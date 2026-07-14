@@ -28,12 +28,15 @@ type Config struct {
 	MaxPostsPerChan int
 }
 
-// Load reads configuration from the .env file in the current directory
-// and applies environment variable overrides. Returns an error if any
-// required value is missing or invalid.
+// Load reads configuration from the .env file in the current directory,
+// if present, and applies environment variable overrides. Missing .env is
+// tolerated so production can start from environment-only Fly secrets.
 func Load() (*Config, error) {
 	f, err := os.Open(".env")
 	if err != nil {
+		if os.IsNotExist(err) {
+			return Parse(strings.NewReader(""))
+		}
 		return nil, fmt.Errorf("open .env: %w", err)
 	}
 	defer f.Close()

@@ -1,9 +1,105 @@
 package config
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
+
+func chdirToTempDir(t *testing.T) {
+	t.Helper()
+
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+
+	dir := t.TempDir()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("chdir temp dir: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if err := os.Chdir(oldWD); err != nil {
+			t.Errorf("restore working directory: %v", err)
+		}
+	})
+}
+
+func TestLoad_UsesDotEnvWhenPresent(t *testing.T) {
+	chdirToTempDir(t)
+
+	if err := os.WriteFile(".env", []byte("BOT_TOKEN=file-token\nOWNER_TELEGRAM_ID=111\nOPENROUTER_API_KEY=file-openrouter\nDB_PATH=/data/bot.db\n"), 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+
+	t.Setenv("BOT_TOKEN", "")
+	t.Setenv("OWNER_TELEGRAM_ID", "")
+	t.Setenv("OPENROUTER_API_KEY", "")
+	t.Setenv("DB_PATH", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.BotToken != "file-token" {
+		t.Errorf("BotToken = %q, want %q", cfg.BotToken, "file-token")
+	}
+	if cfg.OwnerTelegramID != "111" {
+		t.Errorf("OwnerTelegramID = %q, want %q", cfg.OwnerTelegramID, "111")
+	}
+	if cfg.OpenRouterKey != "file-openrouter" {
+		t.Errorf("OpenRouterKey = %q, want %q", cfg.OpenRouterKey, "file-openrouter")
+	}
+	if cfg.DBPath != "/data/bot.db" {
+		t.Errorf("DBPath = %q, want %q", cfg.DBPath, "/data/bot.db")
+	}
+}
+
+func TestLoad_MissingDotEnvUsesEnvironmentValues(t *testing.T) {
+	chdirToTempDir(t)
+
+	t.Setenv("BOT_TOKEN", "env-token")
+	t.Setenv("OWNER_TELEGRAM_ID", "222")
+	t.Setenv("OPENROUTER_API_KEY", "env-openrouter")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.BotToken != "env-token" {
+		t.Errorf("BotToken = %q, want %q", cfg.BotToken, "env-token")
+	}
+	if cfg.OwnerTelegramID != "222" {
+		t.Errorf("OwnerTelegramID = %q, want %q", cfg.OwnerTelegramID, "222")
+	}
+	if cfg.OpenRouterKey != "env-openrouter" {
+		t.Errorf("OpenRouterKey = %q, want %q", cfg.OpenRouterKey, "env-openrouter")
+	}
+	if cfg.DBPath != "bot.db" {
+		t.Errorf("DBPath = %q, want %q", cfg.DBPath, "bot.db")
+	}
+}
+
+func TestLoad_MissingDotEnvUsesProvidedDBPath(t *testing.T) {
+	chdirToTempDir(t)
+
+	t.Setenv("BOT_TOKEN", "env-token")
+	t.Setenv("OWNER_TELEGRAM_ID", "222")
+	t.Setenv("OPENROUTER_API_KEY", "env-openrouter")
+	t.Setenv("DB_PATH", "/data/bot.db")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.DBPath != "/data/bot.db" {
+		t.Errorf("DBPath = %q, want %q", cfg.DBPath, "/data/bot.db")
+	}
+}
 
 func TestParse_AllRequiredFields(t *testing.T) {
 	input := strings.NewReader(`

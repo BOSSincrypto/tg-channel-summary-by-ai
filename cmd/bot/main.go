@@ -10,25 +10,29 @@ import (
 	"syscall"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/config"
+	"github.com/boss/tg-channel-summary-by-ai/internal/db"
 	"github.com/boss/tg-channel-summary-by-ai/internal/webapp"
 )
 
 func main() {
 	log.Println("tg-channel-summary-by-ai starting...")
 
-	// Load configuration from .env
+	// Load configuration from .env or environment variables.
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("failed to load config: %v", err)
 	}
 
-	// TODO: Initialize SQLite database
-	// db, err := db.Open(cfg.DBPath)
-	// if err != nil { log.Fatal(err) }
-	// defer db.Close()
+	// Initialize SQLite so Fly boots against the mounted /data volume.
+	store, err := db.Open(cfg.DBPath)
+	if err != nil {
+		log.Fatalf("failed to open database at %s: %v", cfg.DBPath, err)
+	}
+	defer store.Close()
+	log.Printf("database opened at %s", cfg.DBPath)
 
 	// TODO: Start Telegram bot (long polling)
-	// bot := bot.New(cfg.BotToken, db)
+	// bot := bot.New(cfg.BotToken, store)
 	// go bot.Start()
 
 	// Start HTTP server (health check + WebApp)
@@ -41,7 +45,7 @@ func main() {
 	}()
 
 	// TODO: Start digest scheduler
-	// sched := scheduler.New(db)
+	// sched := scheduler.New(store)
 	// sched.Start()
 
 	// Wait for shutdown signal

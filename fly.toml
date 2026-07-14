@@ -10,6 +10,7 @@ primary_region = "ams"
 
 [env]
   PORT = "8080"
+  DB_PATH = "/data/bot.db"
 
 [[mounts]]
   source = "sqlite_data"

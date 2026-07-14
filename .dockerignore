@@ -1,0 +1,7 @@
+.git
+.env
+*.db
+*.db-wal
+*.db-shm
+body.json
+research/

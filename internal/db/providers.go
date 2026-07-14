@@ -1,0 +1,148 @@
+package db
+
+import (
+	"database/sql"
+	"fmt"
+
+	"github.com/boss/tg-channel-summary-by-ai/internal/model"
+)
+
+// ProviderRepository provides CRUD operations for AI providers.
+type ProviderRepository struct {
+	db *DB
+}
+
+// Insert adds a new AI provider. If is_default is true, all other providers
+// are cleared of their default status first.
+func (r *ProviderRepository) Insert(ap *model.AIProvider) (int64, error) {
+	conn := r.db.Conn()
+
+	if ap.IsDefault {
+		if _, err := conn.Exec(`UPDATE ai_providers SET is_default = 0`); err != nil {
+			return 0, fmt.Errorf("clear existing defaults: %w", err)
+		}
+	}
+
+	result, err := conn.Exec(
+		`INSERT INTO ai_providers (name, base_url, api_key, default_model, is_default)
+		 VALUES (?, ?, ?, ?, ?)`,
+		ap.Name, ap.BaseURL, ap.APIKey, ap.DefaultModel, boolToInt(ap.IsDefault),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("insert provider: %w", err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("last insert id: %w", err)
+	}
+	return id, nil
+}
+
+// GetByID returns a provider by its ID.
+func (r *ProviderRepository) GetByID(id int64) (*model.AIProvider, error) {
+	ap := &model.AIProvider{}
+	var isDefault int
+	err := r.db.Conn().QueryRow(
+		`SELECT id, name, base_url, api_key, default_model, is_default, created_at
+		 FROM ai_providers WHERE id = ?`, id,
+	).Scan(&ap.ID, &ap.Name, &ap.BaseURL, &ap.APIKey, &ap.DefaultModel, &isDefault, &ap.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get provider by id: %w", err)
+	}
+	ap.IsDefault = intToBool(isDefault)
+	return ap, nil
+}
+
+// GetByName returns a provider by its name.
+func (r *ProviderRepository) GetByName(name string) (*model.AIProvider, error) {
+	ap := &model.AIProvider{}
+	var isDefault int
+	err := r.db.Conn().QueryRow(
+		`SELECT id, name, base_url, api_key, default_model, is_default, created_at
+		 FROM ai_providers WHERE name = ?`, name,
+	).Scan(&ap.ID, &ap.Name, &ap.BaseURL, &ap.APIKey, &ap.DefaultModel, &isDefault, &ap.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get provider by name: %w", err)
+	}
+	ap.IsDefault = intToBool(isDefault)
+	return ap, nil
+}
+
+// GetDefault returns the default AI provider, or ErrNotFound if none is set.
+func (r *ProviderRepository) GetDefault() (*model.AIProvider, error) {
+	ap := &model.AIProvider{}
+	var isDefault int
+	err := r.db.Conn().QueryRow(
+		`SELECT id, name, base_url, api_key, default_model, is_default, created_at
+		 FROM ai_providers WHERE is_default = 1 LIMIT 1`,
+	).Scan(&ap.ID, &ap.Name, &ap.BaseURL, &ap.APIKey, &ap.DefaultModel, &isDefault, &ap.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get default provider: %w", err)
+	}
+	ap.IsDefault = intToBool(isDefault)
+	return ap, nil
+}
+
+// List returns all AI providers.
+func (r *ProviderRepository) List() ([]model.AIProvider, error) {
+	rows, err := r.db.Conn().Query(
+		`SELECT id, name, base_url, api_key, default_model, is_default, created_at
+		 FROM ai_providers ORDER BY name ASC`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list providers: %w", err)
+	}
+	defer rows.Close()
+
+	var providers []model.AIProvider
+	for rows.Next() {
+		var ap model.AIProvider
+		var isDefault int
+		if err := rows.Scan(&ap.ID, &ap.Name, &ap.BaseURL, &ap.APIKey, &ap.DefaultModel, &isDefault, &ap.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan provider: %w", err)
+		}
+		ap.IsDefault = intToBool(isDefault)
+		providers = append(providers, ap)
+	}
+	return providers, rows.Err()
+}
+
+// Update modifies an existing provider. If is_default is true, clears others.
+func (r *ProviderRepository) Update(ap *model.AIProvider) error {
+	conn := r.db.Conn()
+
+	if ap.IsDefault {
+		if _, err := conn.Exec(`UPDATE ai_providers SET is_default = 0 WHERE id != ?`, ap.ID); err != nil {
+			return fmt.Errorf("clear existing defaults: %w", err)
+		}
+	}
+
+	_, err := conn.Exec(
+		`UPDATE ai_providers SET name = ?, base_url = ?, api_key = ?, default_model = ?, is_default = ?
+		 WHERE id = ?`,
+		ap.Name, ap.BaseURL, ap.APIKey, ap.DefaultModel, boolToInt(ap.IsDefault), ap.ID,
+	)
+	if err != nil {
+		return fmt.Errorf("update provider: %w", err)
+	}
+	return nil
+}
+
+// Delete removes a provider by ID. Referenced group_settings.provider_id
+// will be set to NULL via ON DELETE SET NULL.
+func (r *ProviderRepository) Delete(id int64) error {
+	_, err := r.db.Conn().Exec(`DELETE FROM ai_providers WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete provider: %w", err)
+	}
+	return nil
+}

@@ -1,0 +1,29 @@
+# Environment
+.env
+
+# Build output
+/bin/
+/dist/
+/app
+
+# SQLite databases
+*.db
+*.db-wal
+*.db-shm
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test coverage
+*.out
+coverage.html
+
+# Temp
+/tmp/

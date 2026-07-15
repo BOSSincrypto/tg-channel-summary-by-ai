@@ -593,6 +593,8 @@ func TestPostRepository(t *testing.T) {
 	db, cleanup := newTestDB(t)
 	defer cleanup()
 
+	now := time.Now().UTC()
+
 	// Create a channel first
 	ch := &model.Channel{Username: "source", Enabled: true}
 	chID, err := db.Channels.Insert(ch)
@@ -607,7 +609,7 @@ func TestPostRepository(t *testing.T) {
 		MessageID:   100,
 		Text:        "Hello world post",
 		Summary:     &summary,
-		PostedAt:    "2026-07-14T12:00:00Z",
+		PostedAt:    now.Add(-3 * time.Hour).Format(time.RFC3339),
 		URL:         "https://t.me/source/100",
 		ContentHash: "abc123hash",
 	}
@@ -642,7 +644,7 @@ func TestPostRepository(t *testing.T) {
 		ChannelID:   chID,
 		MessageID:   100,
 		Text:        "Duplicate",
-		PostedAt:    "2026-07-14T12:00:00Z",
+		PostedAt:    now.Add(-3 * time.Hour).Format(time.RFC3339),
 		URL:         "https://t.me/source/100",
 		ContentHash: "different",
 	}
@@ -671,7 +673,7 @@ func TestPostRepository(t *testing.T) {
 		ChannelID:   chID,
 		MessageID:   200,
 		Text:        "Unsummarized post",
-		PostedAt:    "2026-07-14T10:00:00Z",
+		PostedAt:    now.Add(-2 * time.Hour).Format(time.RFC3339),
 		URL:         "https://t.me/source/200",
 		ContentHash: "hash200",
 	}
@@ -773,7 +775,7 @@ func TestDigestRepository(t *testing.T) {
 		ChannelID:   chID,
 		MessageID:   1,
 		Text:        "Post for digest",
-		PostedAt:    "2026-07-14T12:00:00Z",
+		PostedAt:    time.Now().UTC().Add(-3 * time.Hour).Format(time.RFC3339),
 		URL:         "https://t.me/digestchan/1",
 		ContentHash: "digesthash1",
 	}
@@ -1014,7 +1016,7 @@ func TestCascadeDelete(t *testing.T) {
 		ChannelID:   ch2ID,
 		MessageID:   1,
 		Text:        "Test",
-		PostedAt:    "2026-07-14T12:00:00Z",
+		PostedAt:    time.Now().UTC().Add(-3 * time.Hour).Format(time.RFC3339),
 		URL:         "https://t.me/c/1",
 		ContentHash: "cascadehash",
 	}

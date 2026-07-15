@@ -63,6 +63,7 @@ func TestLoad_MissingDotEnvUsesEnvironmentValues(t *testing.T) {
 	t.Setenv("BOT_TOKEN", "env-token")
 	t.Setenv("OWNER_TELEGRAM_ID", "222")
 	t.Setenv("OPENROUTER_API_KEY", "env-openrouter")
+	t.Setenv("DB_PATH", "")
 
 	cfg, err := Load()
 	if err != nil {

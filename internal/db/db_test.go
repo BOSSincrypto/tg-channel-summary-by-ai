@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -1032,6 +1033,64 @@ func TestCascadeDelete(t *testing.T) {
 	_, err := db.Posts.GetByID(postID)
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("post should be cascade-deleted, got %v", err)
+	}
+}
+
+func TestOpenMalformedDatabaseFailsClosedWithRepairGuidance(t *testing.T) {
+	path := t.TempDir() + "\\malformed.db"
+	if err := os.WriteFile(path, []byte("this is not a SQLite database"), 0o600); err != nil {
+		t.Fatalf("write malformed database: %v", err)
+	}
+
+	_, err := Open(path)
+	if err == nil {
+		t.Fatal("expected malformed database to fail startup")
+	}
+
+	message := err.Error()
+	for _, want := range []string{
+		path,
+		"driver",
+		"Database corruption detected at " + path + ". Restore from backup or manually repair.",
+	} {
+		if !strings.Contains(message, want) {
+			t.Errorf("startup error %q does not contain %q", message, want)
+		}
+	}
+}
+
+func TestOpenUnreadableDatabaseFailsClosedWithPathAndRepairGuidance(t *testing.T) {
+	path := t.TempDir()
+
+	_, err := Open(path)
+	if err == nil {
+		t.Fatal("expected database directory to fail startup")
+	}
+
+	message := err.Error()
+	for _, want := range []string{
+		path,
+		"driver",
+		"Database corruption detected at " + path + ". Restore from backup or manually repair.",
+	} {
+		if !strings.Contains(message, want) {
+			t.Errorf("startup error %q does not contain %q", message, want)
+		}
+	}
+}
+
+func TestDatabaseFullStartupErrorIsExplicitAndFailsClosed(t *testing.T) {
+	path := "/data/bot.db"
+	err := startupError(path, "integrity check", errors.New("database or disk is full (13)"))
+	message := err.Error()
+
+	for _, want := range []string{path, "database full", "database or disk is full (13)"} {
+		if !strings.Contains(message, want) {
+			t.Errorf("startup error %q does not contain %q", message, want)
+		}
+	}
+	if strings.Contains(message, "Database corruption detected") {
+		t.Errorf("database-full error was mislabeled as corruption: %q", message)
 	}
 }
 

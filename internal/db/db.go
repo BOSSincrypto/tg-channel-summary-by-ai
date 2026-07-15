@@ -6,6 +6,7 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -24,48 +25,51 @@ type DB struct {
 
 // Open opens a SQLite database at the given path with WAL mode enabled,
 // runs migrations, performs integrity check, and returns an initialized DB.
+// Any startup failure is returned with path-aware recovery guidance so callers
+// can fail closed before serving HTTP traffic.
 func Open(path string) (*DB, error) {
-	// Use WAL mode by default via pragma in the DSN
+	// Use WAL mode by default via pragma in the DSN.
 	dsn := path + "?_journal_mode=WAL&_foreign_keys=on&_busy_timeout=5000"
 	conn, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		return nil, fmt.Errorf("open database: %w", err)
+		return nil, startupError(path, "open database", err)
 	}
 
-	// Verify connection
+	closeOnError := func(operation string, operationErr error) (*DB, error) {
+		if closeErr := conn.Close(); closeErr != nil {
+			operationErr = fmt.Errorf("%w; close database: %v", operationErr, closeErr)
+		}
+		return nil, startupError(path, operation, operationErr)
+	}
+
+	// Verify connection.
 	if err := conn.Ping(); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("ping database: %w", err)
+		return closeOnError("ping database", err)
 	}
 
-	// Enable WAL mode explicitly (belt and suspenders)
+	// Enable WAL mode explicitly (belt and suspenders).
 	if _, err := conn.Exec("PRAGMA journal_mode=WAL"); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("enable WAL: %w", err)
+		return closeOnError("enable WAL", err)
 	}
 
-	// Enable foreign keys
+	// Enable foreign keys.
 	if _, err := conn.Exec("PRAGMA foreign_keys=ON"); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("enable foreign keys: %w", err)
+		return closeOnError("enable foreign keys", err)
 	}
 
-	// Run integrity check before migrations
+	// Run integrity check before migrations.
 	if err := integrityCheck(conn); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("integrity check failed: %w", err)
+		return closeOnError("integrity check", err)
 	}
 
-	// Run migrations
+	// Run migrations.
 	if err := runMigrations(conn); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("run migrations: %w", err)
+		return closeOnError("run migrations", err)
 	}
 
-	// Verify schema after migrations
+	// Verify schema after migrations.
 	if err := integrityCheck(conn); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("post-migration integrity check failed: %w", err)
+		return closeOnError("post-migration integrity check", err)
 	}
 
 	db := &DB{conn: conn}
@@ -87,6 +91,26 @@ func (d *DB) Close() error {
 // Conn returns the underlying sql.DB for direct access when needed.
 func (d *DB) Conn() *sql.DB {
 	return d.conn
+}
+
+// startupError adds the database path and actionable recovery guidance to
+// every startup failure. Full-disk errors are called out separately because
+// they indicate an operational capacity problem rather than corruption.
+func startupError(path, operation string, err error) error {
+	if isDatabaseFullError(err) {
+		return fmt.Errorf("database startup failed at %s during %s: database full: sqlite driver details: %w", path, operation, err)
+	}
+	return fmt.Errorf("database startup failed at %s during %s: sqlite driver details: %w; Database corruption detected at %s. Restore from backup or manually repair.", path, operation, err, path)
+}
+
+func isDatabaseFullError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "sqlite_full") ||
+		strings.Contains(message, "database or disk is full") ||
+		strings.Contains(message, "database full")
 }
 
 // integrityCheck runs PRAGMA integrity_check and returns an error if it fails.

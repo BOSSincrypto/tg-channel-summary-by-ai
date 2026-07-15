@@ -13,7 +13,10 @@ import (
 	"github.com/boss/tg-channel-summary-by-ai/internal/bot"
 	"github.com/boss/tg-channel-summary-by-ai/internal/config"
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
+	"github.com/boss/tg-channel-summary-by-ai/internal/digest"
 	"github.com/boss/tg-channel-summary-by-ai/internal/maintenance"
+	"github.com/boss/tg-channel-summary-by-ai/internal/parser"
+	"github.com/boss/tg-channel-summary-by-ai/internal/scheduler"
 	"github.com/boss/tg-channel-summary-by-ai/internal/webapp"
 )
 
@@ -58,9 +61,14 @@ func main() {
 		}
 	}()
 
-	// TODO: Start digest scheduler
-	// sched := scheduler.New(store)
-	// sched.Start()
+	// Wire the production parser -> post storage -> digest path before the
+	// scheduler starts. Scheduled group runs use this same injected service.
+	channelParser := parser.New()
+	postStorage := parser.NewPostStorage(store.Channels, store.Posts)
+	channelProcessor := parser.NewChannelProcessor(channelParser, postStorage)
+	digestService := digest.NewWithProcessor(store, channelProcessor)
+	sched := scheduler.New(digestService)
+	sched.Start()
 
 	// Wait for shutdown signal
 	quit := make(chan os.Signal, 1)
@@ -71,7 +79,7 @@ func main() {
 	// Graceful shutdown
 	srv.Stop()
 	maintenanceSvc.Stop()
-	// TODO: sched.Stop()
+	sched.Stop()
 	// TODO: bot.Stop()
 
 	log.Println("Shutdown complete")

@@ -90,15 +90,22 @@ func NewWithOptions(options Options) *Parser {
 // text are media-only posts and are skipped so callers never submit empty text
 // to a summarizer.
 func (p *Parser) ParseChannel(username string) ([]ParsedPost, error) {
+	posts, _, err := p.ParseChannelWithStats(username)
+	return posts, err
+}
+
+// ParseChannelWithStats returns parsed text posts and counts media-only widgets
+// skipped from the result.
+func (p *Parser) ParseChannelWithStats(username string) ([]ParsedPost, ParseStats, error) {
 	username, err := normalizeUsername(username)
 	if err != nil {
-		return nil, err
+		return nil, ParseStats{}, err
 	}
 
 	endpoint := p.baseURL + "/s/" + url.PathEscape(username)
 	request, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil, fmt.Errorf("create t.me/s request: %w", err)
+		return nil, ParseStats{}, fmt.Errorf("create t.me/s request: %w", err)
 	}
 	request.Header.Set("Accept", "text/html")
 	request.Header.Set("Accept-Language", "en-US,en;q=0.9")
@@ -106,42 +113,45 @@ func (p *Parser) ParseChannel(username string) ([]ParsedPost, error) {
 
 	response, err := p.client.Do(request)
 	if err != nil {
-		return nil, fmt.Errorf("fetch t.me/s/%s: %w", username, err)
+		return nil, ParseStats{}, fmt.Errorf("fetch t.me/s/%s: %w", username, err)
 	}
 	defer response.Body.Close()
 
 	if response.StatusCode == http.StatusTooManyRequests {
-		return nil, &RateLimitError{RetryAfter: retryAfter(response.Header.Get("Retry-After"), time.Now())}
+		return nil, ParseStats{}, &RateLimitError{RetryAfter: retryAfter(response.Header.Get("Retry-After"), time.Now())}
 	}
 	if response.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("fetch t.me/s/%s: %w", username, ErrChannelNotFound)
+		return nil, ParseStats{}, fmt.Errorf("fetch t.me/s/%s: %w", username, ErrChannelNotFound)
 	}
 	if response.StatusCode == http.StatusForbidden {
-		return nil, fmt.Errorf("fetch t.me/s/%s: %w", username, ErrChannelPrivate)
+		return nil, ParseStats{}, fmt.Errorf("fetch t.me/s/%s: %w", username, ErrChannelPrivate)
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("fetch t.me/s/%s: unexpected HTTP status %s", username, response.Status)
+		return nil, ParseStats{}, fmt.Errorf("fetch t.me/s/%s: unexpected HTTP status %s", username, response.Status)
 	}
 
 	document, err := goquery.NewDocumentFromReader(response.Body)
 	if err != nil {
-		return nil, fmt.Errorf("parse t.me/s/%s HTML: %w", username, err)
+		return nil, ParseStats{}, fmt.Errorf("parse t.me/s/%s HTML: %w", username, err)
 	}
 	if isPrivatePage(document) {
-		return nil, fmt.Errorf("parse t.me/s/%s: %w", username, ErrChannelPrivate)
+		return nil, ParseStats{}, fmt.Errorf("parse t.me/s/%s: %w", username, ErrChannelPrivate)
 	}
 	if isNotFoundPage(document) {
-		return nil, fmt.Errorf("parse t.me/s/%s: %w", username, ErrChannelNotFound)
+		return nil, ParseStats{}, fmt.Errorf("parse t.me/s/%s: %w", username, ErrChannelNotFound)
 	}
 
 	posts := make([]ParsedPost, 0)
+	stats := ParseStats{}
 	document.Find(".tgme_widget_message[data-post]").Each(func(_ int, selection *goquery.Selection) {
 		post, ok := parsePost(selection)
 		if ok {
 			posts = append(posts, post)
+			return
 		}
+		stats.MediaOnlySkipped++
 	})
-	return posts, nil
+	return posts, stats, nil
 }
 
 func parsePost(selection *goquery.Selection) (ParsedPost, bool) {

@@ -235,6 +235,9 @@ OPENROUTER_API_KEY=test
 	if cfg.MaxPostsPerChan != 100 {
 		t.Errorf("MaxPostsPerChan = %d, want %d", cfg.MaxPostsPerChan, 100)
 	}
+	if cfg.PostRetentionDays != 90 {
+		t.Errorf("PostRetentionDays = %d, want %d", cfg.PostRetentionDays, 90)
+	}
 }
 
 func TestParse_AllOptionalFields(t *testing.T) {
@@ -250,6 +253,7 @@ LOG_LEVEL=debug
 FETCH_DELAY_MS=5000
 MAX_RETRIES=10
 MAX_POSTS_PER_CHANNEL=200
+POST_RETENTION_DAYS=45
 CUSTOM_PROVIDERS=[{"name":"p1"}]
 `)
 	cfg, err := Parse(input)
@@ -279,6 +283,9 @@ CUSTOM_PROVIDERS=[{"name":"p1"}]
 	}
 	if cfg.MaxPostsPerChan != 200 {
 		t.Errorf("MaxPostsPerChan = %d, want %d", cfg.MaxPostsPerChan, 200)
+	}
+	if cfg.PostRetentionDays != 45 {
+		t.Errorf("PostRetentionDays = %d, want %d", cfg.PostRetentionDays, 45)
 	}
 	if cfg.CustomProviders != `[{"name":"p1"}]` {
 		t.Errorf("CustomProviders = %q, want %q", cfg.CustomProviders, `[{"name":"p1"}]`)
@@ -350,14 +357,18 @@ BOT_TOKEN=test
 OWNER_TELEGRAM_ID=123
 OPENROUTER_API_KEY=test
 FETCH_DELAY_MS=notanumber
+POST_RETENTION_DAYS=0
 `)
 	cfg, err := Parse(input)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// Invalid numeric values should fall back to defaults
+	// Invalid numeric values should fall back to defaults.
 	if cfg.FetchDelayMs != 2500 {
 		t.Errorf("FetchDelayMs = %d, want %d (default)", cfg.FetchDelayMs, 2500)
+	}
+	if cfg.PostRetentionDays != 90 {
+		t.Errorf("PostRetentionDays = %d, want %d (default)", cfg.PostRetentionDays, 90)
 	}
 }
 

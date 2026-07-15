@@ -8,9 +8,12 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
+	"github.com/boss/tg-channel-summary-by-ai/internal/bot"
 	"github.com/boss/tg-channel-summary-by-ai/internal/config"
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
+	"github.com/boss/tg-channel-summary-by-ai/internal/maintenance"
 	"github.com/boss/tg-channel-summary-by-ai/internal/webapp"
 )
 
@@ -30,6 +33,17 @@ func main() {
 	}
 	defer store.Close()
 	log.Printf("database opened at %s", cfg.DBPath)
+
+	ownerNotifier := bot.NewOwnerNotifier(cfg.BotToken, cfg.OwnerTelegramID)
+	maintenanceSvc := maintenance.New(maintenance.Options{
+		RetentionDays: cfg.PostRetentionDays,
+		Interval:      24 * time.Hour,
+		DBPath:        cfg.DBPath,
+		Cleaner:       store,
+		ConfigStore:   store.Config,
+		Notifier:      ownerNotifier,
+	})
+	maintenanceSvc.Start()
 
 	// TODO: Start Telegram bot (long polling)
 	// bot := bot.New(cfg.BotToken, store)
@@ -56,6 +70,7 @@ func main() {
 
 	// Graceful shutdown
 	srv.Stop()
+	maintenanceSvc.Stop()
 	// TODO: sched.Stop()
 	// TODO: bot.Stop()
 

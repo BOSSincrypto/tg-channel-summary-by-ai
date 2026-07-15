@@ -14,18 +14,19 @@ import (
 
 // Config holds all configuration values for the application.
 type Config struct {
-	BotToken        string
-	OwnerTelegramID string
-	OpenRouterKey   string
-	CustomProviders string
-	DigestTime      string
-	Timezone        string
-	Port            string
-	DBPath          string
-	LogLevel        string
-	FetchDelayMs    int
-	MaxRetries      int
-	MaxPostsPerChan int
+	BotToken          string
+	OwnerTelegramID   string
+	OpenRouterKey     string
+	CustomProviders   string
+	DigestTime        string
+	Timezone          string
+	Port              string
+	DBPath            string
+	LogLevel          string
+	FetchDelayMs      int
+	MaxRetries        int
+	MaxPostsPerChan   int
+	PostRetentionDays int
 }
 
 // Load reads configuration from the .env file in the current directory,
@@ -88,6 +89,7 @@ func Parse(r io.Reader) (*Config, error) {
 	cfg.FetchDelayMs = intDefault(values, "FETCH_DELAY_MS", 2500)
 	cfg.MaxRetries = intDefault(values, "MAX_RETRIES", 3)
 	cfg.MaxPostsPerChan = intDefault(values, "MAX_POSTS_PER_CHANNEL", 100)
+	cfg.PostRetentionDays = positiveIntDefault(values, "POST_RETENTION_DAYS", 90)
 
 	return cfg, nil
 }
@@ -106,6 +108,7 @@ var allKeys = []string{
 	"FETCH_DELAY_MS",
 	"MAX_RETRIES",
 	"MAX_POSTS_PER_CHANNEL",
+	"POST_RETENTION_DAYS",
 }
 
 // readValues parses KEY=VALUE lines from an io.Reader.
@@ -180,6 +183,16 @@ func intDefault(values map[string]string, key string, def int) int {
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
+		return def
+	}
+	return n
+}
+
+// positiveIntDefault parses a positive integer value for key, returning def on
+// parse failure, zero, negative values, or if the key is missing/empty.
+func positiveIntDefault(values map[string]string, key string, def int) int {
+	n := intDefault(values, key, def)
+	if n <= 0 {
 		return def
 	}
 	return n

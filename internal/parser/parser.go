@@ -46,6 +46,7 @@ type ParsedPost struct {
 	Caption   string
 	PostedAt  string
 	ViewCount int64
+	LinkURLs  []string
 }
 
 // Options configures a Parser. BaseURL and Client are primarily useful for
@@ -174,6 +175,7 @@ func parsePost(selection *goquery.Selection) (ParsedPost, bool) {
 		Caption:   text,
 		PostedAt:  strings.TrimSpace(postedAt),
 		ViewCount: views,
+		LinkURLs:  extractLinkURLs(textSelection),
 	}, true
 }
 

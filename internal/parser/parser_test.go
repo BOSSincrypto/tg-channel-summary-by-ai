@@ -17,7 +17,7 @@ func TestParseChannelExtractsPostsAndDecodesText(t *testing.T) {
 		_, _ = w.Write([]byte(`
 			<section class="tgme_channel_info"></section>
 			<div class="tgme_widget_message" data-post="example/42">
-				<div class="tgme_widget_message_text">Hello &amp; <b>world</b><br>line &lt;two&gt; &#1084;&#1080;&#1088;</div>
+				<div class="tgme_widget_message_text">Hello &amp; <b>world</b><br>line &lt;two&gt; &#1084;&#1080;&#1088; <a href="https://example.com/story#section">story</a></div>
 				<div class="tgme_widget_message_footer">
 					<span class="tgme_widget_message_views">1.7M</span>
 					<a class="tgme_widget_message_date"><time datetime="2026-07-15T18:30:00+00:00">18:30</time></a>
@@ -41,11 +41,14 @@ func TestParseChannelExtractsPostsAndDecodesText(t *testing.T) {
 	if len(posts) != 2 {
 		t.Fatalf("expected 2 text posts, got %d", len(posts))
 	}
-	if posts[0].MessageID != 42 || posts[0].Text != "Hello & world\nline <two> мир" {
+	if posts[0].MessageID != 42 || posts[0].Text != "Hello & world\nline <two> мир story" {
 		t.Fatalf("unexpected first post: %+v", posts[0])
 	}
 	if posts[0].Caption != posts[0].Text {
 		t.Fatalf("caption should preserve the parsed text: %+v", posts[0])
+	}
+	if len(posts[0].LinkURLs) != 1 || posts[0].LinkURLs[0] != "https://example.com/story#section" {
+		t.Fatalf("unexpected links in first post: %v", posts[0].LinkURLs)
 	}
 	if posts[0].PostedAt != "2026-07-15T18:30:00+00:00" {
 		t.Fatalf("unexpected timestamp: %q", posts[0].PostedAt)

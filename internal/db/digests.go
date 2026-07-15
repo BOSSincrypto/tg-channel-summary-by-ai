@@ -144,7 +144,7 @@ func (r *DigestRepository) GetPostsForDigest(digestID int64) ([]model.Post, erro
 // given number of days. Returns the number of deleted digests.
 func (r *DigestRepository) DeleteOlderThan(days int) (int64, error) {
 	result, err := r.db.Conn().Exec(
-		`DELETE FROM digests WHERE sent_at < datetime('now', ? || ' days')`,
+		`DELETE FROM digests WHERE datetime(sent_at) < datetime('now', ? || ' days')`,
 		fmt.Sprintf("-%d", days),
 	)
 	if err != nil {

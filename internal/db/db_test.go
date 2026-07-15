@@ -5,9 +5,197 @@ import (
 	"errors"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
 )
+
+func ptrString(s string) *string {
+	return &s
+}
+
+func offsetRFC3339(t time.Time, offsetHours int) string {
+	return t.In(time.FixedZone("offset", offsetHours*3600)).Format(time.RFC3339)
+}
+
+// TestCleanupPosts verifies post cleanup preserves rows referenced by recent digests.
+func TestCleanupPosts(t *testing.T) {
+	db, cleanup := newTestDB(t)
+	defer cleanup()
+
+	now := time.Now().UTC()
+
+	ch := &model.Channel{Username: "cleanup-chan", Enabled: true}
+	chID, err := db.Channels.Insert(ch)
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+
+	group := &model.Group{TelegramChatID: -1005555, Title: "Cleanup Group"}
+	groupID, err := db.Groups.Insert(group)
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	if err := db.Groups.AssignChannel(groupID, chID, nil); err != nil {
+		t.Fatalf("assign channel: %v", err)
+	}
+
+	referencedPost := &model.Post{
+		ChannelID:   chID,
+		MessageID:   1,
+		Text:        "Referenced old post",
+		PostedAt:    offsetRFC3339(now.Add(-72*time.Hour), 14),
+		URL:         "https://t.me/cleanup-chan/1",
+		ContentHash: "referenced-old",
+	}
+	referencedID, err := db.Posts.Insert(referencedPost)
+	if err != nil {
+		t.Fatalf("insert referenced post: %v", err)
+	}
+
+	unreferencedPost := &model.Post{
+		ChannelID:   chID,
+		MessageID:   2,
+		Text:        "Unreferenced old post",
+		PostedAt:    offsetRFC3339(now.Add(-72*time.Hour), 14),
+		URL:         "https://t.me/cleanup-chan/2",
+		ContentHash: "unreferenced-old",
+	}
+	unreferencedID, err := db.Posts.Insert(unreferencedPost)
+	if err != nil {
+		t.Fatalf("insert unreferenced post: %v", err)
+	}
+
+	recentPost := &model.Post{
+		ChannelID:   chID,
+		MessageID:   3,
+		Text:        "Recent post",
+		PostedAt:    now.Add(-2 * time.Hour).Format(time.RFC3339),
+		URL:         "https://t.me/cleanup-chan/3",
+		ContentHash: "recenthash",
+	}
+	recentID, err := db.Posts.Insert(recentPost)
+	if err != nil {
+		t.Fatalf("insert recent post: %v", err)
+	}
+
+	digest := &model.Digest{GroupID: groupID, PostCount: 2}
+	digestID, err := db.Digests.Insert(digest)
+	if err != nil {
+		t.Fatalf("insert digest: %v", err)
+	}
+	if err := db.Digests.AddPost(digestID, referencedID); err != nil {
+		t.Fatalf("link referenced post to digest: %v", err)
+	}
+	if err := db.Digests.AddPost(digestID, recentID); err != nil {
+		t.Fatalf("link recent post to digest: %v", err)
+	}
+
+	staleDigest := now.Add(-2 * time.Hour).Format(time.RFC3339)
+	if _, err := db.Conn().Exec(`UPDATE digests SET sent_at = ? WHERE id = ?`, staleDigest, digestID); err != nil {
+		t.Fatalf("age digest: %v", err)
+	}
+
+	deleted, err := db.CleanupPosts(1)
+	if err != nil {
+		t.Fatalf("cleanup posts: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("expected exactly 1 old post deleted, got %d", deleted)
+	}
+	if _, err := db.Posts.GetByID(referencedID); err != nil {
+		t.Fatalf("expected referenced post to remain, got %v", err)
+	}
+	if _, err := db.Posts.GetByID(unreferencedID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected unreferenced post to be deleted, got %v", err)
+	}
+	if _, err := db.Posts.GetByID(recentID); err != nil {
+		t.Fatalf("expected recent post to remain, got %v", err)
+	}
+}
+
+// TestPostRepositoryDedupAndWindow verifies cross-channel dedup and normalized time windows.
+func TestPostRepositoryDedupAndWindow(t *testing.T) {
+	db, cleanup := newTestDB(t)
+	defer cleanup()
+
+	now := time.Now().UTC()
+
+	ch1 := &model.Channel{Username: "chan1", Enabled: true}
+	ch1ID, err := db.Channels.Insert(ch1)
+	if err != nil {
+		t.Fatalf("insert channel 1: %v", err)
+	}
+	ch2 := &model.Channel{Username: "chan2", Enabled: true}
+	ch2ID, err := db.Channels.Insert(ch2)
+	if err != nil {
+		t.Fatalf("insert channel 2: %v", err)
+	}
+	group := &model.Group{TelegramChatID: -1006666, Title: "Dedup Group"}
+	groupID, err := db.Groups.Insert(group)
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	if err := db.Groups.AssignChannel(groupID, ch1ID, nil); err != nil {
+		t.Fatalf("assign channel 1: %v", err)
+	}
+	if err := db.Groups.AssignChannel(groupID, ch2ID, nil); err != nil {
+		t.Fatalf("assign channel 2: %v", err)
+	}
+
+	sharedContentHash := "shared-content"
+	sharedLinkHash := ptrString("shared-links")
+	postedAtSharedOld := offsetRFC3339(now.Add(-23*time.Hour), 14)
+	postedAtRecent := now.Add(-2 * time.Hour).Format(time.RFC3339)
+	postedAtTooOld := offsetRFC3339(now.Add(-25*time.Hour), 14)
+
+	post1 := &model.Post{ChannelID: ch1ID, MessageID: 1, Text: "same text", PostedAt: postedAtSharedOld, URL: "https://t.me/chan1/1", ContentHash: sharedContentHash, LinkURLsHash: sharedLinkHash}
+	post2 := &model.Post{ChannelID: ch2ID, MessageID: 1, Text: "same text", PostedAt: postedAtRecent, URL: "https://t.me/chan2/1", ContentHash: sharedContentHash, LinkURLsHash: sharedLinkHash}
+	post3 := &model.Post{ChannelID: ch1ID, MessageID: 2, Text: "unique text", PostedAt: postedAtTooOld, URL: "https://t.me/chan1/2", ContentHash: "unique-old", LinkURLsHash: nil}
+	post4 := &model.Post{ChannelID: ch2ID, MessageID: 2, Text: "unique text", PostedAt: postedAtRecent, URL: "https://t.me/chan2/2", ContentHash: "unique-recent", LinkURLsHash: nil}
+
+	if _, err := db.Posts.Insert(post1); err != nil {
+		t.Fatalf("insert post1: %v", err)
+	}
+	if _, err := db.Posts.Insert(post2); err != nil {
+		t.Fatalf("insert post2: %v", err)
+	}
+	if _, err := db.Posts.Insert(post3); err != nil {
+		t.Fatalf("insert post3: %v", err)
+	}
+	if _, err := db.Posts.Insert(post4); err != nil {
+		t.Fatalf("insert post4: %v", err)
+	}
+
+	unsummarized, err := db.Posts.ListUnsummarized(groupID, 24)
+	if err != nil {
+		t.Fatalf("list unsummarized: %v", err)
+	}
+	if len(unsummarized) != 2 {
+		t.Fatalf("expected 2 unsummarized posts in last 24h after dedup, got %d", len(unsummarized))
+	}
+	for _, p := range unsummarized {
+		if p.ContentHash == "unique-old" {
+			t.Fatal("expected old unique post to be excluded by normalized posted_at window")
+		}
+	}
+
+	exists, err := db.Posts.ExistsByContentHash(groupID, sharedContentHash)
+	if err != nil {
+		t.Fatalf("exists by content hash: %v", err)
+	}
+	if !exists {
+		t.Fatal("expected shared content hash to be found across channels")
+	}
+
+	exists, err = db.Posts.ExistsByContentHash(groupID, "missing")
+	if err != nil {
+		t.Fatalf("exists by missing hash: %v", err)
+	}
+	if exists {
+		t.Fatal("expected missing content hash to not exist")
+	}
+}
 
 // newTestDB opens an in-memory SQLite database for testing.
 // The returned cleanup function must be called by the test to close the DB.
@@ -786,36 +974,6 @@ func TestConfigRepository(t *testing.T) {
 	all2, _ := db.Config.GetAll()
 	if len(all2) != 1 {
 		t.Errorf("expected 1 entry after delete, got %d", len(all2))
-	}
-}
-
-// TestCleanupPosts verifies post cleanup and VACUUM.
-func TestCleanupPosts(t *testing.T) {
-	db, cleanup := newTestDB(t)
-	defer cleanup()
-
-	// Insert a post with old date (SQLite accepts any posted_at string for the test;
-	// we'll use a date that's far in the past)
-	ch := &model.Channel{Username: "oldchan", Enabled: true}
-	chID, _ := db.Channels.Insert(ch)
-
-	oldPost := &model.Post{
-		ChannelID:   chID,
-		MessageID:   1,
-		Text:        "Old post",
-		PostedAt:    "2020-01-01T00:00:00Z",
-		URL:         "https://t.me/oldchan/1",
-		ContentHash: "oldhash",
-	}
-	db.Posts.Insert(oldPost)
-
-	// Cleanup posts older than 1 day - should delete the old post
-	deleted, err := db.CleanupPosts(1)
-	if err != nil {
-		t.Fatalf("cleanup posts: %v", err)
-	}
-	if deleted == 0 {
-		t.Error("expected at least 1 post deleted in cleanup")
 	}
 }
 

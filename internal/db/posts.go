@@ -114,7 +114,8 @@ func (r *PostRepository) UpdateSummary(id int64, summary string) error {
 }
 
 // ListUnsummarized returns posts without summaries for a given group's channels,
-// posted within the last hours (e.g., 24). Results are deduplicated by content hash.
+// posted within the last hours (e.g., 24). Results are deduplicated by the
+// composite signature of content_hash + link_urls_hash across all assigned channels.
 func (r *PostRepository) ListUnsummarized(groupID int64, hours int) ([]model.Post, error) {
 	rows, err := r.db.Conn().Query(
 		`SELECT p.id, p.channel_id, p.message_id, p.text, p.summary,
@@ -123,8 +124,8 @@ func (r *PostRepository) ListUnsummarized(groupID int64, hours int) ([]model.Pos
 		 INNER JOIN group_channels gc ON p.channel_id = gc.channel_id
 		 WHERE gc.group_id = ?
 		   AND p.summary IS NULL
-		   AND p.posted_at >= datetime('now', ? || ' hours')
-		 ORDER BY p.channel_id, p.posted_at DESC`,
+		   AND datetime(p.posted_at) >= datetime('now', ? || ' hours')
+		 ORDER BY datetime(p.posted_at) DESC, p.channel_id ASC, p.message_id ASC`,
 		groupID, fmt.Sprintf("-%d", hours),
 	)
 	if err != nil {
@@ -133,6 +134,7 @@ func (r *PostRepository) ListUnsummarized(groupID int64, hours int) ([]model.Pos
 	defer rows.Close()
 
 	var posts []model.Post
+	seen := make(map[string]struct{})
 	for rows.Next() {
 		var p model.Post
 		var summary, linkURLsHash sql.NullString
@@ -146,9 +148,22 @@ func (r *PostRepository) ListUnsummarized(groupID int64, hours int) ([]model.Pos
 		if linkURLsHash.Valid {
 			p.LinkURLsHash = &linkURLsHash.String
 		}
+
+		key := dedupSignatureKey(p.ContentHash, linkURLsHash)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
 		posts = append(posts, p)
 	}
 	return posts, rows.Err()
+}
+
+func dedupSignatureKey(contentHash string, linkURLsHash sql.NullString) string {
+	if linkURLsHash.Valid {
+		return contentHash + "\x00" + linkURLsHash.String
+	}
+	return contentHash + "\x00"
 }
 
 // ExistsByContentHash checks if a post with the same content_hash already exists
@@ -172,7 +187,16 @@ func (r *PostRepository) ExistsByContentHash(groupID int64, contentHash string) 
 // Returns the number of rows deleted.
 func (r *PostRepository) DeleteOlderThan(days int) (int64, error) {
 	result, err := r.db.Conn().Exec(
-		`DELETE FROM posts WHERE posted_at < datetime('now', ? || ' days')`,
+		`DELETE FROM posts
+		 WHERE datetime(posted_at) < datetime('now', ? || ' days')
+		   AND NOT EXISTS (
+			SELECT 1
+			FROM digest_posts dp
+			INNER JOIN digests d ON d.id = dp.digest_id
+			WHERE dp.post_id = posts.id
+			  AND datetime(d.sent_at) >= datetime('now', ? || ' days')
+		   )`,
+		fmt.Sprintf("-%d", days),
 		fmt.Sprintf("-%d", days),
 	)
 	if err != nil {

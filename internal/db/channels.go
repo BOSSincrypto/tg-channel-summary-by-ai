@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
 )
@@ -12,14 +13,21 @@ type ChannelRepository struct {
 	db *DB
 }
 
-// Insert adds a new channel. Username should be lowercase without @.
+// Insert adds a new channel and normalizes its username before persistence.
 func (r *ChannelRepository) Insert(ch *model.Channel) (int64, error) {
+	if ch == nil {
+		return 0, fmt.Errorf("insert channel: channel is required")
+	}
+	ch.Username = normalizeChannelUsername(ch.Username)
 	result, err := r.db.Conn().Exec(
 		`INSERT INTO channels (username, title, enabled, last_post_id)
 		 VALUES (?, ?, ?, ?)`,
 		ch.Username, ch.Title, boolToInt(ch.Enabled), ch.LastPostID,
 	)
 	if err != nil {
+		if isUniqueViolation(err) {
+			return 0, fmt.Errorf("insert channel %q: %w", ch.Username, ErrDuplicate)
+		}
 		return 0, fmt.Errorf("insert channel: %w", err)
 	}
 	id, err := result.LastInsertId()
@@ -49,11 +57,12 @@ func (r *ChannelRepository) GetByID(id int64) (*model.Channel, error) {
 
 // GetByUsername returns a channel by its username (case-insensitive).
 func (r *ChannelRepository) GetByUsername(username string) (*model.Channel, error) {
+	username = normalizeChannelUsername(username)
 	ch := &model.Channel{}
 	var enabled int
 	err := r.db.Conn().QueryRow(
 		`SELECT id, username, title, enabled, last_post_id, created_at
-		 FROM channels WHERE LOWER(username) = LOWER(?)`, username,
+		 FROM channels WHERE username = ?`, username,
 	).Scan(&ch.ID, &ch.Username, &ch.Title, &enabled, &ch.LastPostID, &ch.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
@@ -113,15 +122,29 @@ func (r *ChannelRepository) ListEnabled() ([]model.Channel, error) {
 	return channels, rows.Err()
 }
 
-// Update modifies an existing channel.
+// Update modifies an existing channel and normalizes its username.
 func (r *ChannelRepository) Update(ch *model.Channel) error {
-	_, err := r.db.Conn().Exec(
+	if ch == nil {
+		return fmt.Errorf("update channel: channel is required")
+	}
+	ch.Username = normalizeChannelUsername(ch.Username)
+	result, err := r.db.Conn().Exec(
 		`UPDATE channels SET username = ?, title = ?, enabled = ?, last_post_id = ?
 		 WHERE id = ?`,
 		ch.Username, ch.Title, boolToInt(ch.Enabled), ch.LastPostID, ch.ID,
 	)
 	if err != nil {
+		if isUniqueViolation(err) {
+			return fmt.Errorf("update channel %q: %w", ch.Username, ErrDuplicate)
+		}
 		return fmt.Errorf("update channel: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("update channel rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrNotFound
 	}
 	return nil
 }
@@ -138,12 +161,38 @@ func (r *ChannelRepository) UpdateLastPostID(id, lastPostID int64) error {
 	return nil
 }
 
+// ToggleEnabled atomically flips a channel's enabled state.
+func (r *ChannelRepository) ToggleEnabled(id int64) error {
+	result, err := r.db.Conn().Exec(
+		`UPDATE channels SET enabled = CASE enabled WHEN 0 THEN 1 ELSE 0 END WHERE id = ?`,
+		id,
+	)
+	if err != nil {
+		return fmt.Errorf("toggle channel %d: %w", id, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("toggle channel %d rows affected: %w", id, err)
+	}
+	if affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // Delete removes a channel by ID. Foreign key cascade removes related
 // rows from group_channels, posts, etc.
 func (r *ChannelRepository) Delete(id int64) error {
-	_, err := r.db.Conn().Exec(`DELETE FROM channels WHERE id = ?`, id)
+	result, err := r.db.Conn().Exec(`DELETE FROM channels WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("delete channel: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("delete channel rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrNotFound
 	}
 	return nil
 }
@@ -151,13 +200,18 @@ func (r *ChannelRepository) Delete(id int64) error {
 // ExistsByUsername checks whether a channel with the given username exists
 // (case-insensitive comparison).
 func (r *ChannelRepository) ExistsByUsername(username string) (bool, error) {
+	username = normalizeChannelUsername(username)
 	var count int
 	err := r.db.Conn().QueryRow(
-		`SELECT COUNT(*) FROM channels WHERE LOWER(username) = LOWER(?)`,
+		`SELECT COUNT(*) FROM channels WHERE username = ?`,
 		username,
 	).Scan(&count)
 	if err != nil {
 		return false, fmt.Errorf("check channel exists: %w", err)
 	}
 	return count > 0, nil
+}
+
+func normalizeChannelUsername(username string) string {
+	return strings.ToLower(strings.TrimPrefix(strings.TrimSpace(username), "@"))
 }

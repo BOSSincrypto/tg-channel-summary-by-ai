@@ -451,6 +451,65 @@ func TestChannelRepository(t *testing.T) {
 	}
 }
 
+func TestChannelRepositoryNormalizesUsernameAndTogglesEnabled(t *testing.T) {
+	db, cleanup := newTestDB(t)
+	defer cleanup()
+
+	channel := &model.Channel{Username: " @News_Channel ", Title: "News", Enabled: true}
+	id, err := db.Channels.Insert(channel)
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+
+	got, err := db.Channels.GetByID(id)
+	if err != nil {
+		t.Fatalf("get channel: %v", err)
+	}
+	if got.Username != "news_channel" {
+		t.Fatalf("stored username = %q, want %q", got.Username, "news_channel")
+	}
+	if channel.Username != "news_channel" {
+		t.Fatalf("input username = %q, want normalized value", channel.Username)
+	}
+
+	exists, err := db.Channels.ExistsByUsername("@NEWS_CHANNEL")
+	if err != nil {
+		t.Fatalf("check duplicate username: %v", err)
+	}
+	if !exists {
+		t.Fatal("expected normalized username lookup to find channel")
+	}
+	if _, err := db.Channels.Insert(&model.Channel{Username: "@NEWS_CHANNEL"}); !errors.Is(err, ErrDuplicate) {
+		t.Fatalf("duplicate insert error = %v, want ErrDuplicate", err)
+	}
+
+	if err := db.Channels.ToggleEnabled(id); err != nil {
+		t.Fatalf("disable channel: %v", err)
+	}
+	got, err = db.Channels.GetByID(id)
+	if err != nil {
+		t.Fatalf("get disabled channel: %v", err)
+	}
+	if got.Enabled {
+		t.Fatal("channel remained enabled after toggle")
+	}
+
+	if err := db.Channels.ToggleEnabled(id); err != nil {
+		t.Fatalf("enable channel: %v", err)
+	}
+	got, err = db.Channels.GetByID(id)
+	if err != nil {
+		t.Fatalf("get re-enabled channel: %v", err)
+	}
+	if !got.Enabled {
+		t.Fatal("channel remained disabled after second toggle")
+	}
+
+	if err := db.Channels.ToggleEnabled(9999); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing channel toggle error = %v, want ErrNotFound", err)
+	}
+}
+
 // TestGroupRepository tests full CRUD for groups including channel assignments.
 func TestGroupRepository(t *testing.T) {
 	db, cleanup := newTestDB(t)

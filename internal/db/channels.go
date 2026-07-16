@@ -139,10 +139,9 @@ func (r *ChannelRepository) Update(ch *model.Channel) error {
 	}
 	ch.Username = normalizeChannelUsername(ch.Username)
 	result, err := r.db.Conn().Exec(
-		`UPDATE channels SET username = ?, title = ?, enabled = ?, last_post_id = ?, fetch_error_kind = ?, fetch_error_message = ?, fetch_error_at = ?
+		`UPDATE channels SET username = ?, title = ?, enabled = ?, last_post_id = ?
 		 WHERE id = ?`,
-		ch.Username, ch.Title, boolToInt(ch.Enabled), ch.LastPostID,
-		ch.FetchErrorKind, ch.FetchErrorMessage, nullableString(ch.FetchErrorAt), ch.ID,
+		ch.Username, ch.Title, boolToInt(ch.Enabled), ch.LastPostID, ch.ID,
 	)
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -179,7 +178,7 @@ func (r *ChannelRepository) MarkFetchError(id int64, kind, message string) error
 		return fmt.Errorf("mark channel fetch error: error kind is required")
 	}
 	timestamp := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err := r.db.Conn().Exec(
+	result, err := r.db.Conn().Exec(
 		`UPDATE channels
 		 SET fetch_error_kind = ?, fetch_error_message = ?, fetch_error_at = ?
 		 WHERE id = ?`,
@@ -188,12 +187,19 @@ func (r *ChannelRepository) MarkFetchError(id int64, kind, message string) error
 	if err != nil {
 		return fmt.Errorf("mark channel %d fetch error: %w", id, err)
 	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("mark channel %d fetch error rows affected: %w", id, err)
+	}
+	if affected == 0 {
+		return ErrNotFound
+	}
 	return nil
 }
 
 // ClearFetchError removes durable fetch-error state after a successful fetch.
 func (r *ChannelRepository) ClearFetchError(id int64) error {
-	_, err := r.db.Conn().Exec(
+	result, err := r.db.Conn().Exec(
 		`UPDATE channels
 		 SET fetch_error_kind = '', fetch_error_message = '', fetch_error_at = NULL
 		 WHERE id = ?`,
@@ -201,6 +207,13 @@ func (r *ChannelRepository) ClearFetchError(id int64) error {
 	)
 	if err != nil {
 		return fmt.Errorf("clear channel %d fetch error: %w", id, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("clear channel %d fetch error rows affected: %w", id, err)
+	}
+	if affected == 0 {
+		return ErrNotFound
 	}
 	return nil
 }

@@ -534,6 +534,27 @@ func TestChannelRepositoryPersistsAndClearsFetchErrorWithoutChangingConfiguratio
 		t.Fatalf("fetch error state = %+v, want persisted kind, message, and timestamp", stored)
 	}
 
+	configUpdate := &model.Channel{
+		ID:         id,
+		Username:   stored.Username,
+		Title:      "Renamed in settings",
+		Enabled:    false,
+		LastPostID: stored.LastPostID,
+	}
+	if err := db.Channels.Update(configUpdate); err != nil {
+		t.Fatalf("update channel configuration: %v", err)
+	}
+	updated, err := db.Channels.GetByID(id)
+	if err != nil {
+		t.Fatalf("get updated channel: %v", err)
+	}
+	if updated.Title != "Renamed in settings" || updated.Enabled {
+		t.Fatalf("updated configuration = %+v, want changed title and disabled state", updated)
+	}
+	if updated.FetchErrorKind != "not_found" || updated.FetchErrorMessage != "channel not found" || updated.FetchErrorAt == nil {
+		t.Fatalf("channel update cleared fetch error state: %+v", updated)
+	}
+
 	if err := db.Channels.ClearFetchError(id); err != nil {
 		t.Fatalf("clear fetch error: %v", err)
 	}
@@ -586,6 +607,18 @@ func TestExistingDatabaseMigratesChannelFetchErrorColumns(t *testing.T) {
 	}
 	if err := database.Channels.MarkFetchError(channel.ID, "private", "private"); err != nil {
 		t.Fatalf("mark migrated channel error: %v", err)
+	}
+}
+
+func TestChannelRepositoryFetchErrorRequiresExistingChannel(t *testing.T) {
+	db, cleanup := newTestDB(t)
+	defer cleanup()
+
+	if err := db.Channels.MarkFetchError(9999, "not_found", "missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("mark missing channel error = %v, want ErrNotFound", err)
+	}
+	if err := db.Channels.ClearFetchError(9999); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("clear missing channel error = %v, want ErrNotFound", err)
 	}
 }
 

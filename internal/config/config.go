@@ -17,6 +17,7 @@ type Config struct {
 	BotToken          string
 	OwnerTelegramID   string
 	OpenRouterKey     string
+	ProviderKey       string
 	CustomProviders   string
 	DigestTime        string
 	Timezone          string
@@ -85,6 +86,7 @@ func Parse(r io.Reader) (*Config, error) {
 	cfg.DBPath = stringDefault(values, "DB_PATH", "bot.db")
 	cfg.LogLevel = stringDefault(values, "LOG_LEVEL", "info")
 	cfg.CustomProviders = values["CUSTOM_PROVIDERS"] // may be empty
+	cfg.ProviderKey = stringDefault(values, "PROVIDER_ENCRYPTION_KEY", cfg.BotToken)
 
 	cfg.FetchDelayMs = intDefault(values, "FETCH_DELAY_MS", 2500)
 	cfg.MaxRetries = intDefault(values, "MAX_RETRIES", 3)
@@ -99,6 +101,7 @@ var allKeys = []string{
 	"BOT_TOKEN",
 	"OWNER_TELEGRAM_ID",
 	"OPENROUTER_API_KEY",
+	"PROVIDER_ENCRYPTION_KEY",
 	"CUSTOM_PROVIDERS",
 	"DIGEST_TIME",
 	"TIMEZONE",

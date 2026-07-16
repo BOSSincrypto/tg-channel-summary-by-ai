@@ -6,14 +6,17 @@ package webapp
 import (
 	"encoding/json"
 	"net/http"
+	"time"
 
+	"github.com/boss/tg-channel-summary-by-ai/internal/db"
 	"github.com/go-chi/chi/v5"
 )
 
 // Server handles HTTP requests for the health check and WebApp.
 type Server struct {
-	router chi.Router
-	srv    *http.Server
+	router          chi.Router
+	srv             *http.Server
+	providerService *ProviderService
 }
 
 // New creates a new HTTP Server with configured routes.
@@ -26,6 +29,48 @@ func New() *Server {
 
 	r.Get("/health", s.handleHealth)
 
+	return s
+}
+
+// NewWithProviders creates a fail-closed provider API server. Production code
+// should use NewWithProvidersAuthenticated with configured Telegram auth.
+func NewWithProviders(store *db.DB, timeout time.Duration, client *http.Client) *Server {
+	return NewWithProvidersAuthenticated(store, timeout, client, nil)
+}
+
+// NewWithProvidersAuthenticated creates a provider API server protected by
+// Telegram WebApp initData validation and the configured owner check.
+func NewWithProvidersAuthenticated(store *db.DB, timeout time.Duration, client *http.Client, auth *WebAppAuth) *Server {
+	if auth == nil {
+		auth = &WebAppAuth{}
+	}
+	return newWithProviders(store, timeout, client, auth)
+}
+
+// NewWithProvidersForTesting creates an unprotected provider API server for
+// unit tests that exercise CRUD behavior without Telegram initData.
+func NewWithProvidersForTesting(store *db.DB, timeout time.Duration, client *http.Client) *Server {
+	return newWithProviders(store, timeout, client, nil, true)
+}
+
+func newWithProviders(store *db.DB, timeout time.Duration, client *http.Client, auth *WebAppAuth, allowPrivateHosts ...bool) *Server {
+	s := New()
+	service := NewProviderService(store.Providers, client)
+	if len(allowPrivateHosts) > 0 && allowPrivateHosts[0] {
+		service.allowPrivateHosts = true
+	}
+	if timeout > 0 {
+		service.validationTimeout = timeout
+	}
+	s.providerService = service
+	providersHandler := http.Handler(http.HandlerFunc(s.handleProviders))
+	providerByIDHandler := http.Handler(http.HandlerFunc(s.handleProviderByID))
+	if auth != nil {
+		providersHandler = auth.Middleware(providersHandler)
+		providerByIDHandler = auth.Middleware(providerByIDHandler)
+	}
+	s.router.Handle("/api/providers", providersHandler)
+	s.router.Handle("/api/providers/{id}", providerByIDHandler)
 	return s
 }
 

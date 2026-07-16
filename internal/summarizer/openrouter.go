@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 )
@@ -28,6 +27,9 @@ type OpenRouterConfig struct {
 	HTTPClient  *http.Client
 	HTTPReferer string
 	AppTitle    string
+	// AllowPrivateHosts is intended only for trusted local test endpoints.
+	// Production provider configuration must leave it false.
+	AllowPrivateHosts bool
 }
 
 // Message is an OpenAI-compatible chat message.
@@ -89,14 +91,13 @@ func NewOpenRouter(apiKey, model string) *OpenRouterProvider {
 
 // NewOpenRouterWithConfig creates a configured OpenRouter provider.
 func NewOpenRouterWithConfig(config OpenRouterConfig) (*OpenRouterProvider, error) {
-	baseURL := strings.TrimRight(strings.TrimSpace(config.BaseURL), "/")
+	baseURL := strings.TrimSpace(config.BaseURL)
 	if baseURL == "" {
 		baseURL = DefaultOpenRouterBaseURL
 	}
-	parsedURL, err := url.Parse(baseURL)
-	if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" ||
-		(parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
-		return nil, fmt.Errorf("invalid OpenRouter base URL %q", config.BaseURL)
+	baseURL, err := validateProviderBaseURL(baseURL, config.AllowPrivateHosts)
+	if err != nil {
+		return nil, err
 	}
 	if strings.TrimSpace(config.APIKey) == "" {
 		return nil, errors.New("OpenRouter API key is required")
@@ -109,6 +110,7 @@ func NewOpenRouterWithConfig(config OpenRouterConfig) (*OpenRouterProvider, erro
 	if client == nil {
 		client = &http.Client{Timeout: 60 * time.Second}
 	}
+	client = secureProviderHTTPClient(client, config.AllowPrivateHosts)
 	return &OpenRouterProvider{
 		baseURL:     baseURL,
 		apiKey:      config.APIKey,

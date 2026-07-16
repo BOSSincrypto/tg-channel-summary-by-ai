@@ -9,13 +9,21 @@ import (
 
 // ProviderRepository provides CRUD operations for AI providers.
 type ProviderRepository struct {
-	db *DB
+	db        *DB
+	keyCipher *secretCipher
 }
 
 // Insert adds a new AI provider. If is_default is true, all other providers
 // are cleared of their default status first.
 func (r *ProviderRepository) Insert(ap *model.AIProvider) (int64, error) {
 	conn := r.db.Conn()
+	if ap == nil {
+		return 0, fmt.Errorf("insert provider: provider is nil")
+	}
+	encryptedKey, err := r.keyCipher.encrypt(ap.APIKey)
+	if err != nil {
+		return 0, fmt.Errorf("encrypt provider API key: %w", err)
+	}
 
 	if ap.IsDefault {
 		if _, err := conn.Exec(`UPDATE ai_providers SET is_default = 0`); err != nil {
@@ -26,7 +34,7 @@ func (r *ProviderRepository) Insert(ap *model.AIProvider) (int64, error) {
 	result, err := conn.Exec(
 		`INSERT INTO ai_providers (name, base_url, api_key, default_model, is_default)
 		 VALUES (?, ?, ?, ?, ?)`,
-		ap.Name, ap.BaseURL, ap.APIKey, ap.DefaultModel, boolToInt(ap.IsDefault),
+		ap.Name, ap.BaseURL, encryptedKey, ap.DefaultModel, boolToInt(ap.IsDefault),
 	)
 	if err != nil {
 		return 0, fmt.Errorf("insert provider: %w", err)
@@ -52,6 +60,9 @@ func (r *ProviderRepository) GetByID(id int64) (*model.AIProvider, error) {
 	if err != nil {
 		return nil, fmt.Errorf("get provider by id: %w", err)
 	}
+	if ap.APIKey, err = r.keyCipher.decrypt(ap.APIKey); err != nil {
+		return nil, fmt.Errorf("decrypt provider API key: %w", err)
+	}
 	ap.IsDefault = intToBool(isDefault)
 	return ap, nil
 }
@@ -70,6 +81,9 @@ func (r *ProviderRepository) GetByName(name string) (*model.AIProvider, error) {
 	if err != nil {
 		return nil, fmt.Errorf("get provider by name: %w", err)
 	}
+	if ap.APIKey, err = r.keyCipher.decrypt(ap.APIKey); err != nil {
+		return nil, fmt.Errorf("decrypt provider API key: %w", err)
+	}
 	ap.IsDefault = intToBool(isDefault)
 	return ap, nil
 }
@@ -87,6 +101,9 @@ func (r *ProviderRepository) GetDefault() (*model.AIProvider, error) {
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get default provider: %w", err)
+	}
+	if ap.APIKey, err = r.keyCipher.decrypt(ap.APIKey); err != nil {
+		return nil, fmt.Errorf("decrypt provider API key: %w", err)
 	}
 	ap.IsDefault = intToBool(isDefault)
 	return ap, nil
@@ -110,6 +127,10 @@ func (r *ProviderRepository) List() ([]model.AIProvider, error) {
 		if err := rows.Scan(&ap.ID, &ap.Name, &ap.BaseURL, &ap.APIKey, &ap.DefaultModel, &isDefault, &ap.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan provider: %w", err)
 		}
+		ap.APIKey, err = r.keyCipher.decrypt(ap.APIKey)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt provider API key: %w", err)
+		}
 		ap.IsDefault = intToBool(isDefault)
 		providers = append(providers, ap)
 	}
@@ -119,6 +140,13 @@ func (r *ProviderRepository) List() ([]model.AIProvider, error) {
 // Update modifies an existing provider. If is_default is true, clears others.
 func (r *ProviderRepository) Update(ap *model.AIProvider) error {
 	conn := r.db.Conn()
+	if ap == nil {
+		return fmt.Errorf("update provider: provider is nil")
+	}
+	encryptedKey, err := r.keyCipher.encrypt(ap.APIKey)
+	if err != nil {
+		return fmt.Errorf("encrypt provider API key: %w", err)
+	}
 
 	if ap.IsDefault {
 		if _, err := conn.Exec(`UPDATE ai_providers SET is_default = 0 WHERE id != ?`, ap.ID); err != nil {
@@ -126,10 +154,10 @@ func (r *ProviderRepository) Update(ap *model.AIProvider) error {
 		}
 	}
 
-	_, err := conn.Exec(
+	_, err = conn.Exec(
 		`UPDATE ai_providers SET name = ?, base_url = ?, api_key = ?, default_model = ?, is_default = ?
 		 WHERE id = ?`,
-		ap.Name, ap.BaseURL, ap.APIKey, ap.DefaultModel, boolToInt(ap.IsDefault), ap.ID,
+		ap.Name, ap.BaseURL, encryptedKey, ap.DefaultModel, boolToInt(ap.IsDefault), ap.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("update provider: %w", err)

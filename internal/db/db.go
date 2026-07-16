@@ -6,6 +6,7 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"os"
 	"strings"
 
 	_ "modernc.org/sqlite"
@@ -14,13 +15,14 @@ import (
 // DB wraps the SQLite database connection and provides access to all
 // entity repositories.
 type DB struct {
-	conn      *sql.DB
-	Channels  *ChannelRepository
-	Groups    *GroupRepository
-	Posts     *PostRepository
-	Digests   *DigestRepository
-	Providers *ProviderRepository
-	Config    *ConfigRepository
+	conn              *sql.DB
+	Channels          *ChannelRepository
+	Groups            *GroupRepository
+	Posts             *PostRepository
+	Digests           *DigestRepository
+	Providers         *ProviderRepository
+	Config            *ConfigRepository
+	providerKeyCipher *secretCipher
 }
 
 // Open opens a SQLite database at the given path with WAL mode enabled,
@@ -28,6 +30,30 @@ type DB struct {
 // Any startup failure is returned with path-aware recovery guidance so callers
 // can fail closed before serving HTTP traffic.
 func Open(path string) (*DB, error) {
+	keyMaterial := os.Getenv("PROVIDER_ENCRYPTION_KEY")
+	if keyMaterial == "" {
+		keyMaterial = os.Getenv("BOT_TOKEN")
+	}
+	if keyMaterial == "" {
+		// Tests and local repository-only tools may not have application
+		// secrets. A process-local key still prevents accidental plaintext
+		// storage for that process; production always supplies BOT_TOKEN.
+		var err error
+		keyMaterial, err = localKeyMaterial()
+		if err != nil {
+			return nil, fmt.Errorf("configure local provider key encryption: %w", err)
+		}
+	}
+	return OpenWithEncryptionKey(path, keyMaterial)
+}
+
+// OpenWithEncryptionKey opens SQLite and encrypts provider API keys with the
+// supplied application secret. The key is never persisted in the database.
+func OpenWithEncryptionKey(path, keyMaterial string) (*DB, error) {
+	keyCipher, err := newSecretCipher(keyMaterial)
+	if err != nil {
+		return nil, fmt.Errorf("configure provider key encryption: %w", err)
+	}
 	// Use WAL mode by default via pragma in the DSN.
 	dsn := path + "?_journal_mode=WAL&_foreign_keys=on&_busy_timeout=5000"
 	conn, err := sql.Open("sqlite", dsn)
@@ -71,16 +97,70 @@ func Open(path string) (*DB, error) {
 	if err := integrityCheck(conn); err != nil {
 		return closeOnError("post-migration integrity check", err)
 	}
+	if err := reencryptLegacyProviderKeys(conn, keyCipher); err != nil {
+		return closeOnError("encrypt legacy provider keys", err)
+	}
 
-	db := &DB{conn: conn}
+	db := &DB{conn: conn, providerKeyCipher: keyCipher}
 	db.Channels = &ChannelRepository{db: db}
 	db.Groups = &GroupRepository{db: db}
 	db.Posts = &PostRepository{db: db}
 	db.Digests = &DigestRepository{db: db}
-	db.Providers = &ProviderRepository{db: db}
+	db.Providers = &ProviderRepository{db: db, keyCipher: keyCipher}
 	db.Config = &ConfigRepository{db: db}
 
 	return db, nil
+}
+
+func reencryptLegacyProviderKeys(conn *sql.DB, keyCipher *secretCipher) error {
+	rows, err := conn.Query(`SELECT id, api_key FROM ai_providers WHERE api_key NOT LIKE ?`, encryptedAPIKeyPrefix+"%")
+	if err != nil {
+		return fmt.Errorf("select legacy provider keys: %w", err)
+	}
+	defer rows.Close()
+
+	type legacyKey struct {
+		id  int64
+		key string
+	}
+	var keys []legacyKey
+	for rows.Next() {
+		var item legacyKey
+		if err := rows.Scan(&item.id, &item.key); err != nil {
+			return fmt.Errorf("scan legacy provider key: %w", err)
+		}
+		keys = append(keys, item)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate legacy provider keys: %w", err)
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+
+	tx, err := conn.Begin()
+	if err != nil {
+		return fmt.Errorf("begin legacy provider key migration: %w", err)
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(`UPDATE ai_providers SET api_key = ? WHERE id = ?`)
+	if err != nil {
+		return fmt.Errorf("prepare legacy provider key migration: %w", err)
+	}
+	defer stmt.Close()
+	for _, item := range keys {
+		encrypted, err := keyCipher.encrypt(item.key)
+		if err != nil {
+			return fmt.Errorf("encrypt legacy provider key %d: %w", item.id, err)
+		}
+		if _, err := stmt.Exec(encrypted, item.id); err != nil {
+			return fmt.Errorf("update legacy provider key %d: %w", item.id, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit legacy provider key migration: %w", err)
+	}
+	return nil
 }
 
 // Close closes the database connection.

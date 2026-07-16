@@ -5,6 +5,7 @@ package main
 
 import (
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -30,7 +31,7 @@ func main() {
 	}
 
 	// Initialize SQLite so Fly boots against the mounted /data volume.
-	store, err := db.Open(cfg.DBPath)
+	store, err := db.OpenWithEncryptionKey(cfg.DBPath, cfg.ProviderKey)
 	if err != nil {
 		log.Fatalf("failed to open database at %s: %v", cfg.DBPath, err)
 	}
@@ -53,7 +54,11 @@ func main() {
 	// go bot.Start()
 
 	// Start HTTP server (health check + WebApp)
-	srv := webapp.New()
+	webAppAuth, err := webapp.NewWebAppAuth(cfg.BotToken, cfg.OwnerTelegramID)
+	if err != nil {
+		log.Fatalf("failed to configure WebApp authentication: %v", err)
+	}
+	srv := webapp.NewWithProvidersAuthenticated(store, 10*time.Second, http.DefaultClient, webAppAuth)
 	go func() {
 		log.Printf("HTTP server listening on :%s", cfg.Port)
 		if err := srv.Start(cfg.Port); err != nil {

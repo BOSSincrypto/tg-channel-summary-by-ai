@@ -33,10 +33,11 @@ func TestOpenRouterProviderChatCompletion(t *testing.T) {
 	defer server.Close()
 
 	provider, err := NewOpenRouterWithConfig(OpenRouterConfig{
-		BaseURL:    server.URL + "/api/v1",
-		APIKey:     "test-key",
-		Model:      "test-model",
-		HTTPClient: server.Client(),
+		BaseURL:           server.URL + "/api/v1",
+		APIKey:            "test-key",
+		Model:             "test-model",
+		HTTPClient:        server.Client(),
+		AllowPrivateHosts: true,
 	})
 	if err != nil {
 		t.Fatalf("create provider: %v", err)
@@ -67,10 +68,11 @@ func TestOpenRouterProviderSummarizeParsesBatchResponse(t *testing.T) {
 	defer server.Close()
 
 	provider, err := NewOpenRouterWithConfig(OpenRouterConfig{
-		BaseURL:    server.URL,
-		APIKey:     "test-key",
-		Model:      "test-model",
-		HTTPClient: server.Client(),
+		BaseURL:           server.URL,
+		APIKey:            "test-key",
+		Model:             "test-model",
+		HTTPClient:        server.Client(),
+		AllowPrivateHosts: true,
 	})
 	if err != nil {
 		t.Fatalf("create provider: %v", err)
@@ -101,10 +103,11 @@ func TestOpenRouterProviderRejectsNonSuccessResponseWithoutLeakingKey(t *testing
 	defer server.Close()
 
 	provider, err := NewOpenRouterWithConfig(OpenRouterConfig{
-		BaseURL:    server.URL,
-		APIKey:     "secret-key",
-		Model:      "test-model",
-		HTTPClient: server.Client(),
+		BaseURL:           server.URL,
+		APIKey:            "secret-key",
+		Model:             "test-model",
+		HTTPClient:        server.Client(),
+		AllowPrivateHosts: true,
 	})
 	if err != nil {
 		t.Fatalf("create provider: %v", err)
@@ -129,10 +132,11 @@ func TestOpenRouterProviderHonorsContextCancellation(t *testing.T) {
 	defer server.Close()
 
 	provider, err := NewOpenRouterWithConfig(OpenRouterConfig{
-		BaseURL:    server.URL,
-		APIKey:     "test-key",
-		Model:      "test-model",
-		HTTPClient: server.Client(),
+		BaseURL:           server.URL,
+		APIKey:            "test-key",
+		Model:             "test-model",
+		HTTPClient:        server.Client(),
+		AllowPrivateHosts: true,
 	})
 	if err != nil {
 		t.Fatalf("create provider: %v", err)

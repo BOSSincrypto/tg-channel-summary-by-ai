@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -244,6 +245,72 @@ func TestGenerateAIParseFailureNotifiesOnceAndPreservesPosts(t *testing.T) {
 	}
 }
 
+func TestSummarizeRejectsIncompleteResultBeforePersistence(t *testing.T) {
+	database, groupID, postIDs := newDigestPostsFixture(t, 2)
+	notifier := &recordingDigestNotifier{}
+	service := NewWithProcessor(database, nil)
+	service.aiConfigSource = database.Groups
+	service.notifier = notifier
+	service.providerFactory = func(summarizer.GroupAIConfigSource, int64, *http.Client, func(error)) (summarizer.Provider, error) {
+		return staticDigestProvider{summaries: []summarizer.Summary{
+			{PostID: postIDs[0], Text: "Первый пост обработан."},
+		}}, nil
+	}
+
+	err := service.summarize(groupID, []model.Post{
+		{ID: postIDs[0]},
+		{ID: postIDs[1]},
+	})
+	if err == nil {
+		t.Fatal("expected incomplete summary result to fail")
+	}
+	if !strings.Contains(err.Error(), "summary") {
+		t.Fatalf("error = %q, want summary validation context", err)
+	}
+	if len(notifier.messages) != 1 {
+		t.Fatalf("notifications = %d, want one: %v", len(notifier.messages), notifier.messages)
+	}
+	for _, postID := range postIDs {
+		post, getErr := database.Posts.GetByID(postID)
+		if getErr != nil {
+			t.Fatalf("get post %d: %v", postID, getErr)
+		}
+		if post.Summary != nil {
+			t.Fatalf("post %d summary = %v, want unsummarized post preserved", postID, post.Summary)
+		}
+	}
+}
+
+func TestSummarizeRejectsOverCompleteResultAndDoesNotPersistAnySummary(t *testing.T) {
+	database, groupID, postIDs := newDigestPostsFixture(t, 2)
+	service := NewWithProcessor(database, nil)
+	service.aiConfigSource = database.Groups
+	service.providerFactory = func(summarizer.GroupAIConfigSource, int64, *http.Client, func(error)) (summarizer.Provider, error) {
+		return staticDigestProvider{summaries: []summarizer.Summary{
+			{PostID: postIDs[0], Text: "Первый пост обработан."},
+			{PostID: postIDs[1], Text: "Второй пост обработан."},
+			{PostID: 999999, Text: "Выдуманный пост обработан."},
+		}}, nil
+	}
+
+	err := service.summarize(groupID, []model.Post{
+		{ID: postIDs[0]},
+		{ID: postIDs[1]},
+	})
+	if err == nil {
+		t.Fatal("expected over-complete summary result to fail")
+	}
+	for _, postID := range postIDs {
+		post, getErr := database.Posts.GetByID(postID)
+		if getErr != nil {
+			t.Fatalf("get post %d: %v", postID, getErr)
+		}
+		if post.Summary != nil {
+			t.Fatalf("post %d summary = %v, want no partial persistence", postID, post.Summary)
+		}
+	}
+}
+
 func TestGeneratePermanentAIFailureNotifiesOnceWithoutRetry(t *testing.T) {
 	database, groupID, postID := newDigestFailureFixture(t)
 	notifier := &recordingDigestNotifier{}
@@ -415,6 +482,12 @@ func TestGenerateFallbackOpenRouterOutageNotifiesOnlyTerminalFailure(t *testing.
 
 func newDigestFailureFixture(t *testing.T) (*db.DB, int64, int64) {
 	t.Helper()
+	database, groupID, postIDs := newDigestPostsFixture(t, 1)
+	return database, groupID, postIDs[0]
+}
+
+func newDigestPostsFixture(t *testing.T, count int) (*db.DB, int64, []int64) {
+	t.Helper()
 	database, err := db.Open(":memory:")
 	if err != nil {
 		t.Fatalf("open database: %v", err)
@@ -431,15 +504,20 @@ func newDigestFailureFixture(t *testing.T) (*db.DB, int64, int64) {
 	if err := database.Groups.AssignChannel(groupID, channelID, nil); err != nil {
 		t.Fatalf("assign channel: %v", err)
 	}
-	postID, err := database.Posts.Insert(&model.Post{
-		ChannelID: channelID, MessageID: 1, Text: "тестовый пост",
-		PostedAt: time.Now().UTC().Format(time.RFC3339),
-		URL:      "https://t.me/failure_channel/1", ContentHash: "failure-post",
-	})
-	if err != nil {
-		t.Fatalf("insert post: %v", err)
+	postIDs := make([]int64, 0, count)
+	for messageID := 1; messageID <= count; messageID++ {
+		postID, insertErr := database.Posts.Insert(&model.Post{
+			ChannelID: channelID, MessageID: int64(messageID), Text: "тестовый пост",
+			PostedAt:    time.Now().UTC().Format(time.RFC3339),
+			URL:         "https://t.me/failure_channel/" + fmt.Sprint(messageID),
+			ContentHash: "failure-post-" + fmt.Sprint(messageID),
+		})
+		if insertErr != nil {
+			t.Fatalf("insert post %d: %v", messageID, insertErr)
+		}
+		postIDs = append(postIDs, postID)
 	}
-	return database, groupID, postID
+	return database, groupID, postIDs
 }
 
 type failingDigestProvider struct {
@@ -462,6 +540,14 @@ func (successfulDigestProvider) Summarize(_ context.Context, posts []summarizer.
 		summaries = append(summaries, summarizer.Summary{PostID: post.ID, Text: "Пост обработан."})
 	}
 	return summaries, nil
+}
+
+type staticDigestProvider struct {
+	summaries []summarizer.Summary
+}
+
+func (p staticDigestProvider) Summarize(context.Context, []summarizer.Post) ([]summarizer.Summary, error) {
+	return p.summaries, nil
 }
 
 func TestScheduledAndManualDigestUseConfiguredProviderFallback(t *testing.T) {

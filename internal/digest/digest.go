@@ -219,21 +219,47 @@ func (s *Service) summarize(groupID int64, posts []model.Post) error {
 		s.notifyAIFailure(groupID, err)
 		return fmt.Errorf("summarize group %d: %w", groupID, err)
 	}
+	if err := validateSummaryBatch(posts, summaries); err != nil {
+		s.notifyAIFailure(groupID, err)
+		return fmt.Errorf("summarize group %d: %w", groupID, err)
+	}
 	if fallbackErr != nil {
 		s.notifyAIFallback(groupID)
 	}
 
-	expected := make(map[int64]struct{}, len(posts))
-	for _, post := range posts {
-		expected[post.ID] = struct{}{}
-	}
 	for _, summary := range summaries {
-		if _, ok := expected[summary.PostID]; !ok {
-			continue
-		}
 		if err := s.database.Posts.UpdateSummary(summary.PostID, summary.Text); err != nil {
 			return fmt.Errorf("store summary for post %d: %w", summary.PostID, err)
 		}
+	}
+	return nil
+}
+
+func validateSummaryBatch(posts []model.Post, summaries []summarizer.Summary) error {
+	if len(summaries) != len(posts) {
+		return fmt.Errorf("summary result count mismatch: received %d summaries for %d posts", len(summaries), len(posts))
+	}
+
+	expected := make(map[int64]struct{}, len(posts))
+	for _, post := range posts {
+		if _, duplicate := expected[post.ID]; duplicate {
+			return fmt.Errorf("summary result contains duplicate input post %d", post.ID)
+		}
+		expected[post.ID] = struct{}{}
+	}
+
+	seen := make(map[int64]struct{}, len(summaries))
+	for _, summary := range summaries {
+		if _, ok := expected[summary.PostID]; !ok {
+			return fmt.Errorf("summary result contains unknown post %d", summary.PostID)
+		}
+		if _, duplicate := seen[summary.PostID]; duplicate {
+			return fmt.Errorf("summary result contains duplicate summary for post %d", summary.PostID)
+		}
+		if strings.TrimSpace(summary.Text) == "" {
+			return fmt.Errorf("summary result contains empty summary for post %d", summary.PostID)
+		}
+		seen[summary.PostID] = struct{}{}
 	}
 	return nil
 }
@@ -262,6 +288,7 @@ func classifyAIFailure(err error) aiFailureClass {
 	if strings.Contains(lower, "parse summaries") ||
 		strings.Contains(lower, "expected json") ||
 		strings.Contains(lower, "summary response") ||
+		strings.Contains(lower, "summary result") ||
 		strings.Contains(lower, "not in russian") ||
 		strings.Contains(lower, "one sentence") {
 		return aiFailureParse

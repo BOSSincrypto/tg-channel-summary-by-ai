@@ -111,6 +111,38 @@ func TestParseChannelErrors(t *testing.T) {
 	}
 }
 
+func TestParseChannelWithStatsReportsHTTPStatus(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{name: "empty successful page", status: http.StatusOK, body: `<div class="tgme_channel_info"></div>`},
+		{name: "failed request", status: http.StatusBadGateway, body: `upstream failed`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer server.Close()
+
+			_, stats, err := NewWithOptions(Options{Client: server.Client(), BaseURL: server.URL}).ParseChannelWithStats("example")
+			if stats.HTTPStatus != tt.status {
+				t.Fatalf("HTTP status = %d, want %d", stats.HTTPStatus, tt.status)
+			}
+			if tt.status == http.StatusOK && err != nil {
+				t.Fatalf("successful page error = %v", err)
+			}
+			if tt.status != http.StatusOK && err == nil {
+				t.Fatal("failed request returned nil error")
+			}
+		})
+	}
+}
+
 func TestParseChannelRateLimitErrorIncludesRetryAfter(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", "17")

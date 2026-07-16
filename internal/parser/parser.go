@@ -116,33 +116,33 @@ func (p *Parser) ParseChannelWithStats(username string) ([]ParsedPost, ParseStat
 		return nil, ParseStats{}, fmt.Errorf("fetch t.me/s/%s: %w", username, err)
 	}
 	defer response.Body.Close()
+	stats := ParseStats{HTTPStatus: response.StatusCode}
 
 	if response.StatusCode == http.StatusTooManyRequests {
-		return nil, ParseStats{}, &RateLimitError{RetryAfter: retryAfter(response.Header.Get("Retry-After"), time.Now())}
+		return nil, stats, &RateLimitError{RetryAfter: retryAfter(response.Header.Get("Retry-After"), time.Now())}
 	}
 	if response.StatusCode == http.StatusNotFound {
-		return nil, ParseStats{}, fmt.Errorf("fetch t.me/s/%s: %w", username, ErrChannelNotFound)
+		return nil, stats, fmt.Errorf("fetch t.me/s/%s: %w", username, ErrChannelNotFound)
 	}
 	if response.StatusCode == http.StatusForbidden {
-		return nil, ParseStats{}, fmt.Errorf("fetch t.me/s/%s: %w", username, ErrChannelPrivate)
+		return nil, stats, fmt.Errorf("fetch t.me/s/%s: %w", username, ErrChannelPrivate)
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return nil, ParseStats{}, fmt.Errorf("fetch t.me/s/%s: unexpected HTTP status %s", username, response.Status)
+		return nil, stats, fmt.Errorf("fetch t.me/s/%s: unexpected HTTP status %s", username, response.Status)
 	}
 
 	document, err := goquery.NewDocumentFromReader(response.Body)
 	if err != nil {
-		return nil, ParseStats{}, fmt.Errorf("parse t.me/s/%s HTML: %w", username, err)
+		return nil, stats, fmt.Errorf("parse t.me/s/%s HTML: %w", username, err)
 	}
 	if isPrivatePage(document) {
-		return nil, ParseStats{}, fmt.Errorf("parse t.me/s/%s: %w", username, ErrChannelPrivate)
+		return nil, stats, fmt.Errorf("parse t.me/s/%s: %w", username, ErrChannelPrivate)
 	}
 	if isNotFoundPage(document) {
-		return nil, ParseStats{}, fmt.Errorf("parse t.me/s/%s: %w", username, ErrChannelNotFound)
+		return nil, stats, fmt.Errorf("parse t.me/s/%s: %w", username, ErrChannelNotFound)
 	}
 
 	posts := make([]ParsedPost, 0)
-	stats := ParseStats{}
 	document.Find(".tgme_widget_message[data-post]").Each(func(_ int, selection *goquery.Selection) {
 		post, ok := parsePost(selection)
 		if ok {

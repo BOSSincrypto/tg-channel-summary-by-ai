@@ -1,8 +1,11 @@
 package parser
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
@@ -114,9 +117,189 @@ func TestChannelProcessorContinuesBatchAfterChannelFailure(t *testing.T) {
 	}
 }
 
+func TestChannelProcessorExposesHTTPAndPopulationMetadata(t *testing.T) {
+	database, cleanup := newStorageTestDB(t)
+	defer cleanup()
+
+	populated := &model.Channel{Username: "populated", Enabled: true, LastPostID: 41}
+	populatedID, err := database.Channels.Insert(populated)
+	if err != nil {
+		t.Fatalf("insert populated channel: %v", err)
+	}
+	populated.ID = populatedID
+	newChannel := &model.Channel{Username: "new", Enabled: true}
+	newID, err := database.Channels.Insert(newChannel)
+	if err != nil {
+		t.Fatalf("insert new channel: %v", err)
+	}
+	newChannel.ID = newID
+
+	fetcher := &fakeStatsChannelFetcher{
+		posts: map[string][]ParsedPost{
+			"populated": nil,
+			"new":       {{MessageID: 1, Text: "new post", PostedAt: "2026-07-15T18:30:00Z"}},
+		},
+		stats: map[string]ParseStats{
+			"populated": {HTTPStatus: http.StatusOK},
+			"new":       {HTTPStatus: http.StatusOK},
+		},
+	}
+	processor := NewChannelProcessor(fetcher, NewPostStorage(database.Channels, database.Posts))
+	batch, err := processor.ProcessChannels([]model.Channel{*populated, *newChannel})
+	if err != nil {
+		t.Fatalf("process channels: %v", err)
+	}
+	if len(batch.Results) != 2 {
+		t.Fatalf("results = %+v, want two successful results", batch.Results)
+	}
+	if got := batch.Results[0]; got.HTTPStatus != http.StatusOK || got.ParsedPosts != 0 || !got.PreviouslyPopulated {
+		t.Fatalf("populated result = %+v, want HTTP 200, zero posts, previously populated", got)
+	}
+	if got := batch.Results[1]; got.HTTPStatus != http.StatusOK || got.ParsedPosts != 1 || got.PreviouslyPopulated {
+		t.Fatalf("new result = %+v, want HTTP 200, one post, not previously populated", got)
+	}
+}
+
+func TestChannelProcessorNotifiesOnceForStructuralChange(t *testing.T) {
+	database, cleanup := newStorageTestDB(t)
+	defer cleanup()
+	channels := make([]model.Channel, 0, 2)
+	for _, username := range []string{"first", "second"} {
+		channel := &model.Channel{Username: username, Enabled: true, LastPostID: 10}
+		id, err := database.Channels.Insert(channel)
+		if err != nil {
+			t.Fatalf("insert channel %s: %v", username, err)
+		}
+		channel.ID = id
+		channels = append(channels, *channel)
+	}
+
+	notifier := &recordingOwnerNotifier{}
+	fetcher := &fakeStatsChannelFetcher{
+		posts: map[string][]ParsedPost{"first": nil, "second": nil},
+		stats: map[string]ParseStats{
+			"first":  {HTTPStatus: http.StatusOK},
+			"second": {HTTPStatus: http.StatusOK},
+		},
+	}
+	processor := NewChannelProcessor(fetcher, NewPostStorage(database.Channels, database.Posts), notifier)
+	batch, err := processor.ProcessChannels(channels)
+	if err != nil {
+		t.Fatalf("process channels: %v", err)
+	}
+	if len(batch.Failures) != 0 {
+		t.Fatalf("failures = %+v, want none", batch.Failures)
+	}
+	if len(notifier.messages) != 1 {
+		t.Fatalf("notifications = %d, want one", len(notifier.messages))
+	}
+	if !strings.Contains(notifier.messages[0], "структуру t.me/s") ||
+		!strings.Contains(notifier.messages[0], "Проверьте парсер") {
+		t.Fatalf("notification = %q, want actionable Russian structure warning", notifier.messages[0])
+	}
+}
+
+func TestChannelProcessorSkipsFalseStructuralChangeAlerts(t *testing.T) {
+	tests := []struct {
+		name     string
+		channels []model.Channel
+		posts    map[string][]ParsedPost
+		stats    map[string]ParseStats
+		errors   map[string]error
+	}{
+		{
+			name:     "new empty channels",
+			channels: []model.Channel{{Username: "new", Enabled: true}},
+			posts:    map[string][]ParsedPost{"new": nil},
+			stats:    map[string]ParseStats{"new": {HTTPStatus: http.StatusOK}},
+		},
+		{
+			name: "mixed non-empty results",
+			channels: []model.Channel{
+				{Username: "populated-empty", Enabled: true, LastPostID: 10},
+				{Username: "populated-nonempty", Enabled: true, LastPostID: 10},
+			},
+			posts: map[string][]ParsedPost{
+				"populated-empty":    nil,
+				"populated-nonempty": {{MessageID: 11, Text: "post", PostedAt: "2026-07-15T18:30:00Z"}},
+			},
+			stats: map[string]ParseStats{
+				"populated-empty":    {HTTPStatus: http.StatusOK},
+				"populated-nonempty": {HTTPStatus: http.StatusOK},
+			},
+		},
+		{
+			name: "failed HTTP request",
+			channels: []model.Channel{
+				{Username: "populated", Enabled: true, LastPostID: 10},
+				{Username: "failed", Enabled: true, LastPostID: 10},
+			},
+			posts: map[string][]ParsedPost{"populated": nil, "failed": nil},
+			stats: map[string]ParseStats{
+				"populated": {HTTPStatus: http.StatusOK},
+				"failed":    {HTTPStatus: http.StatusBadGateway},
+			},
+			errors: map[string]error{"failed": errors.New("bad gateway")},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			database, cleanup := newStorageTestDB(t)
+			defer cleanup()
+			for i := range tt.channels {
+				id, err := database.Channels.Insert(&tt.channels[i])
+				if err != nil {
+					t.Fatalf("insert channel: %v", err)
+				}
+				tt.channels[i].ID = id
+			}
+			notifier := &recordingOwnerNotifier{}
+			processor := NewChannelProcessor(
+				&fakeStatsChannelFetcher{posts: tt.posts, stats: tt.stats, errors: tt.errors},
+				NewPostStorage(database.Channels, database.Posts),
+				notifier,
+			)
+			if _, err := processor.ProcessChannels(tt.channels); err != nil {
+				t.Fatalf("process channels: %v", err)
+			}
+			if len(notifier.messages) != 0 {
+				t.Fatalf("notifications = %q, want none", notifier.messages)
+			}
+		})
+	}
+}
+
 type fakeChannelFetcher struct {
 	posts  map[string][]ParsedPost
 	errors map[string]error
+}
+
+type fakeStatsChannelFetcher struct {
+	posts  map[string][]ParsedPost
+	stats  map[string]ParseStats
+	errors map[string]error
+}
+
+func (f *fakeStatsChannelFetcher) ParseChannel(username string) ([]ParsedPost, error) {
+	posts, _, err := f.ParseChannelWithStats(username)
+	return posts, err
+}
+
+func (f *fakeStatsChannelFetcher) ParseChannelWithStats(username string) ([]ParsedPost, ParseStats, error) {
+	if err := f.errors[username]; err != nil {
+		return nil, f.stats[username], err
+	}
+	return f.posts[username], f.stats[username], nil
+}
+
+type recordingOwnerNotifier struct {
+	messages []string
+}
+
+func (n *recordingOwnerNotifier) NotifyOwner(_ context.Context, text string) error {
+	n.messages = append(n.messages, text)
+	return nil
 }
 
 func (f *fakeChannelFetcher) ParseChannel(username string) ([]ParsedPost, error) {

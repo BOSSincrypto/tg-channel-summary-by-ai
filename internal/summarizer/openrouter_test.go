@@ -3,6 +3,7 @@ package summarizer
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -129,6 +130,74 @@ func TestOpenRouterProviderRejectsNonSuccessResponseWithoutLeakingKey(t *testing
 	}
 }
 
+func TestOpenRouterProviderRedactsKeyFromProviderResponseError(t *testing.T) {
+	const apiKey = "provider-response-secret"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":{"message":"upstream rejected Authorization Bearer provider-response-secret; retry request"}}`, http.StatusBadGateway)
+	}))
+	defer server.Close()
+
+	provider, err := NewOpenRouterWithConfig(OpenRouterConfig{
+		BaseURL:    server.URL,
+		APIKey:     apiKey,
+		Model:      "test-model",
+		HTTPClient: server.Client(),
+		RetrySleep: func(context.Context, time.Duration) error {
+			return nil
+		},
+		AllowPrivateHosts: true,
+	})
+	if err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+
+	_, err = provider.ChatCompletion(context.Background(), []Message{{Role: "user", Content: "test"}})
+	if err == nil {
+		t.Fatal("expected upstream error")
+	}
+	if strings.Contains(err.Error(), apiKey) {
+		t.Fatalf("provider error leaked configured API key: %q", err)
+	}
+	for _, want := range []string{"HTTP 502", "[redacted]", "retry request"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("provider error %q does not retain safe context %q", err, want)
+		}
+	}
+}
+
+func TestOpenRouterProviderRedactsKeyFromTransportError(t *testing.T) {
+	const apiKey = "transport-provider-secret"
+	client := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return nil, fmt.Errorf("transport unavailable for Authorization Bearer %s", apiKey)
+		}),
+	}
+	provider, err := NewOpenRouterWithConfig(OpenRouterConfig{
+		BaseURL:    "https://provider.invalid/v1",
+		APIKey:     apiKey,
+		Model:      "test-model",
+		HTTPClient: client,
+		RetrySleep: func(context.Context, time.Duration) error {
+			return nil
+		},
+		AllowPrivateHosts: true,
+	})
+	if err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+
+	_, err = provider.ChatCompletion(context.Background(), []Message{{Role: "user", Content: "test"}})
+	if err == nil {
+		t.Fatal("expected transport error")
+	}
+	if strings.Contains(err.Error(), apiKey) {
+		t.Fatalf("transport error leaked configured API key: %q", err)
+	}
+	if !strings.Contains(err.Error(), "transport unavailable") {
+		t.Fatalf("transport error lost safe context: %q", err)
+	}
+}
+
 func TestOpenRouterProviderHonorsContextCancellation(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		<-r.Context().Done()
@@ -152,4 +221,10 @@ func TestOpenRouterProviderHonorsContextCancellation(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected context cancellation error")
 	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
 }

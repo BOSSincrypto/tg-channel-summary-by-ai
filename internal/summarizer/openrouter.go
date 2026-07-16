@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/boss/tg-channel-summary-by-ai/internal/security"
 )
 
 const (
@@ -29,12 +31,13 @@ const (
 
 // OpenRouterConfig configures an OpenRouterProvider.
 type OpenRouterConfig struct {
-	BaseURL     string
-	APIKey      string
-	Model       string
-	HTTPClient  *http.Client
-	HTTPReferer string
-	AppTitle    string
+	BaseURL      string
+	APIKey       string
+	Model        string
+	ProviderName string
+	HTTPClient   *http.Client
+	HTTPReferer  string
+	AppTitle     string
 	// RetrySleep overrides the retry delay, primarily for deterministic tests.
 	RetrySleep func(context.Context, time.Duration) error
 	// AllowPrivateHosts is intended only for trusted local test endpoints.
@@ -51,13 +54,15 @@ type Message struct {
 // OpenRouterProvider implements Provider through OpenRouter's
 // OpenAI-compatible chat completions endpoint.
 type OpenRouterProvider struct {
-	baseURL     string
-	apiKey      string
-	model       string
-	httpClient  *http.Client
-	httpReferer string
-	appTitle    string
-	retrySleep  func(context.Context, time.Duration) error
+	baseURL      string
+	apiKey       string
+	model        string
+	httpClient   *http.Client
+	httpReferer  string
+	appTitle     string
+	retrySleep   func(context.Context, time.Duration) error
+	redactor     *security.Redactor
+	providerName string
 }
 
 var _ Provider = (*OpenRouterProvider)(nil)
@@ -93,11 +98,13 @@ func NewOpenRouter(apiKey, model string) *OpenRouterProvider {
 		model = DefaultOpenRouterModel
 	}
 	return &OpenRouterProvider{
-		baseURL:    DefaultOpenRouterBaseURL,
-		apiKey:     apiKey,
-		model:      model,
-		httpClient: &http.Client{Timeout: 60 * time.Second},
-		retrySleep: sleepWithContext,
+		baseURL:      DefaultOpenRouterBaseURL,
+		apiKey:       apiKey,
+		model:        model,
+		httpClient:   &http.Client{Timeout: 60 * time.Second},
+		retrySleep:   sleepWithContext,
+		redactor:     security.NewRedactor(apiKey),
+		providerName: "OpenRouter",
 	}
 }
 
@@ -124,14 +131,24 @@ func NewOpenRouterWithConfig(config OpenRouterConfig) (*OpenRouterProvider, erro
 	}
 	client = secureProviderHTTPClient(client, config.AllowPrivateHosts)
 	return &OpenRouterProvider{
-		baseURL:     baseURL,
-		apiKey:      config.APIKey,
-		model:       model,
-		httpClient:  client,
-		httpReferer: strings.TrimSpace(config.HTTPReferer),
-		appTitle:    strings.TrimSpace(config.AppTitle),
-		retrySleep:  retrySleep(config.RetrySleep),
+		baseURL:      baseURL,
+		apiKey:       config.APIKey,
+		model:        model,
+		httpClient:   client,
+		httpReferer:  strings.TrimSpace(config.HTTPReferer),
+		appTitle:     strings.TrimSpace(config.AppTitle),
+		retrySleep:   retrySleep(config.RetrySleep),
+		redactor:     security.NewRedactor(config.APIKey),
+		providerName: providerName(config.ProviderName),
 	}, nil
+}
+
+func providerName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "OpenRouter"
+	}
+	return name
 }
 
 // ChatCompletion sends messages to /chat/completions and returns the first
@@ -158,7 +175,20 @@ func (p *OpenRouterProvider) ChatCompletion(ctx context.Context, messages []Mess
 			return "", fmt.Errorf("wait before OpenRouter retry: %w", err)
 		}
 	}
-	return "", lastErr
+	return "", p.sanitizeError(lastErr)
+}
+
+func (p *OpenRouterProvider) sanitizeError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var providerErr *ProviderError
+	if errors.As(err, &providerErr) {
+		copy := *providerErr
+		copy.Provider = p.providerName
+		err = &copy
+	}
+	return p.redactor.Wrap("", err)
 }
 
 func (p *OpenRouterProvider) chatCompletionAttempt(ctx context.Context, messages []Message) (string, time.Duration, error) {
@@ -211,7 +241,7 @@ func (p *OpenRouterProvider) chatCompletionAttempt(ctx context.Context, messages
 		return "", 0, fmt.Errorf("decode OpenRouter response: %w", err)
 	}
 	if decoded.Error != nil && decoded.Error.Message != "" {
-		return "", 0, &ProviderError{Message: decoded.Error.Message}
+		return "", 0, &ProviderError{StatusCode: response.StatusCode, Message: decoded.Error.Message}
 	}
 	if len(decoded.Choices) == 0 {
 		return "", 0, errors.New("OpenRouter response contained no choices")
@@ -391,16 +421,21 @@ func parseBatchSummaries(content string) ([]batchSummary, error) {
 type ProviderError struct {
 	StatusCode int
 	Message    string
+	Provider   string
 }
 
 func (e *ProviderError) Error() string {
 	if e == nil {
 		return "AI provider error"
 	}
-	if e.Message == "" {
-		return fmt.Sprintf("OpenRouter chat completion: HTTP %d", e.StatusCode)
+	providerName := e.Provider
+	if providerName == "" {
+		providerName = "OpenRouter"
 	}
-	return fmt.Sprintf("OpenRouter chat completion: HTTP %d: %s", e.StatusCode, e.Message)
+	if e.Message == "" {
+		return fmt.Sprintf("%s chat completion: HTTP %d", providerName, e.StatusCode)
+	}
+	return fmt.Sprintf("%s chat completion: HTTP %d: %s", providerName, e.StatusCode, e.Message)
 }
 
 func isTransientProviderError(ctx context.Context, err error) bool {

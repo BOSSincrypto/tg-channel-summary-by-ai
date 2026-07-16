@@ -45,7 +45,18 @@ func main() {
 		log.Fatalf("failed to configure default AI provider: %v", err)
 	}
 
-	ownerNotifier := bot.NewOwnerNotifier(cfg.BotToken, cfg.OwnerTelegramID)
+	ownerNotifier := bot.NewOwnerNotifier(cfg.BotToken, cfg.OwnerTelegramID, cfg.OpenRouterKey)
+	ownerNotifier.SetProviderSecretSource(func() []string {
+		providers, err := store.Providers.List()
+		if err != nil {
+			return nil
+		}
+		secrets := make([]string, 0, len(providers))
+		for _, provider := range providers {
+			secrets = append(secrets, provider.APIKey)
+		}
+		return secrets
+	})
 	maintenanceSvc := maintenance.New(maintenance.Options{
 		RetentionDays: cfg.PostRetentionDays,
 		Interval:      24 * time.Hour,

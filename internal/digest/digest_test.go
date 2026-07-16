@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
@@ -59,6 +60,72 @@ func TestGenerateFetchesStoresAndSelectsFreshPosts(t *testing.T) {
 	}
 	if storedPost.URL != "https://t.me/digest_channel/7" {
 		t.Fatalf("stored URL = %q, want canonical URL", storedPost.URL)
+	}
+}
+
+func TestGenerateRedactsProviderKeyFromProductionError(t *testing.T) {
+	const apiKey = "digest-provider-secret"
+	parserServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`<div class="tgme_widget_message" data-post="redaction_channel/9"><div class="tgme_widget_message_text">пост для проверки ошибки</div><time datetime="2099-07-15T18:30:00Z"></time></div>`))
+	}))
+	defer parserServer.Close()
+
+	providerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":{"message":"provider request failed with key digest-provider-secret; retry later"}}`, http.StatusBadGateway)
+	}))
+	defer providerServer.Close()
+
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer database.Close()
+
+	providerID, err := database.Providers.Insert(&model.AIProvider{
+		Name:         "Redaction provider",
+		BaseURL:      providerServer.URL,
+		APIKey:       apiKey,
+		DefaultModel: "redaction-model",
+		IsDefault:    true,
+	})
+	if err != nil {
+		t.Fatalf("insert provider: %v", err)
+	}
+	channelID, err := database.Channels.Insert(&model.Channel{Username: "redaction_channel", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	groupID, err := database.Groups.Insert(&model.Group{TelegramChatID: -1005, Title: "Redaction group"})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	if err := database.Groups.AssignChannel(groupID, channelID, nil); err != nil {
+		t.Fatalf("assign channel: %v", err)
+	}
+	if err := database.Groups.UpdateGroupSettings(&model.GroupSettings{
+		GroupID:    groupID,
+		ProviderID: &providerID,
+		DigestTime: "21:00",
+		Timezone:   "UTC",
+	}); err != nil {
+		t.Fatalf("update group settings: %v", err)
+	}
+
+	fetcher := parser.NewWithOptions(parser.Options{Client: parserServer.Client(), BaseURL: parserServer.URL})
+	processor := parser.NewChannelProcessor(fetcher, parser.NewPostStorage(database.Channels, database.Posts))
+	service := NewWithProcessorAndAIForTesting(database, processor, database.Groups, providerServer.Client())
+
+	_, err = service.Generate(groupID)
+	if err == nil {
+		t.Fatal("expected digest provider error")
+	}
+	if strings.Contains(err.Error(), apiKey) {
+		t.Fatalf("digest error leaked configured API key: %q", err)
+	}
+	for _, want := range []string{"summarize group", "Redaction provider", "HTTP 502", "[redacted]"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("digest error %q does not retain safe context %q", err, want)
+		}
 	}
 }
 

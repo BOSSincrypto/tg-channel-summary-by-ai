@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
+	"github.com/boss/tg-channel-summary-by-ai/internal/security"
 )
 
 // CustomProviderConfig configures an OpenAI-compatible custom provider.
@@ -54,33 +55,11 @@ func ValidateCustomProvider(ctx context.Context, config CustomProviderConfig, ti
 }
 
 func sanitizeProviderError(err error, apiKey string) error {
-	if err == nil || apiKey == "" {
-		return err
+	if err == nil {
+		return nil
 	}
-	return errors.New(replaceSecret(err.Error(), apiKey))
-}
-
-func replaceSecret(value, secret string) string {
-	if secret == "" {
-		return value
-	}
-	result := value
-	for {
-		next := replaceFirst(result, secret, "[redacted]")
-		if next == result {
-			return result
-		}
-		result = next
-	}
-}
-
-func replaceFirst(value, old, new string) string {
-	for i := 0; i+len(old) <= len(value); i++ {
-		if value[i:i+len(old)] == old {
-			return value[:i] + new + value[i+len(old):]
-		}
-	}
-	return value
+	message := security.NewRedactor(apiKey).Error(err)
+	return errors.New(message)
 }
 
 // Ensure the custom provider remains usable anywhere a Provider is expected.
@@ -133,12 +112,12 @@ func newProviderFromConfig(config model.AIProvider, modelOverride string, client
 	if strings.TrimRight(config.BaseURL, "/") == DefaultOpenRouterBaseURL {
 		return NewOpenRouterWithConfig(OpenRouterConfig{
 			BaseURL: config.BaseURL, APIKey: config.APIKey, Model: effectiveModel,
-			HTTPClient: client, AllowPrivateHosts: allowPrivateHosts,
+			ProviderName: config.Name, HTTPClient: client, AllowPrivateHosts: allowPrivateHosts,
 		})
 	}
 	return NewCustomProvider(CustomProviderConfig{
 		BaseURL: config.BaseURL, APIKey: config.APIKey, Model: effectiveModel,
-		HTTPClient: client, AllowPrivateHosts: allowPrivateHosts,
+		ProviderName: config.Name, HTTPClient: client, AllowPrivateHosts: allowPrivateHosts,
 	})
 }
 

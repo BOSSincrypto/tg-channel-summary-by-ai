@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
 )
@@ -427,4 +428,300 @@ func (f *fakeChannelFetcher) ParseChannel(username string) ([]ParsedPost, error)
 		return nil, err
 	}
 	return f.posts[username], nil
+}
+
+// sequenceFetcher returns canned responses per call for each channel username.
+type sequenceFetcher struct {
+	// responses[username][callIndex] => posts, stats, error
+	calls     map[string]int
+	order     []string
+	responses map[string][]sequenceResponse
+}
+
+type sequenceResponse struct {
+	posts []ParsedPost
+	stats ParseStats
+	err   error
+}
+
+func (f *sequenceFetcher) ParseChannel(username string) ([]ParsedPost, error) {
+	posts, _, err := f.ParseChannelWithStats(username)
+	return posts, err
+}
+
+func (f *sequenceFetcher) ParseChannelWithStats(username string) ([]ParsedPost, ParseStats, error) {
+	if f.calls == nil {
+		f.calls = make(map[string]int)
+	}
+	f.order = append(f.order, username)
+	idx := f.calls[username]
+	f.calls[username] = idx + 1
+	responses := f.responses[username]
+	if idx >= len(responses) {
+		last := responses[len(responses)-1]
+		return last.posts, last.stats, last.err
+	}
+	resp := responses[idx]
+	return resp.posts, resp.stats, resp.err
+}
+
+type recordingSleeper struct {
+	sleeps []time.Duration
+}
+
+func (s *recordingSleeper) Sleep(_ context.Context, d time.Duration) error {
+	s.sleeps = append(s.sleeps, d)
+	return nil
+}
+
+func TestProcessChannelsRetriesOnlyRateLimitedChannel(t *testing.T) {
+	database, cleanup := newStorageTestDB(t)
+	defer cleanup()
+
+	channelA := &model.Channel{Username: "channela", Enabled: true}
+	idA, err := database.Channels.Insert(channelA)
+	if err != nil {
+		t.Fatalf("insert A: %v", err)
+	}
+	channelA.ID = idA
+	channelB := &model.Channel{Username: "channelb", Enabled: true}
+	idB, err := database.Channels.Insert(channelB)
+	if err != nil {
+		t.Fatalf("insert B: %v", err)
+	}
+	channelB.ID = idB
+
+	fetcher := &sequenceFetcher{responses: map[string][]sequenceResponse{
+		"channela": {
+			{stats: ParseStats{HTTPStatus: http.StatusTooManyRequests}, err: &RateLimitError{RetryAfter: 17 * time.Second}},
+			{posts: []ParsedPost{{MessageID: 1, Text: "a recovered", PostedAt: "2026-07-15T18:30:00Z"}}, stats: ParseStats{HTTPStatus: http.StatusOK}},
+		},
+		"channelb": {
+			{posts: []ParsedPost{{MessageID: 2, Text: "b ok", PostedAt: "2026-07-15T18:31:00Z"}}, stats: ParseStats{HTTPStatus: http.StatusOK}},
+		},
+	}}
+	sleeper := &recordingSleeper{}
+	processor := NewChannelProcessor(fetcher, NewPostStorage(database.Channels, database.Posts)).
+		WithMaxRetries(3).
+		WithSleeper(sleeper)
+
+	batch, err := processor.ProcessChannels([]model.Channel{*channelA, *channelB})
+	if err != nil {
+		t.Fatalf("process channels: %v", err)
+	}
+	if len(batch.Failures) != 0 {
+		t.Fatalf("failures = %+v, want none after A recovery", batch.Failures)
+	}
+	if len(batch.Results) != 2 {
+		t.Fatalf("results = %+v, want both channels", batch.Results)
+	}
+	if fetcher.calls["channela"] != 2 {
+		t.Fatalf("channel A attempts = %d, want 2", fetcher.calls["channela"])
+	}
+	if fetcher.calls["channelb"] != 1 {
+		t.Fatalf("channel B attempts = %d, want 1", fetcher.calls["channelb"])
+	}
+	// B must proceed before A is retried: first-pass A, first-pass B, then retry A.
+	if len(fetcher.order) < 3 || fetcher.order[0] != "channela" || fetcher.order[1] != "channelb" || fetcher.order[2] != "channela" {
+		t.Fatalf("fetch order = %v, want [channela, channelb, channela]", fetcher.order)
+	}
+	if len(sleeper.sleeps) != 1 || sleeper.sleeps[0] != 17*time.Second {
+		t.Fatalf("sleeps = %v, want one 17s sleep only for channel A", sleeper.sleeps)
+	}
+}
+
+func TestProcessChannelsRateLimitDefaultBackoffAndNoInfiniteLoop(t *testing.T) {
+	database, cleanup := newStorageTestDB(t)
+	defer cleanup()
+
+	channel := &model.Channel{Username: "limited", Enabled: true, LastPostID: 5}
+	id, err := database.Channels.Insert(channel)
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	channel.ID = id
+
+	fetcher := &sequenceFetcher{responses: map[string][]sequenceResponse{
+		"limited": {
+			{stats: ParseStats{HTTPStatus: http.StatusTooManyRequests}, err: &RateLimitError{RetryAfter: defaultRateLimitBackoff}},
+		},
+	}}
+	sleeper := &recordingSleeper{}
+	processor := NewChannelProcessor(fetcher, NewPostStorage(database.Channels, database.Posts)).
+		WithMaxRetries(3).
+		WithSleeper(sleeper)
+
+	batch, err := processor.ProcessChannels([]model.Channel{*channel})
+	if err != nil {
+		t.Fatalf("process channels: %v", err)
+	}
+	if len(batch.Failures) != 1 {
+		t.Fatalf("failures = %+v, want one exhausted rate-limit failure", batch.Failures)
+	}
+	var rateLimitErr *RateLimitError
+	if !errors.As(batch.Failures[0].Err, &rateLimitErr) {
+		t.Fatalf("failure err = %v, want RateLimitError", batch.Failures[0].Err)
+	}
+	if rateLimitErr.RetryAfter != defaultRateLimitBackoff {
+		t.Fatalf("retry after = %s, want %s", rateLimitErr.RetryAfter, defaultRateLimitBackoff)
+	}
+	if fetcher.calls["limited"] != 3 {
+		t.Fatalf("attempts = %d, want MaxRetries=3 (no infinite loop)", fetcher.calls["limited"])
+	}
+	// Two sleeps between three attempts.
+	if len(sleeper.sleeps) != 2 {
+		t.Fatalf("sleeps = %v, want two backoff sleeps", sleeper.sleeps)
+	}
+	for _, d := range sleeper.sleeps {
+		if d != defaultRateLimitBackoff {
+			t.Fatalf("sleep = %s, want default five-minute backoff", d)
+		}
+	}
+}
+
+func TestProcessChannelsExhaustedRateLimitPreservedInBatch(t *testing.T) {
+	database, cleanup := newStorageTestDB(t)
+	defer cleanup()
+
+	okChannel := &model.Channel{Username: "ok", Enabled: true}
+	okID, err := database.Channels.Insert(okChannel)
+	if err != nil {
+		t.Fatalf("insert ok: %v", err)
+	}
+	okChannel.ID = okID
+	badChannel := &model.Channel{Username: "bad", Enabled: true, LastPostID: 9}
+	badID, err := database.Channels.Insert(badChannel)
+	if err != nil {
+		t.Fatalf("insert bad: %v", err)
+	}
+	badChannel.ID = badID
+
+	fetcher := &sequenceFetcher{responses: map[string][]sequenceResponse{
+		"ok": {
+			{posts: []ParsedPost{{MessageID: 1, Text: "ok", PostedAt: "2026-07-15T18:30:00Z"}}, stats: ParseStats{HTTPStatus: http.StatusOK}},
+		},
+		"bad": {
+			{stats: ParseStats{HTTPStatus: http.StatusTooManyRequests}, err: &RateLimitError{RetryAfter: time.Second}},
+		},
+	}}
+	processor := NewChannelProcessor(fetcher, NewPostStorage(database.Channels, database.Posts)).
+		WithMaxRetries(2).
+		WithSleeper(&recordingSleeper{})
+
+	batch, err := processor.ProcessChannels([]model.Channel{*okChannel, *badChannel})
+	if err != nil {
+		t.Fatalf("process channels: %v", err)
+	}
+	if len(batch.Results) != 1 || batch.Results[0].Channel.Username != "ok" {
+		t.Fatalf("results = %+v, want successful ok channel only", batch.Results)
+	}
+	if len(batch.Failures) != 1 || batch.Failures[0].Channel.Username != "bad" {
+		t.Fatalf("failures = %+v, want exhausted bad channel preserved", batch.Failures)
+	}
+	if batch.Failures[0].HTTPStatus != http.StatusTooManyRequests {
+		t.Fatalf("failure HTTP status = %d, want 429", batch.Failures[0].HTTPStatus)
+	}
+	stored, err := database.Channels.GetByID(badID)
+	if err != nil {
+		t.Fatalf("get bad channel: %v", err)
+	}
+	if stored.FetchErrorKind != FetchErrorKindRateLimited {
+		t.Fatalf("stored kind = %q, want %q", stored.FetchErrorKind, FetchErrorKindRateLimited)
+	}
+}
+
+func TestProcessChannelsPartialRateLimitNotifiesOnce(t *testing.T) {
+	database, cleanup := newStorageTestDB(t)
+	defer cleanup()
+
+	okChannel := &model.Channel{Username: "ok", Enabled: true}
+	okID, err := database.Channels.Insert(okChannel)
+	if err != nil {
+		t.Fatalf("insert ok: %v", err)
+	}
+	okChannel.ID = okID
+	badChannel := &model.Channel{Username: "ratelimited", Enabled: true, LastPostID: 3}
+	badID, err := database.Channels.Insert(badChannel)
+	if err != nil {
+		t.Fatalf("insert bad: %v", err)
+	}
+	badChannel.ID = badID
+
+	notifier := &recordingOwnerNotifier{}
+	fetcher := &sequenceFetcher{responses: map[string][]sequenceResponse{
+		"ok": {
+			{posts: []ParsedPost{{MessageID: 1, Text: "ok", PostedAt: "2026-07-15T18:30:00Z"}}, stats: ParseStats{HTTPStatus: http.StatusOK}},
+		},
+		"ratelimited": {
+			{stats: ParseStats{HTTPStatus: http.StatusTooManyRequests}, err: &RateLimitError{RetryAfter: time.Second}},
+		},
+	}}
+	processor := NewChannelProcessor(fetcher, NewPostStorage(database.Channels, database.Posts), notifier).
+		WithMaxRetries(1).
+		WithSleeper(&recordingSleeper{})
+
+	batch, err := processor.ProcessChannels([]model.Channel{*okChannel, *badChannel})
+	if err != nil {
+		t.Fatalf("process channels: %v", err)
+	}
+	if len(batch.Failures) != 1 {
+		t.Fatalf("failures = %+v, want one rate-limit failure", batch.Failures)
+	}
+	if len(notifier.messages) != 1 {
+		t.Fatalf("notifications = %q, want exactly one partial-digest rate-limit alert", notifier.messages)
+	}
+	msg := notifier.messages[0]
+	for _, want := range []string{"ограничен", "частичн", "@ratelimited"} {
+		if !strings.Contains(strings.ToLower(msg), strings.ToLower(want)) && !strings.Contains(msg, want) {
+			// keep checking exact Russian tokens below
+			_ = want
+		}
+	}
+	if !strings.Contains(msg, "rate") && !strings.Contains(msg, "429") && !strings.Contains(msg, "ограничен") {
+		// Prefer Russian actionable wording.
+		if !strings.Contains(msg, "лимит") && !strings.Contains(msg, "частот") {
+			t.Fatalf("notification %q missing rate-limit language", msg)
+		}
+	}
+	if !strings.Contains(msg, "@ratelimited") {
+		t.Fatalf("notification %q missing limited channel", msg)
+	}
+	if !strings.Contains(msg, "частичн") && !strings.Contains(msg, "частичный") && !strings.Contains(msg, "неполн") {
+		t.Fatalf("notification %q missing partial-digest wording", msg)
+	}
+}
+
+func TestProcessChannelsFullySuccessfulBatchNoRateLimitNotification(t *testing.T) {
+	database, cleanup := newStorageTestDB(t)
+	defer cleanup()
+
+	channel := &model.Channel{Username: "ok", Enabled: true}
+	id, err := database.Channels.Insert(channel)
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	channel.ID = id
+
+	notifier := &recordingOwnerNotifier{}
+	// First attempt rate-limits, second succeeds — batch fully succeeds, no partial notify.
+	fetcher := &sequenceFetcher{responses: map[string][]sequenceResponse{
+		"ok": {
+			{stats: ParseStats{HTTPStatus: http.StatusTooManyRequests}, err: &RateLimitError{RetryAfter: 2 * time.Second}},
+			{posts: []ParsedPost{{MessageID: 1, Text: "ok", PostedAt: "2026-07-15T18:30:00Z"}}, stats: ParseStats{HTTPStatus: http.StatusOK}},
+		},
+	}}
+	processor := NewChannelProcessor(fetcher, NewPostStorage(database.Channels, database.Posts), notifier).
+		WithMaxRetries(3).
+		WithSleeper(&recordingSleeper{})
+
+	batch, err := processor.ProcessChannels([]model.Channel{*channel})
+	if err != nil {
+		t.Fatalf("process channels: %v", err)
+	}
+	if len(batch.Failures) != 0 || len(batch.Results) != 1 {
+		t.Fatalf("batch = results=%+v failures=%+v, want full success", batch.Results, batch.Failures)
+	}
+	if len(notifier.messages) != 0 {
+		t.Fatalf("notifications = %q, want none for fully successful batch", notifier.messages)
+	}
 }

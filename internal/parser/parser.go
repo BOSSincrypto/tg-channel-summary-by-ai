@@ -59,6 +59,7 @@ type Options struct {
 	Client    *http.Client
 	BaseURL   string
 	UserAgent string
+	Now       func() time.Time
 }
 
 // Parser fetches and parses t.me/s HTML pages.
@@ -66,6 +67,7 @@ type Parser struct {
 	client    *http.Client
 	baseURL   string
 	userAgent string
+	now       func() time.Time
 }
 
 // New creates a Parser using Telegram's public web preview endpoint.
@@ -87,7 +89,11 @@ func NewWithOptions(options Options) *Parser {
 	if userAgent == "" {
 		userAgent = "Mozilla/5.0 (compatible; TelegramDigestBot/1.0)"
 	}
-	return &Parser{client: client, baseURL: baseURL, userAgent: userAgent}
+	now := options.Now
+	if now == nil {
+		now = time.Now
+	}
+	return &Parser{client: client, baseURL: baseURL, userAgent: userAgent, now: now}
 }
 
 // ParseChannel fetches and parses posts from t.me/s/{username}. Posts without
@@ -123,7 +129,11 @@ func (p *Parser) ParseChannelWithStats(username string) ([]ParsedPost, ParseStat
 	stats := ParseStats{HTTPStatus: response.StatusCode}
 
 	if response.StatusCode == http.StatusTooManyRequests {
-		return nil, stats, &RateLimitError{RetryAfter: retryAfter(response.Header.Get("Retry-After"), time.Now())}
+		now := time.Now
+		if p.now != nil {
+			now = p.now
+		}
+		return nil, stats, &RateLimitError{RetryAfter: retryAfter(response.Header.Get("Retry-After"), now())}
 	}
 	if response.StatusCode == http.StatusNotFound {
 		return nil, stats, fmt.Errorf("fetch t.me/s/%s: %w", username, ErrChannelNotFound)
@@ -235,7 +245,11 @@ func isNotFoundPage(document *goquery.Document) bool {
 
 func retryAfter(value string, now time.Time) time.Duration {
 	value = strings.TrimSpace(value)
-	if seconds, err := strconv.Atoi(value); err == nil && seconds >= 0 {
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil && seconds >= 0 {
+		maxSeconds := int64(time.Duration(1<<63-1) / time.Second)
+		if seconds > maxSeconds {
+			return defaultRateLimitBackoff
+		}
 		return time.Duration(seconds) * time.Second
 	}
 	if date, err := http.ParseTime(value); err == nil {

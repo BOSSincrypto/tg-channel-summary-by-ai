@@ -217,6 +217,45 @@ func TestParseChannelRateLimitDefaultsBackoff(t *testing.T) {
 	}
 }
 
+func TestParseChannelRateLimitHTTPDateUsesInjectedClock(t *testing.T) {
+	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", now.Add(45*time.Second).Format(http.TimeFormat))
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	_, err := NewWithOptions(Options{
+		Client:  server.Client(),
+		BaseURL: server.URL,
+		Now:     func() time.Time { return now },
+	}).ParseChannel("example")
+	var rateLimitErr *RateLimitError
+	if !errors.As(err, &rateLimitErr) {
+		t.Fatalf("error = %v, want RateLimitError", err)
+	}
+	if rateLimitErr.RetryAfter != 45*time.Second {
+		t.Fatalf("retry after = %s, want 45s", rateLimitErr.RetryAfter)
+	}
+}
+
+func TestParseChannelRateLimitOverflowUsesDefaultBackoff(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "9223372036854775807")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	_, err := NewWithOptions(Options{Client: server.Client(), BaseURL: server.URL}).ParseChannel("example")
+	var rateLimitErr *RateLimitError
+	if !errors.As(err, &rateLimitErr) {
+		t.Fatalf("error = %v, want RateLimitError", err)
+	}
+	if rateLimitErr.RetryAfter != defaultRateLimitBackoff {
+		t.Fatalf("retry after = %s, want default %s", rateLimitErr.RetryAfter, defaultRateLimitBackoff)
+	}
+}
+
 func TestParseChannelRejectsInvalidUsername(t *testing.T) {
 	_, err := New().ParseChannel("../private")
 	if !errors.Is(err, ErrInvalidUsername) {

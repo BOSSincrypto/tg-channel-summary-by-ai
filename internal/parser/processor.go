@@ -67,6 +67,25 @@ type OwnerNotifier interface {
 	NotifyOwner(ctx context.Context, text string) error
 }
 
+// Sleeper abstracts retry delays so callers can make rate-limit handling
+// deterministic without waiting in tests.
+type Sleeper interface {
+	Sleep(context.Context, time.Duration) error
+}
+
+type contextSleeper struct{}
+
+func (contextSleeper) Sleep(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // ChannelFetchErrorStore persists and clears the durable fetch state attached
 // to a channel. It is optional so parser tests and alternate storage adapters
 // can continue to implement only cursor persistence.
@@ -77,9 +96,11 @@ type ChannelFetchErrorStore interface {
 
 // ChannelProcessor connects t.me/s parsing to persistent post storage.
 type ChannelProcessor struct {
-	fetcher  ChannelFetcher
-	storage  *PostStorage
-	notifier OwnerNotifier
+	fetcher    ChannelFetcher
+	storage    *PostStorage
+	notifier   OwnerNotifier
+	maxRetries int
+	sleeper    Sleeper
 }
 
 // NewChannelProcessor creates the production parser-to-storage adapter.
@@ -88,7 +109,39 @@ func NewChannelProcessor(fetcher ChannelFetcher, storage *PostStorage, notifiers
 	if len(notifiers) > 0 {
 		notifier = notifiers[0]
 	}
-	return &ChannelProcessor{fetcher: fetcher, storage: storage, notifier: notifier}
+	return &ChannelProcessor{
+		fetcher:    fetcher,
+		storage:    storage,
+		notifier:   notifier,
+		maxRetries: 3,
+		sleeper:    contextSleeper{},
+	}
+}
+
+// WithMaxRetries sets the maximum number of fetch attempts for a channel,
+// including its initial attempt. Values less than one are treated as one.
+func (p *ChannelProcessor) WithMaxRetries(maxRetries int) *ChannelProcessor {
+	if p == nil {
+		return p
+	}
+	if maxRetries < 1 {
+		maxRetries = 1
+	}
+	p.maxRetries = maxRetries
+	return p
+}
+
+// WithSleeper injects the delay implementation used between rate-limit
+// attempts. A nil sleeper restores the production context-aware sleeper.
+func (p *ChannelProcessor) WithSleeper(sleeper Sleeper) *ChannelProcessor {
+	if p == nil {
+		return p
+	}
+	if sleeper == nil {
+		sleeper = contextSleeper{}
+	}
+	p.sleeper = sleeper
+	return p
 }
 
 // ProcessChannel fetches a channel, validates required post fields, stores new
@@ -98,6 +151,14 @@ func (p *ChannelProcessor) ProcessChannel(channel *model.Channel) (ChannelProces
 }
 
 func (p *ChannelProcessor) processChannel(ctx context.Context, channel *model.Channel) (ChannelProcessResult, error) {
+	result, err := p.processChannelAttempt(ctx, channel)
+	if err == nil {
+		return result, nil
+	}
+	return p.retryRateLimited(ctx, channel, 1, result, err)
+}
+
+func (p *ChannelProcessor) processChannelAttempt(ctx context.Context, channel *model.Channel) (ChannelProcessResult, error) {
 	if p == nil || p.fetcher == nil || p.storage == nil {
 		return ChannelProcessResult{}, errors.New("process channel: parser and storage are required")
 	}
@@ -122,7 +183,7 @@ func (p *ChannelProcessor) processChannel(ctx context.Context, channel *model.Ch
 			Channel:    *channel,
 			HTTPStatus: stats.HTTPStatus,
 		}
-		if previouslyPopulated {
+		if previouslyPopulated && kind != FetchErrorKindRateLimited {
 			p.notifyChannelFailure(ctx, *channel, kind, err)
 		}
 		return result, fmt.Errorf("process channel %q: %w", channel.Username, err)
@@ -152,6 +213,50 @@ func (p *ChannelProcessor) processChannel(ctx context.Context, channel *model.Ch
 		HTTPStatus:          stats.HTTPStatus,
 		PreviouslyPopulated: previouslyPopulated,
 	}, nil
+}
+
+func (p *ChannelProcessor) retryRateLimited(ctx context.Context, channel *model.Channel, attempts int, result ChannelProcessResult, err error) (ChannelProcessResult, error) {
+	if !isRateLimitError(err) {
+		return result, err
+	}
+	maxRetries := p.maxRetries
+	if maxRetries < 1 {
+		maxRetries = 1
+	}
+	for attempts < maxRetries {
+		rateLimitErr := rateLimitError(err)
+		if rateLimitErr == nil {
+			return result, err
+		}
+		sleeper := p.sleeper
+		if sleeper == nil {
+			sleeper = contextSleeper{}
+		}
+		if sleepErr := sleeper.Sleep(ctx, rateLimitErr.RetryAfter); sleepErr != nil {
+			return result, fmt.Errorf("process channel %q: wait before retry: %w", channel.Username, sleepErr)
+		}
+		attempts++
+		result, err = p.processChannelAttempt(ctx, channel)
+		if err == nil {
+			return result, nil
+		}
+		if !isRateLimitError(err) {
+			return result, err
+		}
+	}
+	return result, err
+}
+
+func rateLimitError(err error) *RateLimitError {
+	var rateLimitErr *RateLimitError
+	if errors.As(err, &rateLimitErr) {
+		return rateLimitErr
+	}
+	return nil
+}
+
+func isRateLimitError(err error) bool {
+	return rateLimitError(err) != nil
 }
 
 func fetchErrorKind(err error) string {
@@ -226,20 +331,65 @@ func (p *ChannelProcessor) ProcessChannelsContext(ctx context.Context, channels 
 		Results:  make([]ChannelProcessResult, 0, len(channels)),
 		Failures: make([]ChannelFailure, 0),
 	}
+	type channelOutcome struct {
+		result ChannelProcessResult
+		err    error
+	}
+	type pendingRetry struct {
+		index int
+	}
+	outcomes := make([]channelOutcome, len(channels))
+	pending := make([]pendingRetry, 0)
 	for i := range channels {
-		result, err := p.processChannel(ctx, &channels[i])
-		if err != nil {
-			batch.Failures = append(batch.Failures, ChannelFailure{
-				Channel:    channels[i],
-				Err:        err,
-				HTTPStatus: result.HTTPStatus,
-			})
+		result, err := p.processChannelAttempt(ctx, &channels[i])
+		outcomes[i] = channelOutcome{result: result, err: err}
+		if isRateLimitError(err) {
+			pending = append(pending, pendingRetry{index: i})
+		}
+	}
+	for _, retry := range pending {
+		channel := &channels[retry.index]
+		outcome := outcomes[retry.index]
+		outcome.result, outcome.err = p.retryRateLimited(ctx, channel, 1, outcome.result, outcome.err)
+		outcomes[retry.index] = outcome
+	}
+	rateLimited := make([]ChannelFailure, 0)
+	for i, outcome := range outcomes {
+		if outcome.err == nil {
+			batch.Results = append(batch.Results, outcome.result)
 			continue
 		}
-		batch.Results = append(batch.Results, result)
+		failure := ChannelFailure{
+			Channel:    channels[i],
+			Err:        outcome.err,
+			HTTPStatus: outcome.result.HTTPStatus,
+		}
+		batch.Failures = append(batch.Failures, failure)
+		if isRateLimitError(outcome.err) {
+			rateLimited = append(rateLimited, failure)
+		}
 	}
+	p.notifyRateLimitPartial(ctx, rateLimited)
 	p.notifyStructuralChange(ctx, batch)
 	return batch, nil
+}
+
+func (p *ChannelProcessor) notifyRateLimitPartial(ctx context.Context, failures []ChannelFailure) {
+	if len(failures) == 0 || p.notifier == nil {
+		return
+	}
+	usernames := make([]string, 0, len(failures))
+	for _, failure := range failures {
+		usernames = append(usernames, "@"+failure.Channel.Username)
+	}
+	message := fmt.Sprintf(
+		"⚠️ частичный дайджест: канал(ы) %s ограничены Telegram (HTTP 429) после исчерпания попыток. Посты из этих каналов не включены. Проверьте доступность каналов и повторите запуск позже.",
+		strings.Join(usernames, ", "),
+	)
+	log.Printf("WARNING: partial digest after rate-limited channels: %s", strings.Join(usernames, ", "))
+	if err := p.notifier.NotifyOwner(ctx, message); err != nil {
+		log.Printf("WARNING: failed to notify owner about rate-limited channels: %v", err)
+	}
 }
 
 func (p *ChannelProcessor) notifyStructuralChange(ctx context.Context, batch ChannelBatchResult) {

@@ -65,7 +65,8 @@ func main() {
 	// scheduler starts. Scheduled group runs use this same injected service.
 	channelParser := parser.New()
 	postStorage := parser.NewPostStorage(store.Channels, store.Posts)
-	channelProcessor := parser.NewChannelProcessor(channelParser, postStorage, ownerNotifier)
+	channelProcessor := parser.NewChannelProcessor(channelParser, postStorage, ownerNotifier).
+		WithMaxRetries(cfg.MaxRetries)
 	digestService := digest.NewWithProcessor(store, channelProcessor)
 	sched := scheduler.New(digestService, scheduler.WithGroupSource(store.Groups))
 	if err := sched.Start(); err != nil {

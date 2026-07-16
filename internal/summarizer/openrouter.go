@@ -7,16 +7,24 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const (
 	// DefaultOpenRouterBaseURL is the OpenAI-compatible OpenRouter API base URL.
 	DefaultOpenRouterBaseURL = "https://openrouter.ai/api/v1"
 	// DefaultOpenRouterModel is the model selected for the default provider.
-	DefaultOpenRouterModel = "openai/gpt-oss-120b"
+	DefaultOpenRouterModel  = "openai/gpt-oss-120b"
+	defaultMaxPostsPerBatch = 50
+	defaultMaxPostChars     = 2000
+	fallbackSummary         = "[Не удалось создать краткое содержание]"
+	maxRetryDelay           = 30 * time.Second
 )
 
 // OpenRouterConfig configures an OpenRouterProvider.
@@ -27,6 +35,8 @@ type OpenRouterConfig struct {
 	HTTPClient  *http.Client
 	HTTPReferer string
 	AppTitle    string
+	// RetrySleep overrides the retry delay, primarily for deterministic tests.
+	RetrySleep func(context.Context, time.Duration) error
 	// AllowPrivateHosts is intended only for trusted local test endpoints.
 	// Production provider configuration must leave it false.
 	AllowPrivateHosts bool
@@ -47,6 +57,7 @@ type OpenRouterProvider struct {
 	httpClient  *http.Client
 	httpReferer string
 	appTitle    string
+	retrySleep  func(context.Context, time.Duration) error
 }
 
 var _ Provider = (*OpenRouterProvider)(nil)
@@ -86,6 +97,7 @@ func NewOpenRouter(apiKey, model string) *OpenRouterProvider {
 		apiKey:     apiKey,
 		model:      model,
 		httpClient: &http.Client{Timeout: 60 * time.Second},
+		retrySleep: sleepWithContext,
 	}
 }
 
@@ -118,6 +130,7 @@ func NewOpenRouterWithConfig(config OpenRouterConfig) (*OpenRouterProvider, erro
 		httpClient:  client,
 		httpReferer: strings.TrimSpace(config.HTTPReferer),
 		appTitle:    strings.TrimSpace(config.AppTitle),
+		retrySleep:  retrySleep(config.RetrySleep),
 	}, nil
 }
 
@@ -130,6 +143,25 @@ func (p *OpenRouterProvider) ChatCompletion(ctx context.Context, messages []Mess
 	if len(messages) == 0 {
 		return "", errors.New("chat completion requires at least one message")
 	}
+	var lastErr error
+	for attempt := 0; attempt <= 3; attempt++ {
+		content, retryAfter, err := p.chatCompletionAttempt(ctx, messages)
+		if err == nil {
+			return content, nil
+		}
+		lastErr = err
+		if !isTransientProviderError(ctx, err) || attempt == 3 {
+			break
+		}
+		delay := retryDelay(attempt, retryAfter)
+		if err := p.retrySleep(ctx, delay); err != nil {
+			return "", fmt.Errorf("wait before OpenRouter retry: %w", err)
+		}
+	}
+	return "", lastErr
+}
+
+func (p *OpenRouterProvider) chatCompletionAttempt(ctx context.Context, messages []Message) (string, time.Duration, error) {
 	requestBody := chatCompletionRequest{
 		Model:       p.model,
 		Messages:    messages,
@@ -138,11 +170,11 @@ func (p *OpenRouterProvider) ChatCompletion(ctx context.Context, messages []Mess
 	}
 	payload, err := json.Marshal(requestBody)
 	if err != nil {
-		return "", fmt.Errorf("marshal OpenRouter request: %w", err)
+		return "", 0, fmt.Errorf("marshal OpenRouter request: %w", err)
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(payload))
 	if err != nil {
-		return "", fmt.Errorf("create OpenRouter request: %w", err)
+		return "", 0, fmt.Errorf("create OpenRouter request: %w", err)
 	}
 	request.Header.Set("Authorization", "Bearer "+p.apiKey)
 	request.Header.Set("Content-Type", "application/json")
@@ -155,37 +187,40 @@ func (p *OpenRouterProvider) ChatCompletion(ctx context.Context, messages []Mess
 
 	response, err := p.httpClient.Do(request)
 	if err != nil {
-		return "", fmt.Errorf("OpenRouter request: %w", err)
+		return "", 0, fmt.Errorf("OpenRouter request: %w", err)
 	}
 	defer response.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 	if err != nil {
-		return "", fmt.Errorf("read OpenRouter response: %w", err)
+		return "", 0, fmt.Errorf("read OpenRouter response: %w", err)
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		var apiError chatCompletionResponse
 		if json.Unmarshal(body, &apiError) == nil && apiError.Error != nil && apiError.Error.Message != "" {
-			return "", fmt.Errorf("OpenRouter chat completion: HTTP %d: %s", response.StatusCode, apiError.Error.Message)
+			return "", retryAfter(response), &ProviderError{
+				StatusCode: response.StatusCode,
+				Message:    apiError.Error.Message,
+			}
 		}
-		return "", fmt.Errorf("OpenRouter chat completion: HTTP %d", response.StatusCode)
+		return "", retryAfter(response), &ProviderError{StatusCode: response.StatusCode}
 	}
 
 	var decoded chatCompletionResponse
 	if err := json.Unmarshal(body, &decoded); err != nil {
-		return "", fmt.Errorf("decode OpenRouter response: %w", err)
+		return "", 0, fmt.Errorf("decode OpenRouter response: %w", err)
 	}
 	if decoded.Error != nil && decoded.Error.Message != "" {
-		return "", fmt.Errorf("OpenRouter chat completion: %s", decoded.Error.Message)
+		return "", 0, &ProviderError{Message: decoded.Error.Message}
 	}
 	if len(decoded.Choices) == 0 {
-		return "", errors.New("OpenRouter response contained no choices")
+		return "", 0, errors.New("OpenRouter response contained no choices")
 	}
 	content := strings.TrimSpace(decoded.Choices[0].Message.Content)
 	if content == "" {
-		return "", errors.New("OpenRouter response contained empty content")
+		return "", 0, errors.New("OpenRouter response contained empty content")
 	}
-	return content, nil
+	return content, 0, nil
 }
 
 // Summarize implements Provider using one batch chat completion request.
@@ -193,14 +228,30 @@ func (p *OpenRouterProvider) Summarize(ctx context.Context, posts []Post) ([]Sum
 	if len(posts) == 0 {
 		return []Summary{}, nil
 	}
+	summaries := make([]Summary, 0, len(posts))
+	for start := 0; start < len(posts); start += defaultMaxPostsPerBatch {
+		end := start + defaultMaxPostsPerBatch
+		if end > len(posts) {
+			end = len(posts)
+		}
+		batch, err := p.summarizeBatch(ctx, posts[start:end])
+		if err != nil {
+			return nil, fmt.Errorf("summarize posts %d-%d: %w", start+1, end, err)
+		}
+		summaries = append(summaries, batch...)
+	}
+	return summaries, nil
+}
+
+func (p *OpenRouterProvider) summarizeBatch(ctx context.Context, posts []Post) ([]Summary, error) {
 	var prompt strings.Builder
-	prompt.WriteString("Прочитай посты из Telegram и подготовь для каждого ровно одно предложение на русском языке. ")
-	prompt.WriteString("Верни только JSON-массив объектов с полями post_id и summary, сохраняя идентификаторы постов.\n\n")
+	prompt.WriteString("Прочитай посты из Telegram и подготовь для каждого ровно одно короткое предложение на русском языке. ")
+	prompt.WriteString("Не добавляй факты от себя и не объединяй посты. Верни только JSON-массив объектов с полями post_id и summary, сохраняя идентификаторы постов.\n\n")
 	for _, post := range posts {
-		fmt.Fprintf(&prompt, "--- ПОСТ %d ---\n%s\n\n", post.ID, post.Text)
+		fmt.Fprintf(&prompt, "--- ПОСТ %d ---\n%s\n\n", post.ID, truncatePostText(post.Text, defaultMaxPostChars))
 	}
 	content, err := p.ChatCompletion(ctx, []Message{
-		{Role: "system", Content: "Ты — точный редактор русскоязычных Telegram-дайджестов."},
+		{Role: "system", Content: "Ты — точный редактор русскоязычных Telegram-дайджестов. Отвечай только на русском языке, готовь ровно одно предложение для каждого поста."},
 		{Role: "user", Content: prompt.String()},
 	})
 	if err != nil {
@@ -208,23 +259,117 @@ func (p *OpenRouterProvider) Summarize(ctx context.Context, posts []Post) ([]Sum
 	}
 	parsed, err := parseBatchSummaries(content)
 	if err != nil {
+		log.Printf("AI response unparseable: %v", err)
 		return nil, fmt.Errorf("parse summaries: %w", err)
 	}
-	summaries := make([]Summary, 0, len(parsed))
+
+	expected := make(map[int64]struct{}, len(posts))
+	for _, post := range posts {
+		expected[post.ID] = struct{}{}
+	}
+	byID := make(map[int64]string, len(parsed))
 	for _, item := range parsed {
-		if strings.TrimSpace(item.Summary) == "" {
-			return nil, fmt.Errorf("summary for post %d is empty", item.PostID)
+		text := strings.TrimSpace(item.Summary)
+		if _, ok := expected[item.PostID]; !ok {
+			log.Printf("AI returned hallucinated summary for unknown post %d; discarding", item.PostID)
+			continue
 		}
-		summaries = append(summaries, Summary{PostID: item.PostID, Text: strings.TrimSpace(item.Summary)})
+		if _, duplicate := byID[item.PostID]; duplicate {
+			log.Printf("AI returned duplicate summary for post %d; discarding", item.PostID)
+			continue
+		}
+		if err := validateSummaryText(text); err != nil {
+			return nil, fmt.Errorf("summary for post %d: %w", item.PostID, err)
+		}
+		byID[item.PostID] = text
+	}
+	if len(byID) != len(posts) {
+		log.Printf("AI returned %d summaries for %d posts: WARNING: %d posts not summarized", len(byID), len(posts), len(posts)-len(byID))
+	} else {
+		log.Printf("AI returned %d summaries for %d posts - OK", len(byID), len(posts))
+	}
+	summaries := make([]Summary, 0, len(posts))
+	for _, post := range posts {
+		text := byID[post.ID]
+		if text == "" {
+			text = fallbackSummary
+		}
+		summaries = append(summaries, Summary{PostID: post.ID, Text: text})
 	}
 	return summaries, nil
 }
 
+func validateSummaryText(text string) error {
+	if text == "" {
+		return errors.New("summary is empty")
+	}
+	var cyrillic, letters int
+	for _, r := range text {
+		if unicode.IsLetter(r) {
+			letters++
+			if unicode.In(r, unicode.Cyrillic) {
+				cyrillic++
+			}
+		}
+	}
+	if cyrillic == 0 || (letters > 8 && float64(cyrillic)/float64(letters) < 0.25) {
+		return errors.New("summary is not in Russian")
+	}
+	if sentenceCount(text) > 1 {
+		return errors.New("summary must contain exactly one sentence")
+	}
+	return nil
+}
+
+func sentenceCount(text string) int {
+	runes := []rune(strings.TrimSpace(text))
+	count := 0
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		if r != '.' && r != '!' && r != '?' {
+			continue
+		}
+		if r == '.' {
+			if i+1 < len(runes) && unicode.IsDigit(runes[i+1]) {
+				continue
+			}
+			next := i + 1
+			for next < len(runes) && unicode.IsSpace(runes[next]) {
+				next++
+			}
+			if next < len(runes) && unicode.IsLower(runes[next]) {
+				continue
+			}
+		}
+		count++
+		for i+1 < len(runes) && (runes[i+1] == '.' || runes[i+1] == '!' || runes[i+1] == '?') {
+			i++
+		}
+	}
+	if count == 0 {
+		return 1
+	}
+	return count
+}
+
+func truncatePostText(text string, maxChars int) string {
+	runes := []rune(text)
+	if len(runes) <= maxChars {
+		return text
+	}
+	if maxChars <= 3 {
+		return string(runes[:maxChars])
+	}
+	return string(runes[:maxChars-3]) + "..."
+}
+
 func parseBatchSummaries(content string) ([]batchSummary, error) {
 	content = strings.TrimSpace(content)
-	content = strings.TrimPrefix(content, "```json")
-	content = strings.TrimPrefix(content, "```")
-	content = strings.TrimSuffix(strings.TrimSpace(content), "```")
+	if strings.HasPrefix(content, "```") {
+		content = strings.TrimSpace(strings.TrimPrefix(content, "```json"))
+		content = strings.TrimSpace(strings.TrimPrefix(content, "```"))
+		content = strings.TrimSpace(strings.TrimSuffix(content, "```"))
+	}
 
 	var summaries []batchSummary
 	if err := json.Unmarshal([]byte(content), &summaries); err == nil {
@@ -240,4 +385,82 @@ func parseBatchSummaries(content string) ([]batchSummary, error) {
 		return nil, errors.New("summary response did not contain summaries")
 	}
 	return envelope.Summaries, nil
+}
+
+// ProviderError describes an HTTP failure returned by an AI provider.
+type ProviderError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *ProviderError) Error() string {
+	if e == nil {
+		return "AI provider error"
+	}
+	if e.Message == "" {
+		return fmt.Sprintf("OpenRouter chat completion: HTTP %d", e.StatusCode)
+	}
+	return fmt.Sprintf("OpenRouter chat completion: HTTP %d: %s", e.StatusCode, e.Message)
+}
+
+func isTransientProviderError(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	var providerErr *ProviderError
+	if errors.As(err, &providerErr) {
+		return providerErr.StatusCode == http.StatusRequestTimeout ||
+			providerErr.StatusCode == http.StatusTooManyRequests ||
+			providerErr.StatusCode >= http.StatusInternalServerError
+	}
+	var networkErr net.Error
+	if errors.As(err, &networkErr) && (networkErr.Timeout() || networkErr.Temporary()) {
+		return true
+	}
+	var operationErr *net.OpError
+	return errors.As(err, &operationErr)
+}
+
+func retryAfter(response *http.Response) time.Duration {
+	value := strings.TrimSpace(response.Header.Get("Retry-After"))
+	if value == "" {
+		return 0
+	}
+	seconds, err := strconv.Atoi(value)
+	if err != nil || seconds < 0 {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func retryDelay(attempt int, retryAfter time.Duration) time.Duration {
+	if retryAfter > 0 {
+		if retryAfter > maxRetryDelay {
+			return maxRetryDelay
+		}
+		return retryAfter
+	}
+	delay := time.Second * time.Duration(1<<attempt)
+	if delay > maxRetryDelay {
+		return maxRetryDelay
+	}
+	return delay
+}
+
+func retrySleep(sleep func(context.Context, time.Duration) error) func(context.Context, time.Duration) error {
+	if sleep == nil {
+		return sleepWithContext
+	}
+	return sleep
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }

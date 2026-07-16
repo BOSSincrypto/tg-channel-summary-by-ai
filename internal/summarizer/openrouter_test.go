@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestOpenRouterProviderChatCompletion(t *testing.T) {
@@ -103,10 +104,13 @@ func TestOpenRouterProviderRejectsNonSuccessResponseWithoutLeakingKey(t *testing
 	defer server.Close()
 
 	provider, err := NewOpenRouterWithConfig(OpenRouterConfig{
-		BaseURL:           server.URL,
-		APIKey:            "secret-key",
-		Model:             "test-model",
-		HTTPClient:        server.Client(),
+		BaseURL:    server.URL,
+		APIKey:     "secret-key",
+		Model:      "test-model",
+		HTTPClient: server.Client(),
+		RetrySleep: func(context.Context, time.Duration) error {
+			return nil
+		},
 		AllowPrivateHosts: true,
 	})
 	if err != nil {

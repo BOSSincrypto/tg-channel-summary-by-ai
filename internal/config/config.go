@@ -90,7 +90,7 @@ func Parse(r io.Reader) (*Config, error) {
 
 	cfg.FetchDelayMs = intDefault(values, "FETCH_DELAY_MS", 2500)
 	cfg.MaxRetries = intDefault(values, "MAX_RETRIES", 3)
-	cfg.MaxPostsPerChan = intDefault(values, "MAX_POSTS_PER_CHANNEL", 100)
+	cfg.MaxPostsPerChan = intDefault(values, "MAX_POSTS_PER_CHANNEL", 50)
 	cfg.PostRetentionDays = positiveIntDefault(values, "POST_RETENTION_DAYS", 90)
 
 	return cfg, nil

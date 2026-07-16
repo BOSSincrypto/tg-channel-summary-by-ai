@@ -4,7 +4,10 @@
 // batch summarization with one-sentence Russian summaries per post.
 package summarizer
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 // Provider defines the interface for AI summarization backends.
 type Provider interface {
@@ -36,5 +39,8 @@ func New(provider Provider) *Service {
 
 // SummarizePosts summarizes a batch of posts.
 func (s *Service) SummarizePosts(ctx context.Context, posts []Post) ([]Summary, error) {
+	if s == nil || s.provider == nil {
+		return nil, errors.New("summarizer provider is not configured")
+	}
 	return s.provider.Summarize(ctx, posts)
 }

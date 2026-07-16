@@ -232,8 +232,8 @@ OPENROUTER_API_KEY=test
 	if cfg.MaxRetries != 3 {
 		t.Errorf("MaxRetries = %d, want %d", cfg.MaxRetries, 3)
 	}
-	if cfg.MaxPostsPerChan != 100 {
-		t.Errorf("MaxPostsPerChan = %d, want %d", cfg.MaxPostsPerChan, 100)
+	if cfg.MaxPostsPerChan != 50 {
+		t.Errorf("MaxPostsPerChan = %d, want %d", cfg.MaxPostsPerChan, 50)
 	}
 	if cfg.PostRetentionDays != 90 {
 		t.Errorf("PostRetentionDays = %d, want %d", cfg.PostRetentionDays, 90)

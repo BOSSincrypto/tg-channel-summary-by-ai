@@ -67,8 +67,10 @@ func main() {
 	postStorage := parser.NewPostStorage(store.Channels, store.Posts)
 	channelProcessor := parser.NewChannelProcessor(channelParser, postStorage)
 	digestService := digest.NewWithProcessor(store, channelProcessor)
-	sched := scheduler.New(digestService)
-	sched.Start()
+	sched := scheduler.New(digestService, scheduler.WithGroupSource(store.Groups))
+	if err := sched.Start(); err != nil {
+		log.Fatalf("failed to start scheduler: %v", err)
+	}
 
 	// Wait for shutdown signal
 	quit := make(chan os.Signal, 1)

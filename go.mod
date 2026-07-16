@@ -5,6 +5,7 @@ go 1.26.5
 require (
 	github.com/PuerkitoBio/goquery v1.10.2
 	github.com/go-chi/chi/v5 v5.3.1
+	github.com/robfig/cron/v3 v3.0.1
 	golang.org/x/net v0.35.0
 	golang.org/x/sys v0.44.0
 	modernc.org/sqlite v1.53.0

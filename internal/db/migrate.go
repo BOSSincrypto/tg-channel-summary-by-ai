@@ -13,6 +13,48 @@ func runMigrations(conn *sql.DB) error {
 			return fmt.Errorf("migration %d: %w", i+1, err)
 		}
 	}
+	if err := ensureChannelFetchErrorColumns(conn); err != nil {
+		return fmt.Errorf("migrate channel fetch error state: %w", err)
+	}
+	return nil
+}
+
+func ensureChannelFetchErrorColumns(conn *sql.DB) error {
+	rows, err := conn.Query("PRAGMA table_info(channels)")
+	if err != nil {
+		return fmt.Errorf("inspect channels table: %w", err)
+	}
+	defer rows.Close()
+
+	columns := make(map[string]bool)
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return fmt.Errorf("scan channels column: %w", err)
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate channels columns: %w", err)
+	}
+
+	for _, column := range []struct {
+		name string
+		ddl  string
+	}{
+		{name: "fetch_error_kind", ddl: "ALTER TABLE channels ADD COLUMN fetch_error_kind TEXT DEFAULT ''"},
+		{name: "fetch_error_message", ddl: "ALTER TABLE channels ADD COLUMN fetch_error_message TEXT DEFAULT ''"},
+		{name: "fetch_error_at", ddl: "ALTER TABLE channels ADD COLUMN fetch_error_at TEXT"},
+	} {
+		if columns[column.name] {
+			continue
+		}
+		if _, err := conn.Exec(column.ddl); err != nil {
+			return fmt.Errorf("add %s: %w", column.name, err)
+		}
+	}
 	return nil
 }
 
@@ -28,6 +70,9 @@ var migrations = []string{
 		title TEXT DEFAULT '',
 		enabled INTEGER DEFAULT 1,
 		last_post_id INTEGER DEFAULT 0,
+		fetch_error_kind TEXT DEFAULT '',
+		fetch_error_message TEXT DEFAULT '',
+		fetch_error_at TEXT,
 		created_at TEXT DEFAULT (datetime('now'))
 	)`,
 

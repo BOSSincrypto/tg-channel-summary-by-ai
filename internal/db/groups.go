@@ -176,7 +176,7 @@ func (r *GroupRepository) GetChannelAssignments(groupID int64) ([]model.GroupCha
 // GetChannelsForGroup returns full channel objects assigned to a group.
 func (r *GroupRepository) GetChannelsForGroup(groupID int64) ([]model.Channel, error) {
 	rows, err := r.db.Conn().Query(
-		`SELECT c.id, c.username, c.title, c.enabled, c.last_post_id, c.created_at
+		`SELECT c.id, c.username, c.title, c.enabled, c.last_post_id, c.fetch_error_kind, c.fetch_error_message, c.fetch_error_at, c.created_at
 		 FROM channels c
 		 INNER JOIN group_channels gc ON c.id = gc.channel_id
 		 WHERE gc.group_id = ? AND c.enabled = 1
@@ -192,10 +192,14 @@ func (r *GroupRepository) GetChannelsForGroup(groupID int64) ([]model.Channel, e
 	for rows.Next() {
 		var ch model.Channel
 		var enabled int
-		if err := rows.Scan(&ch.ID, &ch.Username, &ch.Title, &enabled, &ch.LastPostID, &ch.CreatedAt); err != nil {
+		var fetchErrorAt sql.NullString
+		if err := rows.Scan(&ch.ID, &ch.Username, &ch.Title, &enabled, &ch.LastPostID, &ch.FetchErrorKind, &ch.FetchErrorMessage, &fetchErrorAt, &ch.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan channel: %w", err)
 		}
 		ch.Enabled = intToBool(enabled)
+		if fetchErrorAt.Valid {
+			ch.FetchErrorAt = &fetchErrorAt.String
+		}
 		channels = append(channels, ch)
 	}
 	return channels, rows.Err()

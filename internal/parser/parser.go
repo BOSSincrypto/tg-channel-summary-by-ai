@@ -23,8 +23,12 @@ var (
 	ErrInvalidUsername = errors.New("invalid channel username")
 	// ErrChannelNotFound indicates that Telegram could not resolve the channel.
 	ErrChannelNotFound = errors.New("channel not found")
-	// ErrChannelPrivate indicates that the channel is private or has no preview.
+	// ErrChannelPrivate indicates that Telegram explicitly identifies a private
+	// channel or a channel with previews disabled.
 	ErrChannelPrivate = errors.New("channel is private or unavailable")
+	// ErrChannelUnavailable indicates that Telegram returned an ambiguous page
+	// which does not reliably identify a missing or private channel.
+	ErrChannelUnavailable = errors.New("channel unavailable or ambiguous")
 )
 
 const defaultRateLimitBackoff = 5 * time.Minute
@@ -141,6 +145,10 @@ func (p *Parser) ParseChannelWithStats(username string) ([]ParsedPost, ParseStat
 	if isNotFoundPage(document) {
 		return nil, stats, fmt.Errorf("parse t.me/s/%s: %w", username, ErrChannelNotFound)
 	}
+	if document.Find(".tgme_widget_message[data-post]").Length() == 0 &&
+		document.Find(".tgme_channel_info").Length() == 0 {
+		return nil, stats, fmt.Errorf("parse t.me/s/%s: %w", username, ErrChannelUnavailable)
+	}
 
 	posts := make([]ParsedPost, 0)
 	document.Find(".tgme_widget_message[data-post]").Each(func(_ int, selection *goquery.Selection) {
@@ -219,8 +227,10 @@ func isNotFoundPage(document *goquery.Document) bool {
 	return strings.Contains(text, "not found") ||
 		strings.Contains(text, "doesn't exist") ||
 		strings.Contains(text, "does not exist") ||
-		strings.Contains(text, "contact @") ||
-		strings.Contains(text, "не найден")
+		strings.Contains(text, "не найден") ||
+		strings.Contains(text, "deleted") ||
+		strings.Contains(text, "удалён") ||
+		strings.Contains(text, "удален")
 }
 
 func retryAfter(value string, now time.Time) time.Duration {

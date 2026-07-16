@@ -201,17 +201,19 @@ func TestChannelProcessorNotifiesOnceForStructuralChange(t *testing.T) {
 
 func TestChannelProcessorSkipsFalseStructuralChangeAlerts(t *testing.T) {
 	tests := []struct {
-		name     string
-		channels []model.Channel
-		posts    map[string][]ParsedPost
-		stats    map[string]ParseStats
-		errors   map[string]error
+		name              string
+		channels          []model.Channel
+		posts             map[string][]ParsedPost
+		stats             map[string]ParseStats
+		errors            map[string]error
+		wantNotifications int
 	}{
 		{
-			name:     "new empty channels",
-			channels: []model.Channel{{Username: "new", Enabled: true}},
-			posts:    map[string][]ParsedPost{"new": nil},
-			stats:    map[string]ParseStats{"new": {HTTPStatus: http.StatusOK}},
+			name:              "new empty channels",
+			channels:          []model.Channel{{Username: "new", Enabled: true}},
+			posts:             map[string][]ParsedPost{"new": nil},
+			stats:             map[string]ParseStats{"new": {HTTPStatus: http.StatusOK}},
+			wantNotifications: 0,
 		},
 		{
 			name: "mixed non-empty results",
@@ -227,6 +229,7 @@ func TestChannelProcessorSkipsFalseStructuralChangeAlerts(t *testing.T) {
 				"populated-empty":    {HTTPStatus: http.StatusOK},
 				"populated-nonempty": {HTTPStatus: http.StatusOK},
 			},
+			wantNotifications: 0,
 		},
 		{
 			name: "failed HTTP request",
@@ -239,7 +242,8 @@ func TestChannelProcessorSkipsFalseStructuralChangeAlerts(t *testing.T) {
 				"populated": {HTTPStatus: http.StatusOK},
 				"failed":    {HTTPStatus: http.StatusBadGateway},
 			},
-			errors: map[string]error{"failed": errors.New("bad gateway")},
+			errors:            map[string]error{"failed": errors.New("bad gateway")},
+			wantNotifications: 1,
 		},
 	}
 
@@ -263,10 +267,126 @@ func TestChannelProcessorSkipsFalseStructuralChangeAlerts(t *testing.T) {
 			if _, err := processor.ProcessChannels(tt.channels); err != nil {
 				t.Fatalf("process channels: %v", err)
 			}
-			if len(notifier.messages) != 0 {
-				t.Fatalf("notifications = %q, want none", notifier.messages)
+			if len(notifier.messages) != tt.wantNotifications {
+				t.Fatalf("notifications = %q, want %d", notifier.messages, tt.wantNotifications)
 			}
 		})
+	}
+}
+
+func TestChannelProcessorPersistsAndNotifiesPreviouslyWorkingNotFoundChannel(t *testing.T) {
+	database, cleanup := newStorageTestDB(t)
+	defer cleanup()
+
+	channel := &model.Channel{
+		Username:   "oldname",
+		Title:      "Keep this title",
+		Enabled:    true,
+		LastPostID: 41,
+	}
+	channelID, err := database.Channels.Insert(channel)
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	channel.ID = channelID
+	post := &model.Post{
+		ChannelID:   channelID,
+		MessageID:   41,
+		Text:        "previous post",
+		PostedAt:    "2026-07-15T18:30:00Z",
+		URL:         "https://t.me/oldname/41",
+		ContentHash: HashContent("previous post"),
+	}
+	if _, err := database.Posts.Insert(post); err != nil {
+		t.Fatalf("insert previous post: %v", err)
+	}
+
+	notifier := &recordingOwnerNotifier{}
+	processor := NewChannelProcessor(
+		&fakeChannelFetcher{errors: map[string]error{"oldname": ErrChannelNotFound}},
+		NewPostStorage(database.Channels, database.Posts),
+		notifier,
+	)
+	result, err := processor.ProcessChannel(channel)
+	if !errors.Is(err, ErrChannelNotFound) {
+		t.Fatalf("process error = %v, want ErrChannelNotFound", err)
+	}
+	if result.Channel.FetchErrorKind != FetchErrorKindNotFound {
+		t.Fatalf("result error kind = %q, want %q", result.Channel.FetchErrorKind, FetchErrorKindNotFound)
+	}
+	stored, err := database.Channels.GetByID(channelID)
+	if err != nil {
+		t.Fatalf("get failed channel: %v", err)
+	}
+	if stored.FetchErrorKind != FetchErrorKindNotFound || stored.FetchErrorMessage == "" || stored.FetchErrorAt == nil {
+		t.Fatalf("stored failure = %+v, want durable not-found state", stored)
+	}
+	if stored.Title != "Keep this title" || !stored.Enabled || stored.LastPostID != 41 {
+		t.Fatalf("channel data was not preserved: %+v", stored)
+	}
+	if _, err := database.Posts.GetByChannelAndMessageID(channelID, 41); err != nil {
+		t.Fatalf("previous post was removed: %v", err)
+	}
+	if len(notifier.messages) != 1 {
+		t.Fatalf("notifications = %d, want one", len(notifier.messages))
+	}
+	for _, want := range []string{"@oldname", "не найден", "переименован", "обновите username", "настройках"} {
+		if !strings.Contains(notifier.messages[0], want) {
+			t.Fatalf("notification %q does not contain %q", notifier.messages[0], want)
+		}
+	}
+}
+
+func TestChannelProcessorClearsFetchErrorAfterRecoveryAndPreservesPosts(t *testing.T) {
+	database, cleanup := newStorageTestDB(t)
+	defer cleanup()
+
+	channel := &model.Channel{Username: "recover", Title: "Configured", Enabled: false, LastPostID: 1}
+	channelID, err := database.Channels.Insert(channel)
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	channel.ID = channelID
+	if err := database.Channels.MarkFetchError(channelID, FetchErrorKindNotFound, "old failure"); err != nil {
+		t.Fatalf("mark error: %v", err)
+	}
+	previous := &model.Post{
+		ChannelID: channelID, MessageID: 1, Text: "previous",
+		PostedAt: "2026-07-15T18:30:00Z", URL: "https://t.me/recover/1",
+		ContentHash: HashContent("previous"),
+	}
+	if _, err := database.Posts.Insert(previous); err != nil {
+		t.Fatalf("insert previous post: %v", err)
+	}
+
+	processor := NewChannelProcessor(
+		&fakeChannelFetcher{posts: map[string][]ParsedPost{
+			"recover": {{MessageID: 2, Text: "recovered", PostedAt: "2026-07-16T18:30:00Z"}},
+		}},
+		NewPostStorage(database.Channels, database.Posts),
+	)
+	result, err := processor.ProcessChannel(channel)
+	if err != nil {
+		t.Fatalf("recovery process: %v", err)
+	}
+	if result.StoredPosts != 1 {
+		t.Fatalf("stored posts = %d, want one recovered post", result.StoredPosts)
+	}
+	recovered, err := database.Channels.GetByID(channelID)
+	if err != nil {
+		t.Fatalf("get recovered channel: %v", err)
+	}
+	if recovered.FetchErrorKind != "" || recovered.FetchErrorMessage != "" || recovered.FetchErrorAt != nil {
+		t.Fatalf("recovered error state = %+v, want cleared", recovered)
+	}
+	if recovered.Title != "Configured" || recovered.Enabled || recovered.LastPostID != 2 {
+		t.Fatalf("recovered channel configuration = %+v, want preserved config and cursor 2", recovered)
+	}
+	if _, err := database.Posts.GetByChannelAndMessageID(channelID, 1); err != nil {
+		t.Fatalf("previous post was not preserved: %v", err)
+	}
+	if _, err := database.Posts.GetByChannelAndMessageID(channelID, 2); err != nil {
+		t.Fatalf("recovered post was not stored: %v", err)
 	}
 }
 

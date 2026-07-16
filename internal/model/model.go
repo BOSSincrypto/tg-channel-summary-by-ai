@@ -5,12 +5,15 @@ package model
 
 // Channel represents a Telegram channel being monitored.
 type Channel struct {
-	ID         int64
-	Username   string // lowercase without @
-	Title      string
-	Enabled    bool
-	LastPostID int64
-	CreatedAt  string
+	ID                int64
+	Username          string // lowercase without @
+	Title             string
+	Enabled           bool
+	LastPostID        int64
+	FetchErrorKind    string
+	FetchErrorMessage string
+	FetchErrorAt      *string
+	CreatedAt         string
 }
 
 // Group represents a Telegram group where digests are sent.
@@ -23,9 +26,9 @@ type Group struct {
 
 // GroupChannel links a channel to a group with optional topic assignment.
 type GroupChannel struct {
-	GroupID        int64
-	ChannelID      int64
-	TopicThreadID  *int64 // nil if no specific topic
+	GroupID       int64
+	ChannelID     int64
+	TopicThreadID *int64 // nil if no specific topic
 }
 
 // GroupSettings holds per-group AI and scheduling configuration.
@@ -39,16 +42,16 @@ type GroupSettings struct {
 
 // Post represents a parsed post from a Telegram channel.
 type Post struct {
-	ID            int64
-	ChannelID     int64
-	MessageID     int64
-	Text          string
-	Summary       *string // nil until summarized
-	PostedAt      string
-	URL           string
-	ContentHash   string
-	LinkURLsHash  *string // nil if no links in post
-	CreatedAt     string
+	ID           int64
+	ChannelID    int64
+	MessageID    int64
+	Text         string
+	Summary      *string // nil until summarized
+	PostedAt     string
+	URL          string
+	ContentHash  string
+	LinkURLsHash *string // nil if no links in post
+	CreatedAt    string
 }
 
 // Digest represents a sent digest in a group.

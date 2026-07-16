@@ -297,7 +297,7 @@ func TestSchemaColumns(t *testing.T) {
 		table   string
 		columns []string
 	}{
-		{"channels", []string{"id", "username", "title", "enabled", "last_post_id", "created_at"}},
+		{"channels", []string{"id", "username", "title", "enabled", "last_post_id", "fetch_error_kind", "fetch_error_message", "fetch_error_at", "created_at"}},
 		{"groups", []string{"id", "telegram_chat_id", "title", "created_at"}},
 		{"group_channels", []string{"group_id", "channel_id", "topic_thread_id"}},
 		{"ai_providers", []string{"id", "name", "base_url", "api_key", "default_model", "is_default", "created_at"}},
@@ -507,6 +507,85 @@ func TestChannelRepositoryNormalizesUsernameAndTogglesEnabled(t *testing.T) {
 
 	if err := db.Channels.ToggleEnabled(9999); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing channel toggle error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestChannelRepositoryPersistsAndClearsFetchErrorWithoutChangingConfiguration(t *testing.T) {
+	db, cleanup := newTestDB(t)
+	defer cleanup()
+
+	channel := &model.Channel{Username: "renamed", Title: "Original title", Enabled: true, LastPostID: 42}
+	id, err := db.Channels.Insert(channel)
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	if err := db.Channels.MarkFetchError(id, "not_found", "channel not found"); err != nil {
+		t.Fatalf("mark fetch error: %v", err)
+	}
+
+	stored, err := db.Channels.GetByID(id)
+	if err != nil {
+		t.Fatalf("get channel: %v", err)
+	}
+	if stored.Username != "renamed" || stored.Title != "Original title" || !stored.Enabled || stored.LastPostID != 42 {
+		t.Fatalf("channel configuration changed: %+v", stored)
+	}
+	if stored.FetchErrorKind != "not_found" || stored.FetchErrorMessage != "channel not found" || stored.FetchErrorAt == nil {
+		t.Fatalf("fetch error state = %+v, want persisted kind, message, and timestamp", stored)
+	}
+
+	if err := db.Channels.ClearFetchError(id); err != nil {
+		t.Fatalf("clear fetch error: %v", err)
+	}
+	recovered, err := db.Channels.GetByID(id)
+	if err != nil {
+		t.Fatalf("get recovered channel: %v", err)
+	}
+	if recovered.FetchErrorKind != "" || recovered.FetchErrorMessage != "" || recovered.FetchErrorAt != nil {
+		t.Fatalf("fetch error state after clear = %+v, want empty", recovered)
+	}
+	if recovered.LastPostID != 42 {
+		t.Fatalf("last post ID after clear = %d, want 42", recovered.LastPostID)
+	}
+}
+
+func TestExistingDatabaseMigratesChannelFetchErrorColumns(t *testing.T) {
+	path := t.TempDir() + "\\legacy.db"
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy database: %v", err)
+	}
+	if _, err := legacy.Exec(`CREATE TABLE channels (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		username TEXT NOT NULL UNIQUE,
+		title TEXT DEFAULT '',
+		enabled INTEGER DEFAULT 1,
+		last_post_id INTEGER DEFAULT 0,
+		created_at TEXT DEFAULT (datetime('now'))
+	)`); err != nil {
+		t.Fatalf("create legacy channels table: %v", err)
+	}
+	if _, err := legacy.Exec(`INSERT INTO channels (username, title, last_post_id) VALUES ('legacy', 'Legacy', 7)`); err != nil {
+		t.Fatalf("insert legacy channel: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy database: %v", err)
+	}
+
+	database, err := Open(path)
+	if err != nil {
+		t.Fatalf("open migrated database: %v", err)
+	}
+	defer database.Close()
+	channel, err := database.Channels.GetByUsername("legacy")
+	if err != nil {
+		t.Fatalf("get migrated channel: %v", err)
+	}
+	if channel.LastPostID != 7 || channel.FetchErrorKind != "" || channel.FetchErrorAt != nil {
+		t.Fatalf("migrated channel = %+v, want legacy data and empty error state", channel)
+	}
+	if err := database.Channels.MarkFetchError(channel.ID, "private", "private"); err != nil {
+		t.Fatalf("mark migrated channel error: %v", err)
 	}
 }
 

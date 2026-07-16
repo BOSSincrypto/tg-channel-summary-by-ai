@@ -111,6 +111,47 @@ func TestParseChannelErrors(t *testing.T) {
 	}
 }
 
+func TestParseChannelKeepsNotFoundPrivateAndAmbiguousPagesDistinct(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		wantErr error
+	}{
+		{
+			name:    "reliable not found page",
+			body:    `<div class="tgme_page_title">Channel not found</div>`,
+			wantErr: ErrChannelNotFound,
+		},
+		{
+			name:    "reliable private page",
+			body:    `<div class="tgme_page_description">This channel is private</div>`,
+			wantErr: ErrChannelPrivate,
+		},
+		{
+			name:    "ambiguous contact page",
+			body:    `<div class="tgme_page"><div class="tgme_page_description">If you have Telegram, you can contact <strong>Telegram</strong> right away.</div></div>`,
+			wantErr: ErrChannelUnavailable,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer server.Close()
+
+			_, err := NewWithOptions(Options{Client: server.Client(), BaseURL: server.URL}).ParseChannel("example")
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("error = %v, want errors.Is(..., %v)", err, tt.wantErr)
+			}
+			if tt.wantErr == ErrChannelUnavailable && (errors.Is(err, ErrChannelNotFound) || errors.Is(err, ErrChannelPrivate)) {
+				t.Fatalf("ambiguous page was over-classified: %v", err)
+			}
+		})
+	}
+}
+
 func TestParseChannelWithStatsReportsHTTPStatus(t *testing.T) {
 	tests := []struct {
 		name   string

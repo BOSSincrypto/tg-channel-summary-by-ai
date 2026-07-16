@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
 )
@@ -38,6 +39,14 @@ type ChannelProcessResult struct {
 	PreviouslyPopulated bool
 }
 
+const (
+	FetchErrorKindNotFound    = "not_found"
+	FetchErrorKindPrivate     = "private"
+	FetchErrorKindUnavailable = "unavailable"
+	FetchErrorKindRateLimited = "rate_limited"
+	FetchErrorKindFetch       = "fetch"
+)
+
 // ChannelFailure records a channel that could not be fetched or stored.
 type ChannelFailure struct {
 	Channel    model.Channel
@@ -56,6 +65,14 @@ type ChannelBatchResult struct {
 // the bot package.
 type OwnerNotifier interface {
 	NotifyOwner(ctx context.Context, text string) error
+}
+
+// ChannelFetchErrorStore persists and clears the durable fetch state attached
+// to a channel. It is optional so parser tests and alternate storage adapters
+// can continue to implement only cursor persistence.
+type ChannelFetchErrorStore interface {
+	MarkFetchError(id int64, kind, message string) error
+	ClearFetchError(id int64) error
 }
 
 // ChannelProcessor connects t.me/s parsing to persistent post storage.
@@ -77,6 +94,10 @@ func NewChannelProcessor(fetcher ChannelFetcher, storage *PostStorage, notifiers
 // ProcessChannel fetches a channel, validates required post fields, stores new
 // posts, skips duplicates, and advances the channel cursor through PostStorage.
 func (p *ChannelProcessor) ProcessChannel(channel *model.Channel) (ChannelProcessResult, error) {
+	return p.processChannel(context.Background(), channel)
+}
+
+func (p *ChannelProcessor) processChannel(ctx context.Context, channel *model.Channel) (ChannelProcessResult, error) {
 	if p == nil || p.fetcher == nil || p.storage == nil {
 		return ChannelProcessResult{}, errors.New("process channel: parser and storage are required")
 	}
@@ -87,10 +108,24 @@ func (p *ChannelProcessor) ProcessChannel(channel *model.Channel) (ChannelProces
 
 	posts, stats, err := p.parse(channel.Username)
 	if err != nil {
-		return ChannelProcessResult{
+		kind := fetchErrorKind(err)
+		channel.FetchErrorKind = kind
+		channel.FetchErrorMessage = err.Error()
+		if errorStore, ok := p.storage.channels.(ChannelFetchErrorStore); ok {
+			if persistErr := errorStore.MarkFetchError(channel.ID, kind, err.Error()); persistErr != nil {
+				return ChannelProcessResult{}, fmt.Errorf("process channel %q: persist fetch error: %w", channel.Username, persistErr)
+			}
+		}
+		timestamp := time.Now().UTC().Format(time.RFC3339Nano)
+		channel.FetchErrorAt = &timestamp
+		result := ChannelProcessResult{
 			Channel:    *channel,
 			HTTPStatus: stats.HTTPStatus,
-		}, fmt.Errorf("process channel %q: %w", channel.Username, err)
+		}
+		if previouslyPopulated {
+			p.notifyChannelFailure(ctx, *channel, kind, err)
+		}
+		return result, fmt.Errorf("process channel %q: %w", channel.Username, err)
 	}
 	for _, post := range posts {
 		if strings.TrimSpace(post.PostedAt) == "" {
@@ -101,6 +136,14 @@ func (p *ChannelProcessor) ProcessChannel(channel *model.Channel) (ChannelProces
 	if err != nil {
 		return ChannelProcessResult{}, fmt.Errorf("process channel %q: %w", channel.Username, err)
 	}
+	if errorStore, ok := p.storage.channels.(ChannelFetchErrorStore); ok {
+		if err := errorStore.ClearFetchError(channel.ID); err != nil {
+			return ChannelProcessResult{}, fmt.Errorf("process channel %q: clear fetch error: %w", channel.Username, err)
+		}
+	}
+	channel.FetchErrorKind = ""
+	channel.FetchErrorMessage = ""
+	channel.FetchErrorAt = nil
 	return ChannelProcessResult{
 		Channel:             *channel,
 		ParsedPosts:         len(posts),
@@ -109,6 +152,59 @@ func (p *ChannelProcessor) ProcessChannel(channel *model.Channel) (ChannelProces
 		HTTPStatus:          stats.HTTPStatus,
 		PreviouslyPopulated: previouslyPopulated,
 	}, nil
+}
+
+func fetchErrorKind(err error) string {
+	var rateLimitErr *RateLimitError
+	switch {
+	case errors.Is(err, ErrChannelNotFound):
+		return FetchErrorKindNotFound
+	case errors.Is(err, ErrChannelPrivate):
+		return FetchErrorKindPrivate
+	case errors.Is(err, ErrChannelUnavailable):
+		return FetchErrorKindUnavailable
+	case errors.As(err, &rateLimitErr):
+		return FetchErrorKindRateLimited
+	default:
+		return FetchErrorKindFetch
+	}
+}
+
+func (p *ChannelProcessor) notifyChannelFailure(ctx context.Context, channel model.Channel, kind string, err error) {
+	if p.notifier == nil {
+		return
+	}
+
+	message := channelFailureNotification(channel.Username, kind)
+	log.Printf("WARNING: channel @%s fetch failed (%s): %v", channel.Username, kind, err)
+	if notifyErr := p.notifier.NotifyOwner(ctx, message); notifyErr != nil {
+		log.Printf("WARNING: failed to notify owner about channel @%s: %v", channel.Username, notifyErr)
+	}
+}
+
+func channelFailureNotification(username, kind string) string {
+	switch kind {
+	case FetchErrorKindNotFound:
+		return fmt.Sprintf(
+			"⚠️ Канал @%s не найден. Возможно, канал был переименован или удалён. Предыдущий username: @%s. Проверьте и обновите username канала в настройках.",
+			username, username,
+		)
+	case FetchErrorKindPrivate:
+		return fmt.Sprintf(
+			"⚠️ Канал @%s стал приватным или недоступен для предпросмотра. Проверьте доступность канала и обновите username или настройки канала.",
+			username,
+		)
+	case FetchErrorKindUnavailable:
+		return fmt.Sprintf(
+			"⚠️ Канал @%s недоступен, но Telegram не сообщил точную причину. Проверьте доступность канала и при необходимости обновите username в настройках.",
+			username,
+		)
+	default:
+		return fmt.Sprintf(
+			"⚠️ Не удалось получить канал @%s: %s. Проверьте доступность канала и настройки.",
+			username, kind,
+		)
+	}
 }
 
 // ProcessChannels processes every channel independently. A failed channel is
@@ -131,7 +227,7 @@ func (p *ChannelProcessor) ProcessChannelsContext(ctx context.Context, channels 
 		Failures: make([]ChannelFailure, 0),
 	}
 	for i := range channels {
-		result, err := p.ProcessChannel(&channels[i])
+		result, err := p.processChannel(ctx, &channels[i])
 		if err != nil {
 			batch.Failures = append(batch.Failures, ChannelFailure{
 				Channel:    channels[i],

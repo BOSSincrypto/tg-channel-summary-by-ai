@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
 )
@@ -20,9 +21,10 @@ func (r *ChannelRepository) Insert(ch *model.Channel) (int64, error) {
 	}
 	ch.Username = normalizeChannelUsername(ch.Username)
 	result, err := r.db.Conn().Exec(
-		`INSERT INTO channels (username, title, enabled, last_post_id)
-		 VALUES (?, ?, ?, ?)`,
+		`INSERT INTO channels (username, title, enabled, last_post_id, fetch_error_kind, fetch_error_message, fetch_error_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		ch.Username, ch.Title, boolToInt(ch.Enabled), ch.LastPostID,
+		ch.FetchErrorKind, ch.FetchErrorMessage, nullableString(ch.FetchErrorAt),
 	)
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -41,10 +43,11 @@ func (r *ChannelRepository) Insert(ch *model.Channel) (int64, error) {
 func (r *ChannelRepository) GetByID(id int64) (*model.Channel, error) {
 	ch := &model.Channel{}
 	var enabled int
+	var fetchErrorAt sql.NullString
 	err := r.db.Conn().QueryRow(
-		`SELECT id, username, title, enabled, last_post_id, created_at
+		`SELECT id, username, title, enabled, last_post_id, fetch_error_kind, fetch_error_message, fetch_error_at, created_at
 		 FROM channels WHERE id = ?`, id,
-	).Scan(&ch.ID, &ch.Username, &ch.Title, &enabled, &ch.LastPostID, &ch.CreatedAt)
+	).Scan(&ch.ID, &ch.Username, &ch.Title, &enabled, &ch.LastPostID, &ch.FetchErrorKind, &ch.FetchErrorMessage, &fetchErrorAt, &ch.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -52,6 +55,7 @@ func (r *ChannelRepository) GetByID(id int64) (*model.Channel, error) {
 		return nil, fmt.Errorf("get channel by id: %w", err)
 	}
 	ch.Enabled = intToBool(enabled)
+	ch.FetchErrorAt = nullableStringPtr(fetchErrorAt)
 	return ch, nil
 }
 
@@ -60,10 +64,11 @@ func (r *ChannelRepository) GetByUsername(username string) (*model.Channel, erro
 	username = normalizeChannelUsername(username)
 	ch := &model.Channel{}
 	var enabled int
+	var fetchErrorAt sql.NullString
 	err := r.db.Conn().QueryRow(
-		`SELECT id, username, title, enabled, last_post_id, created_at
+		`SELECT id, username, title, enabled, last_post_id, fetch_error_kind, fetch_error_message, fetch_error_at, created_at
 		 FROM channels WHERE username = ?`, username,
-	).Scan(&ch.ID, &ch.Username, &ch.Title, &enabled, &ch.LastPostID, &ch.CreatedAt)
+	).Scan(&ch.ID, &ch.Username, &ch.Title, &enabled, &ch.LastPostID, &ch.FetchErrorKind, &ch.FetchErrorMessage, &fetchErrorAt, &ch.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -71,13 +76,14 @@ func (r *ChannelRepository) GetByUsername(username string) (*model.Channel, erro
 		return nil, fmt.Errorf("get channel by username: %w", err)
 	}
 	ch.Enabled = intToBool(enabled)
+	ch.FetchErrorAt = nullableStringPtr(fetchErrorAt)
 	return ch, nil
 }
 
 // List returns all channels.
 func (r *ChannelRepository) List() ([]model.Channel, error) {
 	rows, err := r.db.Conn().Query(
-		`SELECT id, username, title, enabled, last_post_id, created_at
+		`SELECT id, username, title, enabled, last_post_id, fetch_error_kind, fetch_error_message, fetch_error_at, created_at
 		 FROM channels ORDER BY username ASC`,
 	)
 	if err != nil {
@@ -89,10 +95,12 @@ func (r *ChannelRepository) List() ([]model.Channel, error) {
 	for rows.Next() {
 		var ch model.Channel
 		var enabled int
-		if err := rows.Scan(&ch.ID, &ch.Username, &ch.Title, &enabled, &ch.LastPostID, &ch.CreatedAt); err != nil {
+		var fetchErrorAt sql.NullString
+		if err := rows.Scan(&ch.ID, &ch.Username, &ch.Title, &enabled, &ch.LastPostID, &ch.FetchErrorKind, &ch.FetchErrorMessage, &fetchErrorAt, &ch.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan channel: %w", err)
 		}
 		ch.Enabled = intToBool(enabled)
+		ch.FetchErrorAt = nullableStringPtr(fetchErrorAt)
 		channels = append(channels, ch)
 	}
 	return channels, rows.Err()
@@ -101,7 +109,7 @@ func (r *ChannelRepository) List() ([]model.Channel, error) {
 // ListEnabled returns only channels where enabled = 1.
 func (r *ChannelRepository) ListEnabled() ([]model.Channel, error) {
 	rows, err := r.db.Conn().Query(
-		`SELECT id, username, title, enabled, last_post_id, created_at
+		`SELECT id, username, title, enabled, last_post_id, fetch_error_kind, fetch_error_message, fetch_error_at, created_at
 		 FROM channels WHERE enabled = 1 ORDER BY username ASC`,
 	)
 	if err != nil {
@@ -113,10 +121,12 @@ func (r *ChannelRepository) ListEnabled() ([]model.Channel, error) {
 	for rows.Next() {
 		var ch model.Channel
 		var enabled int
-		if err := rows.Scan(&ch.ID, &ch.Username, &ch.Title, &enabled, &ch.LastPostID, &ch.CreatedAt); err != nil {
+		var fetchErrorAt sql.NullString
+		if err := rows.Scan(&ch.ID, &ch.Username, &ch.Title, &enabled, &ch.LastPostID, &ch.FetchErrorKind, &ch.FetchErrorMessage, &fetchErrorAt, &ch.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan channel: %w", err)
 		}
 		ch.Enabled = intToBool(enabled)
+		ch.FetchErrorAt = nullableStringPtr(fetchErrorAt)
 		channels = append(channels, ch)
 	}
 	return channels, rows.Err()
@@ -129,9 +139,10 @@ func (r *ChannelRepository) Update(ch *model.Channel) error {
 	}
 	ch.Username = normalizeChannelUsername(ch.Username)
 	result, err := r.db.Conn().Exec(
-		`UPDATE channels SET username = ?, title = ?, enabled = ?, last_post_id = ?
+		`UPDATE channels SET username = ?, title = ?, enabled = ?, last_post_id = ?, fetch_error_kind = ?, fetch_error_message = ?, fetch_error_at = ?
 		 WHERE id = ?`,
-		ch.Username, ch.Title, boolToInt(ch.Enabled), ch.LastPostID, ch.ID,
+		ch.Username, ch.Title, boolToInt(ch.Enabled), ch.LastPostID,
+		ch.FetchErrorKind, ch.FetchErrorMessage, nullableString(ch.FetchErrorAt), ch.ID,
 	)
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -157,6 +168,39 @@ func (r *ChannelRepository) UpdateLastPostID(id, lastPostID int64) error {
 	)
 	if err != nil {
 		return fmt.Errorf("update last post id: %w", err)
+	}
+	return nil
+}
+
+// MarkFetchError persists the latest channel fetch failure without changing
+// channel configuration, the cursor, or stored posts.
+func (r *ChannelRepository) MarkFetchError(id int64, kind, message string) error {
+	if strings.TrimSpace(kind) == "" {
+		return fmt.Errorf("mark channel fetch error: error kind is required")
+	}
+	timestamp := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := r.db.Conn().Exec(
+		`UPDATE channels
+		 SET fetch_error_kind = ?, fetch_error_message = ?, fetch_error_at = ?
+		 WHERE id = ?`,
+		kind, message, timestamp, id,
+	)
+	if err != nil {
+		return fmt.Errorf("mark channel %d fetch error: %w", id, err)
+	}
+	return nil
+}
+
+// ClearFetchError removes durable fetch-error state after a successful fetch.
+func (r *ChannelRepository) ClearFetchError(id int64) error {
+	_, err := r.db.Conn().Exec(
+		`UPDATE channels
+		 SET fetch_error_kind = '', fetch_error_message = '', fetch_error_at = NULL
+		 WHERE id = ?`,
+		id,
+	)
+	if err != nil {
+		return fmt.Errorf("clear channel %d fetch error: %w", id, err)
 	}
 	return nil
 }
@@ -214,4 +258,19 @@ func (r *ChannelRepository) ExistsByUsername(username string) (bool, error) {
 
 func normalizeChannelUsername(username string) string {
 	return strings.ToLower(strings.TrimPrefix(strings.TrimSpace(username), "@"))
+}
+
+func nullableString(value *string) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
+func nullableStringPtr(value sql.NullString) *string {
+	if !value.Valid {
+		return nil
+	}
+	result := value.String
+	return &result
 }

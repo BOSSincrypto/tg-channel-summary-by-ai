@@ -3,6 +3,7 @@ package digest
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -212,6 +213,255 @@ func TestGenerateUsesEffectiveGroupAIProviderAndModel(t *testing.T) {
 	if post.Summary == nil || *post.Summary != "Группа получила новый пост." {
 		t.Fatalf("post summary = %v, want AI summary", post.Summary)
 	}
+}
+
+func TestGenerateAIParseFailureNotifiesOnceAndPreservesPosts(t *testing.T) {
+	database, groupID, postID := newDigestFailureFixture(t)
+	notifier := &recordingDigestNotifier{}
+	service := NewWithProcessor(database, nil)
+	service.aiConfigSource = database.Groups
+	service.notifier = notifier
+	service.providerFactory = func(summarizer.GroupAIConfigSource, int64, *http.Client, func(error)) (summarizer.Provider, error) {
+		return failingDigestProvider{err: errors.New("parse summaries: expected JSON summary array")}, nil
+	}
+
+	err := service.summarize(groupID, []model.Post{{ID: postID}})
+	if err == nil {
+		t.Fatal("expected parse failure")
+	}
+	if len(notifier.messages) != 1 {
+		t.Fatalf("notifications = %d, want one: %v", len(notifier.messages), notifier.messages)
+	}
+	if !strings.Contains(notifier.messages[0], "разобрать") || !strings.Contains(notifier.messages[0], "Failure group") {
+		t.Fatalf("notification = %q, want actionable parse context", notifier.messages[0])
+	}
+	post, err := database.Posts.GetByID(postID)
+	if err != nil {
+		t.Fatalf("get post: %v", err)
+	}
+	if post.Summary != nil {
+		t.Fatalf("post summary = %v, want unsummarized post preserved", post.Summary)
+	}
+}
+
+func TestGeneratePermanentAIFailureNotifiesOnceWithoutRetry(t *testing.T) {
+	database, groupID, postID := newDigestFailureFixture(t)
+	notifier := &recordingDigestNotifier{}
+	providerCalls := 0
+	service := NewWithProcessor(database, nil)
+	service.aiConfigSource = database.Groups
+	service.notifier = notifier
+	service.providerFactory = func(summarizer.GroupAIConfigSource, int64, *http.Client, func(error)) (summarizer.Provider, error) {
+		return failingDigestProvider{
+			err: &summarizer.ProviderError{
+				StatusCode: http.StatusUnauthorized,
+				Message:    "invalid API key",
+				Provider:   "OpenRouter",
+			},
+			calls: &providerCalls,
+		}, nil
+	}
+
+	err := service.summarize(groupID, []model.Post{{ID: postID}})
+	if err == nil {
+		t.Fatal("expected permanent provider failure")
+	}
+	if providerCalls != 1 {
+		t.Fatalf("provider calls = %d, want one because permanent errors are not retried", providerCalls)
+	}
+	if len(notifier.messages) != 1 {
+		t.Fatalf("notifications = %d, want one: %v", len(notifier.messages), notifier.messages)
+	}
+	message := notifier.messages[0]
+	if !strings.Contains(message, "401") || !strings.Contains(message, "Failure group") || !strings.Contains(message, "ключ") {
+		t.Fatalf("notification = %q, want status, group, and key action", message)
+	}
+}
+
+func TestGenerateExhaustedTransientFailureNotifiesOnce(t *testing.T) {
+	database, groupID, postID := newDigestFailureFixture(t)
+	notifier := &recordingDigestNotifier{}
+	service := NewWithProcessor(database, nil)
+	service.aiConfigSource = database.Groups
+	service.notifier = notifier
+	service.providerFactory = func(summarizer.GroupAIConfigSource, int64, *http.Client, func(error)) (summarizer.Provider, error) {
+		return failingDigestProvider{err: &summarizer.ProviderError{
+			StatusCode: http.StatusBadGateway,
+			Message:    "temporary outage",
+			Provider:   "OpenRouter",
+		}}, nil
+	}
+
+	err := service.summarize(groupID, []model.Post{{ID: postID}})
+	if err == nil {
+		t.Fatal("expected exhausted transient failure")
+	}
+	if len(notifier.messages) != 1 {
+		t.Fatalf("notifications = %d, want one: %v", len(notifier.messages), notifier.messages)
+	}
+	message := notifier.messages[0]
+	if !strings.Contains(message, "OpenRouter") || !strings.Contains(message, "5xx") ||
+		!strings.Contains(message, "повтор") {
+		t.Fatalf("notification = %q, want provider, retry outcome, and next action", message)
+	}
+}
+
+func TestGenerateSuccessfulRetryDoesNotNotifyFailure(t *testing.T) {
+	database, groupID, postID := newDigestFailureFixture(t)
+	notifier := &recordingDigestNotifier{}
+	service := NewWithProcessor(database, nil)
+	service.aiConfigSource = database.Groups
+	service.notifier = notifier
+	service.providerFactory = func(summarizer.GroupAIConfigSource, int64, *http.Client, func(error)) (summarizer.Provider, error) {
+		return successfulDigestProvider{}, nil
+	}
+
+	if err := service.summarize(groupID, []model.Post{{ID: postID}}); err != nil {
+		t.Fatalf("summarize after successful retry: %v", err)
+	}
+	if len(notifier.messages) != 0 {
+		t.Fatalf("notifications = %v, want none after recovery", notifier.messages)
+	}
+}
+
+func TestGenerateAndManualDigestEachNotifyOnePermanentAIFailure(t *testing.T) {
+	parserServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`<div class="tgme_widget_message" data-post="cycle_channel/1"><div class="tgme_widget_message_text">пост цикла</div><time datetime="2099-07-15T18:30:00Z"></time></div>`))
+	}))
+	defer parserServer.Close()
+	providerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":{"message":"invalid key"}}`, http.StatusForbidden)
+	}))
+	defer providerServer.Close()
+
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer database.Close()
+	providerID, err := database.Providers.Insert(&model.AIProvider{
+		Name: "OpenRouter", BaseURL: providerServer.URL, APIKey: "cycle-key", DefaultModel: "cycle-model", IsDefault: true,
+	})
+	if err != nil {
+		t.Fatalf("insert provider: %v", err)
+	}
+	channelID, err := database.Channels.Insert(&model.Channel{Username: "cycle_channel", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	groupID, err := database.Groups.Insert(&model.Group{TelegramChatID: -10021, Title: "Cycle group"})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	if err := database.Groups.AssignChannel(groupID, channelID, nil); err != nil {
+		t.Fatalf("assign channel: %v", err)
+	}
+	if err := database.Groups.UpdateGroupSettings(&model.GroupSettings{
+		GroupID: groupID, ProviderID: &providerID, DigestTime: "21:00", Timezone: "UTC",
+	}); err != nil {
+		t.Fatalf("update group settings: %v", err)
+	}
+
+	fetcher := parser.NewWithOptions(parser.Options{Client: parserServer.Client(), BaseURL: parserServer.URL})
+	processor := parser.NewChannelProcessor(fetcher, parser.NewPostStorage(database.Channels, database.Posts))
+	notifier := &recordingDigestNotifier{}
+	service := NewWithProcessorAndAIForTesting(database, processor, database.Groups, providerServer.Client(), notifier)
+
+	if _, err := service.Generate(groupID); err == nil {
+		t.Fatal("scheduled digest should fail cleanly on permanent AI error")
+	}
+	if len(notifier.messages) != 1 {
+		t.Fatalf("scheduled notifications = %d, want one: %v", len(notifier.messages), notifier.messages)
+	}
+	if _, err := service.GenerateManual(groupID); err == nil {
+		t.Fatal("manual digest should fail cleanly on permanent AI error")
+	}
+	if len(notifier.messages) != 2 {
+		t.Fatalf("scheduled and manual notifications = %d, want one per cycle: %v", len(notifier.messages), notifier.messages)
+	}
+	posts, err := database.Posts.ListUnsummarized(groupID, 24)
+	if err != nil {
+		t.Fatalf("list unsummarized posts: %v", err)
+	}
+	if len(posts) != 1 {
+		t.Fatalf("unsummarized posts = %d, want one preserved post", len(posts))
+	}
+}
+
+func TestGenerateFallbackOpenRouterOutageNotifiesOnlyTerminalFailure(t *testing.T) {
+	database, groupID, postID := newDigestFailureFixture(t)
+	notifier := &recordingDigestNotifier{}
+	service := NewWithProcessor(database, nil)
+	service.aiConfigSource = database.Groups
+	service.notifier = notifier
+	service.providerFactory = func(_ summarizer.GroupAIConfigSource, _ int64, _ *http.Client, onFallback func(error)) (summarizer.Provider, error) {
+		onFallback(errors.New("custom provider unavailable"))
+		return failingDigestProvider{err: &summarizer.ProviderError{
+			StatusCode: http.StatusBadGateway, Provider: "OpenRouter",
+		}}, nil
+	}
+
+	if err := service.summarize(groupID, []model.Post{{ID: postID}}); err == nil {
+		t.Fatal("expected fallback outage")
+	}
+	if len(notifier.messages) != 1 {
+		t.Fatalf("notifications = %v, want one terminal failure notification", notifier.messages)
+	}
+	if !strings.Contains(notifier.messages[0], "OpenRouter недоступен") ||
+		strings.Contains(notifier.messages[0], "использован OpenRouter") {
+		t.Fatalf("notification = %q, want only outage context", notifier.messages[0])
+	}
+}
+
+func newDigestFailureFixture(t *testing.T) (*db.DB, int64, int64) {
+	t.Helper()
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { database.Close() })
+	channelID, err := database.Channels.Insert(&model.Channel{Username: "failure_channel", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	groupID, err := database.Groups.Insert(&model.Group{TelegramChatID: -10020, Title: "Failure group"})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	if err := database.Groups.AssignChannel(groupID, channelID, nil); err != nil {
+		t.Fatalf("assign channel: %v", err)
+	}
+	postID, err := database.Posts.Insert(&model.Post{
+		ChannelID: channelID, MessageID: 1, Text: "тестовый пост",
+		PostedAt: time.Now().UTC().Format(time.RFC3339),
+		URL:      "https://t.me/failure_channel/1", ContentHash: "failure-post",
+	})
+	if err != nil {
+		t.Fatalf("insert post: %v", err)
+	}
+	return database, groupID, postID
+}
+
+type failingDigestProvider struct {
+	err   error
+	calls *int
+}
+
+func (p failingDigestProvider) Summarize(context.Context, []summarizer.Post) ([]summarizer.Summary, error) {
+	if p.calls != nil {
+		(*p.calls)++
+	}
+	return nil, p.err
+}
+
+type successfulDigestProvider struct{}
+
+func (successfulDigestProvider) Summarize(_ context.Context, posts []summarizer.Post) ([]summarizer.Summary, error) {
+	summaries := make([]summarizer.Summary, 0, len(posts))
+	for _, post := range posts {
+		summaries = append(summaries, summarizer.Summary{PostID: post.ID, Text: "Пост обработан."})
+	}
+	return summaries, nil
 }
 
 func TestScheduledAndManualDigestUseConfiguredProviderFallback(t *testing.T) {

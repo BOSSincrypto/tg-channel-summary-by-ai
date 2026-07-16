@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
@@ -36,6 +37,16 @@ type Service struct {
 }
 
 const defaultMaxPostsPerChannel = 50
+
+type aiFailureClass string
+
+const (
+	aiFailureParse              aiFailureClass = "parse"
+	aiFailureTransientExhausted aiFailureClass = "transient_exhausted"
+	aiFailurePermanent          aiFailureClass = "permanent"
+	aiFailureOpenRouterOutage   aiFailureClass = "openrouter_outage"
+	aiFailureProvider           aiFailureClass = "provider"
+)
 
 // Option customizes digest candidate selection.
 type Option func(*Service)
@@ -184,15 +195,17 @@ func (s *Service) summarize(groupID int64, posts []model.Post) error {
 		return nil
 	}
 	if s.providerFactory == nil {
-		return fmt.Errorf("summarize group %d: provider factory is not configured", groupID)
+		err := errors.New("provider factory is not configured")
+		s.notifyAIFailure(groupID, err)
+		return fmt.Errorf("summarize group %d: %w", groupID, err)
 	}
 
-	fallbackNotified := false
+	var fallbackErr error
 	provider, err := s.providerFactory(s.aiConfigSource, groupID, s.providerHTTPClient, func(providerErr error) {
-		fallbackNotified = true
-		s.notifyAI(groupID, fmt.Sprintf("⚠️ Провайдер AI для группы %d временно недоступен, использован OpenRouter: %v", groupID, providerErr))
+		fallbackErr = providerErr
 	})
 	if err != nil {
+		s.notifyAIFailure(groupID, err)
 		return fmt.Errorf("summarize group %d: create provider: %w", groupID, err)
 	}
 	input := make([]summarizer.Post, 0, len(posts))
@@ -203,10 +216,11 @@ func (s *Service) summarize(groupID int64, posts []model.Post) error {
 	defer cancel()
 	summaries, err := provider.Summarize(summaryContext, input)
 	if err != nil {
-		if !fallbackNotified {
-			s.notifyAI(groupID, fmt.Sprintf("⚠️ Не удалось создать дайджест группы %d: %v", groupID, err))
-		}
+		s.notifyAIFailure(groupID, err)
 		return fmt.Errorf("summarize group %d: %w", groupID, err)
+	}
+	if fallbackErr != nil {
+		s.notifyAIFallback(groupID)
 	}
 
 	expected := make(map[int64]struct{}, len(posts))
@@ -222,6 +236,108 @@ func (s *Service) summarize(groupID int64, posts []model.Post) error {
 		}
 	}
 	return nil
+}
+
+func (s *Service) notifyAIFallback(groupID int64) {
+	group := s.groupTitle(groupID)
+	message := fmt.Sprintf(
+		"⚠️ Провайдер AI для группы «%s» временно недоступен, поэтому использован OpenRouter. Проверьте провайдера и повторите следующий цикл.",
+		group,
+	)
+	s.notifyAI(groupID, message)
+}
+
+func (s *Service) notifyAIFailure(groupID int64, err error) {
+	class := classifyAIFailure(err)
+	group := s.groupTitle(groupID)
+	message := fmt.Sprintf("❌ %s", formatAIFailure(class, group, err))
+	s.notifyAI(groupID, message)
+}
+
+func classifyAIFailure(err error) aiFailureClass {
+	if err == nil {
+		return aiFailureProvider
+	}
+	lower := strings.ToLower(err.Error())
+	if strings.Contains(lower, "parse summaries") ||
+		strings.Contains(lower, "expected json") ||
+		strings.Contains(lower, "summary response") ||
+		strings.Contains(lower, "not in russian") ||
+		strings.Contains(lower, "one sentence") {
+		return aiFailureParse
+	}
+
+	var providerErr *summarizer.ProviderError
+	if errors.As(err, &providerErr) {
+		switch {
+		case providerErr.StatusCode == http.StatusUnauthorized ||
+			providerErr.StatusCode == http.StatusPaymentRequired ||
+			providerErr.StatusCode == http.StatusForbidden:
+			return aiFailurePermanent
+		case providerErr.StatusCode == http.StatusRequestTimeout ||
+			providerErr.StatusCode == http.StatusTooManyRequests ||
+			providerErr.StatusCode >= http.StatusInternalServerError:
+			if strings.EqualFold(providerErr.Provider, "OpenRouter") ||
+				strings.Contains(lower, "openrouter") {
+				return aiFailureOpenRouterOutage
+			}
+			return aiFailureTransientExhausted
+		}
+	}
+	if strings.Contains(lower, "timeout") ||
+		strings.Contains(lower, "connection refused") ||
+		strings.Contains(lower, "temporarily unavailable") ||
+		strings.Contains(lower, "retry") {
+		return aiFailureTransientExhausted
+	}
+	return aiFailureProvider
+}
+
+func formatAIFailure(class aiFailureClass, group string, err error) string {
+	switch class {
+	case aiFailureParse:
+		return fmt.Sprintf("Не удалось разобрать ответ AI для группы «%s». Ответ провайдера не сохранён; проверьте формат ответа и повторите запуск.", group)
+	case aiFailureOpenRouterOutage:
+		return fmt.Sprintf("OpenRouter недоступен (%s). Дайджест группы «%s» пропущен после исчерпания повторных попыток; проверьте статус OpenRouter и повторите позже.", providerStatusDetail(err), group)
+	case aiFailureTransientExhausted:
+		return fmt.Sprintf("Временная ошибка AI для группы «%s» (%s) не устранена после повторных попыток; дайджест пропущен, повторите запуск позже.", group, providerStatusDetail(err))
+	case aiFailurePermanent:
+		return fmt.Sprintf("Ошибка AI провайдера для группы «%s» (%s). Дайджест пропущен; проверьте API ключ, доступ и баланс.", group, safeProviderStatus(err))
+	default:
+		return fmt.Sprintf("Ошибка AI провайдера для группы «%s»; дайджест пропущен. Проверьте настройки провайдера и повторите запуск.", group)
+	}
+}
+
+func safeProviderStatus(err error) string {
+	var providerErr *summarizer.ProviderError
+	if errors.As(err, &providerErr) && providerErr.StatusCode > 0 {
+		return fmt.Sprintf("HTTP %d", providerErr.StatusCode)
+	}
+	return "неизвестный статус"
+}
+
+func providerStatusDetail(err error) string {
+	status := safeProviderStatus(err)
+	var providerErr *summarizer.ProviderError
+	if errors.As(err, &providerErr) {
+		switch {
+		case providerErr.StatusCode >= http.StatusInternalServerError:
+			return status + " (5xx)"
+		case providerErr.StatusCode == http.StatusTooManyRequests:
+			return status + " (ограничение запросов)"
+		}
+	}
+	return status
+}
+
+func (s *Service) groupTitle(groupID int64) string {
+	if s != nil && s.database != nil {
+		group, err := s.database.Groups.GetByID(groupID)
+		if err == nil && group != nil && strings.TrimSpace(group.Title) != "" {
+			return strings.TrimSpace(group.Title)
+		}
+	}
+	return fmt.Sprintf("группа %d", groupID)
 }
 
 func (s *Service) notifyAI(groupID int64, message string) {

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/boss/tg-channel-summary-by-ai/internal/db"
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
 	"github.com/boss/tg-channel-summary-by-ai/internal/security"
 )
@@ -83,10 +84,24 @@ func NewProviderForGroup(source GroupAIConfigSource, groupID int64, client *http
 	return newProviderForGroup(source, groupID, client, false)
 }
 
+// NewProviderForGroupWithFallback resolves a group's configured provider and
+// wraps custom providers with the configured OpenRouter default. The primary
+// provider is rebuilt on every call, so fallback never disables it for a later
+// digest cycle.
+func NewProviderForGroupWithFallback(source GroupAIConfigSource, groupID int64, client *http.Client, onFallback func(error)) (Provider, error) {
+	return newProviderForGroupWithFallback(source, groupID, client, onFallback, false)
+}
+
 // NewProviderForGroupForTesting permits loopback httptest endpoints while
 // testing group routing without weakening production network restrictions.
 func NewProviderForGroupForTesting(source GroupAIConfigSource, groupID int64, client *http.Client) (Provider, error) {
 	return newProviderForGroup(source, groupID, client, true)
+}
+
+// NewProviderForGroupWithFallbackForTesting is the loopback-enabled variant
+// of NewProviderForGroupWithFallback.
+func NewProviderForGroupWithFallbackForTesting(source GroupAIConfigSource, groupID int64, client *http.Client, onFallback func(error)) (Provider, error) {
+	return newProviderForGroupWithFallback(source, groupID, client, onFallback, true)
 }
 
 func newProviderForGroup(source GroupAIConfigSource, groupID int64, client *http.Client, allowPrivateHosts bool) (Provider, error) {
@@ -101,6 +116,64 @@ func newProviderForGroup(source GroupAIConfigSource, groupID int64, client *http
 		return nil, fmt.Errorf("resolve AI provider for group %d: configuration is nil", groupID)
 	}
 	return newProviderFromConfig(config.Provider, config.Model, client, allowPrivateHosts)
+}
+
+func newProviderForGroupWithFallback(source GroupAIConfigSource, groupID int64, client *http.Client, onFallback func(error), allowPrivateHosts bool) (Provider, error) {
+	if source == nil {
+		return nil, errors.New("group AI config source is required")
+	}
+	config, err := source.ResolveAIConfig(groupID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve AI provider for group %d: %w", groupID, err)
+	}
+	if config == nil {
+		return nil, fmt.Errorf("resolve AI provider for group %d: configuration is nil", groupID)
+	}
+
+	primary, err := newProviderFromConfig(config.Provider, config.Model, client, allowPrivateHosts)
+	if err != nil {
+		return nil, err
+	}
+	if isOpenRouterProvider(config.Provider, allowPrivateHosts) {
+		return primary, nil
+	}
+
+	var getFallback func() (*model.AIProvider, error)
+	if providerSource, ok := source.(interface {
+		GetOpenRouterProvider() (*model.AIProvider, error)
+	}); ok {
+		getFallback = providerSource.GetOpenRouterProvider
+	} else if providerSource, ok := source.(interface {
+		GetDefaultProvider() (*model.AIProvider, error)
+	}); ok {
+		getFallback = providerSource.GetDefaultProvider
+	}
+	if getFallback == nil {
+		return primary, nil
+	}
+	fallbackConfig, err := getFallback()
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			return primary, nil
+		}
+		return nil, fmt.Errorf("resolve OpenRouter fallback for group %d: %w", groupID, err)
+	}
+	if fallbackConfig == nil || !isOpenRouterProvider(*fallbackConfig, allowPrivateHosts) {
+		return primary, nil
+	}
+
+	fallback, err := newProviderFromConfig(*fallbackConfig, "", client, allowPrivateHosts)
+	if err != nil {
+		return nil, fmt.Errorf("create OpenRouter fallback for group %d: %w", groupID, err)
+	}
+	return NewFallbackProvider(primary, fallback, onFallback)
+}
+
+func isOpenRouterProvider(config model.AIProvider, allowPrivateHosts bool) bool {
+	if strings.TrimRight(strings.TrimSpace(config.BaseURL), "/") == DefaultOpenRouterBaseURL {
+		return true
+	}
+	return allowPrivateHosts && strings.EqualFold(strings.TrimSpace(config.Name), "OpenRouter")
 }
 
 func newProviderFromConfig(config model.AIProvider, modelOverride string, client *http.Client, allowPrivateHosts bool) (Provider, error) {

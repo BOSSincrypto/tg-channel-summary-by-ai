@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"time"
 
@@ -28,8 +29,15 @@ type Service struct {
 	database           *db.DB
 	processor          *parser.ChannelProcessor
 	aiConfigSource     summarizer.GroupAIConfigSource
-	providerFactory    func(summarizer.GroupAIConfigSource, int64, *http.Client) (summarizer.Provider, error)
+	providerFactory    func(summarizer.GroupAIConfigSource, int64, *http.Client, func(error)) (summarizer.Provider, error)
 	providerHTTPClient *http.Client
+	notifier           OwnerNotifier
+}
+
+// OwnerNotifier is the small transport contract needed for digest AI alerts.
+// The digest package does not depend on the Telegram bot implementation.
+type OwnerNotifier interface {
+	NotifyOwner(context.Context, string) error
 }
 
 // New creates an unconfigured digest Service. It is retained for callers that
@@ -46,23 +54,28 @@ func NewWithProcessor(database *db.DB, processor *parser.ChannelProcessor) *Serv
 
 // NewWithProcessorAndAI creates a digest service that resolves the effective
 // provider and model for each group before summarizing its posts.
-func NewWithProcessorAndAI(database *db.DB, processor *parser.ChannelProcessor, source summarizer.GroupAIConfigSource, client *http.Client) *Service {
-	return newWithProcessorAndAI(database, processor, source, client, summarizer.NewProviderForGroup)
+func NewWithProcessorAndAI(database *db.DB, processor *parser.ChannelProcessor, source summarizer.GroupAIConfigSource, client *http.Client, notifiers ...OwnerNotifier) *Service {
+	return newWithProcessorAndAI(database, processor, source, client, summarizer.NewProviderForGroupWithFallback, notifiers...)
 }
 
 // NewWithProcessorAndAIForTesting is equivalent to NewWithProcessorAndAI but
 // permits loopback provider endpoints used by deterministic tests.
-func NewWithProcessorAndAIForTesting(database *db.DB, processor *parser.ChannelProcessor, source summarizer.GroupAIConfigSource, client *http.Client) *Service {
-	return newWithProcessorAndAI(database, processor, source, client, summarizer.NewProviderForGroupForTesting)
+func NewWithProcessorAndAIForTesting(database *db.DB, processor *parser.ChannelProcessor, source summarizer.GroupAIConfigSource, client *http.Client, notifiers ...OwnerNotifier) *Service {
+	return newWithProcessorAndAI(database, processor, source, client, summarizer.NewProviderForGroupWithFallbackForTesting, notifiers...)
 }
 
-func newWithProcessorAndAI(database *db.DB, processor *parser.ChannelProcessor, source summarizer.GroupAIConfigSource, client *http.Client, factory func(summarizer.GroupAIConfigSource, int64, *http.Client) (summarizer.Provider, error)) *Service {
+func newWithProcessorAndAI(database *db.DB, processor *parser.ChannelProcessor, source summarizer.GroupAIConfigSource, client *http.Client, factory func(summarizer.GroupAIConfigSource, int64, *http.Client, func(error)) (summarizer.Provider, error), notifiers ...OwnerNotifier) *Service {
+	var notifier OwnerNotifier
+	if len(notifiers) > 0 {
+		notifier = notifiers[0]
+	}
 	return &Service{
 		database:           database,
 		processor:          processor,
 		aiConfigSource:     source,
 		providerFactory:    factory,
 		providerHTTPClient: client,
+		notifier:           notifier,
 	}
 }
 
@@ -100,6 +113,12 @@ func (s *Service) Generate(groupID int64) (*Digest, error) {
 	return &Digest{GroupID: groupID, PostCount: len(posts)}, nil
 }
 
+// GenerateManual is the manual trigger entry point. It deliberately shares
+// the same provider-resolving path as scheduled Generate calls.
+func (s *Service) GenerateManual(groupID int64) (*Digest, error) {
+	return s.Generate(groupID)
+}
+
 func (s *Service) summarize(groupID int64, posts []model.Post) error {
 	if s.aiConfigSource == nil || len(posts) == 0 {
 		return nil
@@ -108,7 +127,11 @@ func (s *Service) summarize(groupID int64, posts []model.Post) error {
 		return fmt.Errorf("summarize group %d: provider factory is not configured", groupID)
 	}
 
-	provider, err := s.providerFactory(s.aiConfigSource, groupID, s.providerHTTPClient)
+	fallbackNotified := false
+	provider, err := s.providerFactory(s.aiConfigSource, groupID, s.providerHTTPClient, func(providerErr error) {
+		fallbackNotified = true
+		s.notifyAI(groupID, fmt.Sprintf("⚠️ Провайдер AI для группы %d временно недоступен, использован OpenRouter: %v", groupID, providerErr))
+	})
 	if err != nil {
 		return fmt.Errorf("summarize group %d: create provider: %w", groupID, err)
 	}
@@ -120,6 +143,9 @@ func (s *Service) summarize(groupID int64, posts []model.Post) error {
 	defer cancel()
 	summaries, err := provider.Summarize(summaryContext, input)
 	if err != nil {
+		if !fallbackNotified {
+			s.notifyAI(groupID, fmt.Sprintf("⚠️ Не удалось создать дайджест группы %d: %v", groupID, err))
+		}
 		return fmt.Errorf("summarize group %d: %w", groupID, err)
 	}
 
@@ -136,4 +162,15 @@ func (s *Service) summarize(groupID int64, posts []model.Post) error {
 		}
 	}
 	return nil
+}
+
+func (s *Service) notifyAI(groupID int64, message string) {
+	if s == nil || s.notifier == nil {
+		return
+	}
+	if err := s.notifier.NotifyOwner(context.Background(), message); err != nil {
+		// The provider error remains the actionable digest failure; a transport
+		// failure must not replace it or cause a retry to invoke the provider.
+		log.Printf("failed to notify owner about AI digest group %d: %v", groupID, err)
+	}
 }

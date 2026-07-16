@@ -282,6 +282,19 @@ func (r *GroupRepository) ResolveAIConfig(groupID int64) (*model.GroupAIConfig, 
 	}, nil
 }
 
+// GetDefaultProvider returns the configured default AI provider. It is kept
+// separate from ResolveAIConfig so runtime callers can construct a fallback
+// without changing the group's primary provider selection.
+func (r *GroupRepository) GetDefaultProvider() (*model.AIProvider, error) {
+	return r.db.Providers.GetDefault()
+}
+
+// GetOpenRouterProvider returns the persisted OpenRouter provider regardless
+// of which provider is currently selected as the group's default.
+func (r *GroupRepository) GetOpenRouterProvider() (*model.AIProvider, error) {
+	return r.db.Providers.GetByName("OpenRouter")
+}
+
 // UpdateGroupSettings updates the settings for a group.
 func (r *GroupRepository) UpdateGroupSettings(gs *model.GroupSettings) error {
 	var providerID, modelVal interface{}

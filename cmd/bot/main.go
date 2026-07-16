@@ -90,7 +90,7 @@ func main() {
 	postStorage := parser.NewPostStorage(store.Channels, store.Posts)
 	channelProcessor := parser.NewChannelProcessor(channelParser, postStorage, ownerNotifier).
 		WithMaxRetries(cfg.MaxRetries)
-	digestService := digest.NewWithProcessorAndAI(store, channelProcessor, store.Groups, http.DefaultClient, ownerNotifier)
+	digestService := digest.NewWithProcessorAndAIWithMaxPostsPerChannel(store, channelProcessor, store.Groups, http.DefaultClient, cfg.MaxPostsPerChan, ownerNotifier)
 	sched := scheduler.New(digestService, scheduler.WithGroupSource(store.Groups))
 	if err := sched.Start(); err != nil {
 		log.Fatalf("failed to start scheduler: %v", err)

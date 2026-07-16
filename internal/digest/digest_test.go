@@ -7,10 +7,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
 	"github.com/boss/tg-channel-summary-by-ai/internal/parser"
+	"github.com/boss/tg-channel-summary-by-ai/internal/summarizer"
 )
 
 type recordingDigestNotifier struct {
@@ -304,4 +306,142 @@ func TestScheduledAndManualDigestUseConfiguredProviderFallback(t *testing.T) {
 	if post.Summary == nil || !strings.Contains(*post.Summary, "кастомным") {
 		t.Fatalf("manual post summary = %v, want custom-provider summary", post.Summary)
 	}
+}
+
+func TestGenerateCapsPostsPerChannelBeforeSummarizationAndDefersExcess(t *testing.T) {
+	parserServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`<div class="tgme_channel_info"></div>`))
+	}))
+	defer parserServer.Close()
+
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer database.Close()
+
+	channelA, err := database.Channels.Insert(&model.Channel{Username: "capped_a", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert channel A: %v", err)
+	}
+	channelB, err := database.Channels.Insert(&model.Channel{Username: "capped_b", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert channel B: %v", err)
+	}
+	groupID, err := database.Groups.Insert(&model.Group{TelegramChatID: -1011, Title: "Capped"})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	for _, channelID := range []int64{channelA, channelB} {
+		if err := database.Groups.AssignChannel(groupID, channelID, nil); err != nil {
+			t.Fatalf("assign channel %d: %v", channelID, err)
+		}
+	}
+
+	postedAt := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
+	for _, item := range []struct {
+		channelID int64
+		messageID int64
+	}{
+		{channelA, 1}, {channelA, 2}, {channelA, 3},
+		{channelB, 1}, {channelB, 2}, {channelB, 3},
+	} {
+		if _, err := database.Posts.Insert(&model.Post{
+			ChannelID: item.channelID, MessageID: item.messageID,
+			Text:        "post to cap",
+			PostedAt:    postedAt,
+			URL:         "https://t.me/capped/" + string(rune('0'+item.messageID)),
+			ContentHash: "unique-" + string(rune('0'+item.channelID)) + "-" + string(rune('0'+item.messageID)),
+		}); err != nil {
+			t.Fatalf("insert post %d/%d: %v", item.channelID, item.messageID, err)
+		}
+	}
+
+	fetcher := parser.NewWithOptions(parser.Options{Client: parserServer.Client(), BaseURL: parserServer.URL})
+	processor := parser.NewChannelProcessor(fetcher, parser.NewPostStorage(database.Channels, database.Posts))
+	provider := &recordingDigestProvider{}
+	service := NewWithProcessor(database, processor, WithMaxPostsPerChannel(2))
+	service.aiConfigSource = database.Groups
+	service.providerFactory = func(summarizer.GroupAIConfigSource, int64, *http.Client, func(error)) (summarizer.Provider, error) {
+		return provider, nil
+	}
+
+	first, err := service.Generate(groupID)
+	if err != nil {
+		t.Fatalf("first generate: %v", err)
+	}
+	if first.PostCount != 4 {
+		t.Fatalf("first digest post count = %d, want 4", first.PostCount)
+	}
+	if len(provider.calls) != 1 || len(provider.calls[0]) != 4 {
+		t.Fatalf("first provider calls = %#v, want one call with four capped posts", provider.calls)
+	}
+	counts := map[int64]int{}
+	for _, post := range provider.calls[0] {
+		counts[post.ID]++
+	}
+	if len(counts) != 4 {
+		t.Fatalf("first provider post IDs = %#v, want four unique posts", counts)
+	}
+
+	remaining, err := database.Posts.ListUnsummarized(groupID, 24)
+	if err != nil {
+		t.Fatalf("list deferred posts: %v", err)
+	}
+	if len(remaining) != 2 {
+		t.Fatalf("deferred posts = %d, want 2", len(remaining))
+	}
+
+	second, err := service.GenerateManual(groupID)
+	if err != nil {
+		t.Fatalf("second generate: %v", err)
+	}
+	if second.PostCount != 2 {
+		t.Fatalf("second digest post count = %d, want 2 deferred posts", second.PostCount)
+	}
+	if len(provider.calls) != 2 || len(provider.calls[1]) != 2 {
+		t.Fatalf("second provider calls = %#v, want deferred posts only", provider.calls)
+	}
+	remaining, err = database.Posts.ListUnsummarized(groupID, 24)
+	if err != nil {
+		t.Fatalf("list posts after second cycle: %v", err)
+	}
+	if len(remaining) != 0 {
+		t.Fatalf("posts remaining after second cycle = %d, want 0", len(remaining))
+	}
+}
+
+type recordingDigestProvider struct {
+	calls [][]summarizer.Post
+}
+
+func TestCapPostsPerChannelDefaultsToFiftyAndKeepsChannelsIndependent(t *testing.T) {
+	posts := make([]model.Post, 0, 102)
+	for channelID := int64(1); channelID <= 2; channelID++ {
+		for messageID := int64(1); messageID <= 51; messageID++ {
+			posts = append(posts, model.Post{ChannelID: channelID, MessageID: messageID})
+		}
+	}
+
+	selected := capPostsPerChannel(posts, 0)
+	if len(selected) != 100 {
+		t.Fatalf("selected posts = %d, want 100 with default limit 50 per channel", len(selected))
+	}
+	counts := map[int64]int{}
+	for _, post := range selected {
+		counts[post.ChannelID]++
+	}
+	if counts[1] != 50 || counts[2] != 50 {
+		t.Fatalf("selected counts by channel = %#v, want 50 each", counts)
+	}
+}
+
+func (p *recordingDigestProvider) Summarize(_ context.Context, posts []summarizer.Post) ([]summarizer.Summary, error) {
+	copied := append([]summarizer.Post(nil), posts...)
+	p.calls = append(p.calls, copied)
+	summaries := make([]summarizer.Summary, 0, len(posts))
+	for _, post := range posts {
+		summaries = append(summaries, summarizer.Summary{PostID: post.ID, Text: "Пост обработан."})
+	}
+	return summaries, nil
 }

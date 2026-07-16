@@ -32,6 +32,22 @@ type Service struct {
 	providerFactory    func(summarizer.GroupAIConfigSource, int64, *http.Client, func(error)) (summarizer.Provider, error)
 	providerHTTPClient *http.Client
 	notifier           OwnerNotifier
+	maxPostsPerChannel int
+}
+
+const defaultMaxPostsPerChannel = 50
+
+// Option customizes digest candidate selection.
+type Option func(*Service)
+
+// WithMaxPostsPerChannel limits how many unsummarized posts are selected from
+// each channel in one digest cycle. Non-positive values use the default.
+func WithMaxPostsPerChannel(limit int) Option {
+	return func(s *Service) {
+		if limit > 0 {
+			s.maxPostsPerChannel = limit
+		}
+	}
 }
 
 // OwnerNotifier is the small transport contract needed for digest AI alerts.
@@ -48,8 +64,16 @@ func New() *Service {
 
 // NewWithProcessor creates a digest service that fetches assigned channels and
 // persists parser output before selecting posts for the digest.
-func NewWithProcessor(database *db.DB, processor *parser.ChannelProcessor) *Service {
-	return &Service{database: database, processor: processor}
+func NewWithProcessor(database *db.DB, processor *parser.ChannelProcessor, options ...Option) *Service {
+	service := &Service{
+		database:           database,
+		processor:          processor,
+		maxPostsPerChannel: defaultMaxPostsPerChannel,
+	}
+	for _, option := range options {
+		option(service)
+	}
+	return service
 }
 
 // NewWithProcessorAndAI creates a digest service that resolves the effective
@@ -76,7 +100,25 @@ func newWithProcessorAndAI(database *db.DB, processor *parser.ChannelProcessor, 
 		providerFactory:    factory,
 		providerHTTPClient: client,
 		notifier:           notifier,
+		maxPostsPerChannel: defaultMaxPostsPerChannel,
 	}
+}
+
+// NewWithProcessorAndAIWithMaxPostsPerChannel wires production candidate
+// selection to the configured per-channel limit. Scheduled and manual entry
+// points both use the returned service.
+func NewWithProcessorAndAIWithMaxPostsPerChannel(database *db.DB, processor *parser.ChannelProcessor, source summarizer.GroupAIConfigSource, client *http.Client, maxPostsPerChannel int, notifiers ...OwnerNotifier) *Service {
+	service := newWithProcessorAndAI(database, processor, source, client, summarizer.NewProviderForGroupWithFallback, notifiers...)
+	WithMaxPostsPerChannel(maxPostsPerChannel)(service)
+	return service
+}
+
+// NewWithProcessorAndAIForTestingWithMaxPostsPerChannel is the loopback-enabled
+// equivalent used by deterministic production-boundary tests.
+func NewWithProcessorAndAIForTestingWithMaxPostsPerChannel(database *db.DB, processor *parser.ChannelProcessor, source summarizer.GroupAIConfigSource, client *http.Client, maxPostsPerChannel int, notifiers ...OwnerNotifier) *Service {
+	service := newWithProcessorAndAI(database, processor, source, client, summarizer.NewProviderForGroupWithFallbackForTesting, notifiers...)
+	WithMaxPostsPerChannel(maxPostsPerChannel)(service)
+	return service
 }
 
 // FetchAndStore processes all enabled channels assigned to a group. Individual
@@ -96,9 +138,10 @@ func (s *Service) FetchAndStore(groupID int64) (parser.ChannelBatchResult, error
 	return batch, nil
 }
 
-// Generate fetches and stores current channel output, then returns the
-// unsummarized posts available for this group's digest window. Storage happens
-// before selection so runtime cursor advancement and deduplication are applied.
+// Generate fetches and stores current channel output, then selects at most the
+// configured number of unsummarized posts per channel for this group's digest
+// window. Storage happens before selection so runtime cursor advancement and
+// deduplication are applied, while unselected posts remain eligible later.
 func (s *Service) Generate(groupID int64) (*Digest, error) {
 	if _, err := s.FetchAndStore(groupID); err != nil {
 		return nil, err
@@ -107,10 +150,27 @@ func (s *Service) Generate(groupID int64) (*Digest, error) {
 	if err != nil {
 		return nil, fmt.Errorf("list digest posts for group %d: %w", groupID, err)
 	}
+	posts = capPostsPerChannel(posts, s.maxPostsPerChannel)
 	if err := s.summarize(groupID, posts); err != nil {
 		return nil, err
 	}
 	return &Digest{GroupID: groupID, PostCount: len(posts)}, nil
+}
+
+func capPostsPerChannel(posts []model.Post, limit int) []model.Post {
+	if limit <= 0 {
+		limit = defaultMaxPostsPerChannel
+	}
+	selected := make([]model.Post, 0, len(posts))
+	counts := make(map[int64]int)
+	for _, post := range posts {
+		if counts[post.ChannelID] >= limit {
+			continue
+		}
+		selected = append(selected, post)
+		counts[post.ChannelID]++
+	}
+	return selected
 }
 
 // GenerateManual is the manual trigger entry point. It deliberately shares

@@ -4,6 +4,8 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -16,8 +18,10 @@ import (
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
 	"github.com/boss/tg-channel-summary-by-ai/internal/digest"
 	"github.com/boss/tg-channel-summary-by-ai/internal/maintenance"
+	"github.com/boss/tg-channel-summary-by-ai/internal/model"
 	"github.com/boss/tg-channel-summary-by-ai/internal/parser"
 	"github.com/boss/tg-channel-summary-by-ai/internal/scheduler"
+	"github.com/boss/tg-channel-summary-by-ai/internal/summarizer"
 	"github.com/boss/tg-channel-summary-by-ai/internal/webapp"
 )
 
@@ -37,6 +41,9 @@ func main() {
 	}
 	defer store.Close()
 	log.Printf("database opened at %s", cfg.DBPath)
+	if err := ensureDefaultAIProvider(store, cfg.OpenRouterKey); err != nil {
+		log.Fatalf("failed to configure default AI provider: %v", err)
+	}
 
 	ownerNotifier := bot.NewOwnerNotifier(cfg.BotToken, cfg.OwnerTelegramID)
 	maintenanceSvc := maintenance.New(maintenance.Options{
@@ -72,7 +79,7 @@ func main() {
 	postStorage := parser.NewPostStorage(store.Channels, store.Posts)
 	channelProcessor := parser.NewChannelProcessor(channelParser, postStorage, ownerNotifier).
 		WithMaxRetries(cfg.MaxRetries)
-	digestService := digest.NewWithProcessor(store, channelProcessor)
+	digestService := digest.NewWithProcessorAndAI(store, channelProcessor, store.Groups, http.DefaultClient)
 	sched := scheduler.New(digestService, scheduler.WithGroupSource(store.Groups))
 	if err := sched.Start(); err != nil {
 		log.Fatalf("failed to start scheduler: %v", err)
@@ -91,4 +98,38 @@ func main() {
 	// TODO: bot.Stop()
 
 	log.Println("Shutdown complete")
+}
+
+func ensureDefaultAIProvider(store *db.DB, apiKey string) error {
+	if _, err := store.Providers.GetDefault(); err == nil {
+		return nil
+	} else if !errors.Is(err, db.ErrNotFound) {
+		return fmt.Errorf("check default AI provider: %w", err)
+	}
+
+	provider, err := store.Providers.GetByName("OpenRouter")
+	if errors.Is(err, db.ErrNotFound) {
+		_, err = store.Providers.Insert(&model.AIProvider{
+			Name:         "OpenRouter",
+			BaseURL:      summarizer.DefaultOpenRouterBaseURL,
+			APIKey:       apiKey,
+			DefaultModel: summarizer.DefaultOpenRouterModel,
+			IsDefault:    true,
+		})
+		if err != nil {
+			return fmt.Errorf("insert default AI provider: %w", err)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("load OpenRouter provider: %w", err)
+	}
+
+	provider.APIKey = apiKey
+	provider.DefaultModel = summarizer.DefaultOpenRouterModel
+	provider.IsDefault = true
+	if err := store.Providers.Update(provider); err != nil {
+		return fmt.Errorf("update default OpenRouter provider: %w", err)
+	}
+	return nil
 }

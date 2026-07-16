@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
 )
@@ -243,6 +244,42 @@ func (r *GroupRepository) GetGroupSettings(groupID int64) (*model.GroupSettings,
 		gs.Model = &model.String
 	}
 	return gs, nil
+}
+
+// ResolveAIConfig returns the effective provider and model for a group.
+// Groups without an explicit provider use the provider marked as default.
+// A non-empty group model overrides the provider's default model.
+func (r *GroupRepository) ResolveAIConfig(groupID int64) (*model.GroupAIConfig, error) {
+	settings, err := r.GetGroupSettings(groupID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve group AI config: load settings: %w", err)
+	}
+
+	var provider *model.AIProvider
+	if settings.ProviderID != nil {
+		provider, err = r.db.Providers.GetByID(*settings.ProviderID)
+		if err != nil {
+			return nil, fmt.Errorf("resolve group AI config: load assigned provider: %w", err)
+		}
+	} else {
+		provider, err = r.db.Providers.GetDefault()
+		if err != nil {
+			return nil, fmt.Errorf("resolve group AI config: load default provider: %w", err)
+		}
+	}
+
+	effectiveModel := provider.DefaultModel
+	if settings.Model != nil && strings.TrimSpace(*settings.Model) != "" {
+		effectiveModel = strings.TrimSpace(*settings.Model)
+	}
+	if strings.TrimSpace(effectiveModel) == "" {
+		return nil, fmt.Errorf("resolve group AI config: provider %d has no model configured", provider.ID)
+	}
+
+	return &model.GroupAIConfig{
+		Provider: *provider,
+		Model:    effectiveModel,
+	}, nil
 }
 
 // UpdateGroupSettings updates the settings for a group.

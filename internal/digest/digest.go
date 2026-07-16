@@ -4,11 +4,16 @@
 package digest
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"time"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
+	"github.com/boss/tg-channel-summary-by-ai/internal/model"
 	"github.com/boss/tg-channel-summary-by-ai/internal/parser"
+	"github.com/boss/tg-channel-summary-by-ai/internal/summarizer"
 )
 
 // Digest represents a single digest for a group.
@@ -20,8 +25,11 @@ type Digest struct {
 
 // Service assembles and delivers digests.
 type Service struct {
-	database  *db.DB
-	processor *parser.ChannelProcessor
+	database           *db.DB
+	processor          *parser.ChannelProcessor
+	aiConfigSource     summarizer.GroupAIConfigSource
+	providerFactory    func(summarizer.GroupAIConfigSource, int64, *http.Client) (summarizer.Provider, error)
+	providerHTTPClient *http.Client
 }
 
 // New creates an unconfigured digest Service. It is retained for callers that
@@ -34,6 +42,28 @@ func New() *Service {
 // persists parser output before selecting posts for the digest.
 func NewWithProcessor(database *db.DB, processor *parser.ChannelProcessor) *Service {
 	return &Service{database: database, processor: processor}
+}
+
+// NewWithProcessorAndAI creates a digest service that resolves the effective
+// provider and model for each group before summarizing its posts.
+func NewWithProcessorAndAI(database *db.DB, processor *parser.ChannelProcessor, source summarizer.GroupAIConfigSource, client *http.Client) *Service {
+	return newWithProcessorAndAI(database, processor, source, client, summarizer.NewProviderForGroup)
+}
+
+// NewWithProcessorAndAIForTesting is equivalent to NewWithProcessorAndAI but
+// permits loopback provider endpoints used by deterministic tests.
+func NewWithProcessorAndAIForTesting(database *db.DB, processor *parser.ChannelProcessor, source summarizer.GroupAIConfigSource, client *http.Client) *Service {
+	return newWithProcessorAndAI(database, processor, source, client, summarizer.NewProviderForGroupForTesting)
+}
+
+func newWithProcessorAndAI(database *db.DB, processor *parser.ChannelProcessor, source summarizer.GroupAIConfigSource, client *http.Client, factory func(summarizer.GroupAIConfigSource, int64, *http.Client) (summarizer.Provider, error)) *Service {
+	return &Service{
+		database:           database,
+		processor:          processor,
+		aiConfigSource:     source,
+		providerFactory:    factory,
+		providerHTTPClient: client,
+	}
 }
 
 // FetchAndStore processes all enabled channels assigned to a group. Individual
@@ -64,5 +94,46 @@ func (s *Service) Generate(groupID int64) (*Digest, error) {
 	if err != nil {
 		return nil, fmt.Errorf("list digest posts for group %d: %w", groupID, err)
 	}
+	if err := s.summarize(groupID, posts); err != nil {
+		return nil, err
+	}
 	return &Digest{GroupID: groupID, PostCount: len(posts)}, nil
+}
+
+func (s *Service) summarize(groupID int64, posts []model.Post) error {
+	if s.aiConfigSource == nil || len(posts) == 0 {
+		return nil
+	}
+	if s.providerFactory == nil {
+		return fmt.Errorf("summarize group %d: provider factory is not configured", groupID)
+	}
+
+	provider, err := s.providerFactory(s.aiConfigSource, groupID, s.providerHTTPClient)
+	if err != nil {
+		return fmt.Errorf("summarize group %d: create provider: %w", groupID, err)
+	}
+	input := make([]summarizer.Post, 0, len(posts))
+	for _, post := range posts {
+		input = append(input, summarizer.Post{ID: post.ID, Text: post.Text})
+	}
+	summaryContext, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	summaries, err := provider.Summarize(summaryContext, input)
+	if err != nil {
+		return fmt.Errorf("summarize group %d: %w", groupID, err)
+	}
+
+	expected := make(map[int64]struct{}, len(posts))
+	for _, post := range posts {
+		expected[post.ID] = struct{}{}
+	}
+	for _, summary := range summaries {
+		if _, ok := expected[summary.PostID]; !ok {
+			continue
+		}
+		if err := s.database.Posts.UpdateSummary(summary.PostID, summary.Text); err != nil {
+			return fmt.Errorf("store summary for post %d: %w", summary.PostID, err)
+		}
+	}
+	return nil
 }

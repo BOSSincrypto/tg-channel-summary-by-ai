@@ -80,6 +80,14 @@ type AIProvider struct {
 	CreatedAt    string
 }
 
+// GroupAIConfig is the effective AI configuration for a group. Provider is
+// either the explicitly assigned provider or the configured default provider,
+// and Model is either the group's override or the provider's default model.
+type GroupAIConfig struct {
+	Provider AIProvider
+	Model    string
+}
+
 // ConfigKV represents a key-value configuration entry in the config table.
 type ConfigKV struct {
 	Key   string

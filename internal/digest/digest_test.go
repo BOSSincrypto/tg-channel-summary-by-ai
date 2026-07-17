@@ -1142,6 +1142,138 @@ func TestCapPostsPerChannelDefaultsToFiftyAndKeepsChannelsIndependent(t *testing
 	}
 }
 
+type outcomeFetcher struct {
+	posts map[string][]parser.ParsedPost
+	errs  map[string]error
+}
+
+func (f outcomeFetcher) ParseChannel(username string) ([]parser.ParsedPost, error) {
+	if err := f.errs[username]; err != nil {
+		return nil, err
+	}
+	return f.posts[username], nil
+}
+
+type outcomeDelivery struct {
+	err error
+}
+
+func (d outcomeDelivery) Deliver(context.Context, int64, *Digest) (DeliveryReceipt, error) {
+	if d.err != nil {
+		return DeliveryReceipt{}, d.err
+	}
+	return DeliveryReceipt{MessageID: 777, MessageURL: "https://t.me/c/777"}, nil
+}
+
+func TestGenerateManualResultExposesAllTerminalOutcomes(t *testing.T) {
+	tests := []struct {
+		name            string
+		channels        []string
+		posts           map[string][]parser.ParsedPost
+		errs            map[string]error
+		provider        summarizer.Provider
+		delivery        Delivery
+		wantOutcome     string
+		wantPostCount   int
+		wantFailedCount int
+		wantSent        bool
+		wantSaved       bool
+	}{
+		{
+			name: "succeeded", channels: []string{"ok"},
+			posts:    map[string][]parser.ParsedPost{"ok": {{MessageID: 1, Text: "пост", PostedAt: time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)}}},
+			provider: successfulDigestProvider{}, delivery: outcomeDelivery{},
+			wantOutcome: OutcomeSucceeded, wantPostCount: 1, wantSent: true, wantSaved: true,
+		},
+		{
+			name: "no posts", channels: []string{"empty"},
+			posts:    map[string][]parser.ParsedPost{"empty": {}},
+			provider: successfulDigestProvider{}, delivery: outcomeDelivery{},
+			wantOutcome: OutcomeNoPosts,
+		},
+		{
+			name: "partial", channels: []string{"ok", "broken"},
+			posts:    map[string][]parser.ParsedPost{"ok": {{MessageID: 2, Text: "пост", PostedAt: time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)}}},
+			errs:     map[string]error{"broken": errors.New("channel unavailable")},
+			provider: successfulDigestProvider{}, delivery: outcomeDelivery{},
+			wantOutcome: OutcomePartial, wantPostCount: 1, wantFailedCount: 1, wantSent: true, wantSaved: true,
+		},
+		{
+			name: "all channels failed", channels: []string{"broken"},
+			errs:     map[string]error{"broken": errors.New("channel unavailable")},
+			provider: successfulDigestProvider{}, delivery: outcomeDelivery{},
+			wantOutcome: OutcomeAllChannelsFailed, wantFailedCount: 1,
+		},
+		{
+			name: "ai failed", channels: []string{"ok"},
+			posts:    map[string][]parser.ParsedPost{"ok": {{MessageID: 3, Text: "пост", PostedAt: time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)}}},
+			provider: failingDigestProvider{err: errors.New("AI timeout")}, delivery: outcomeDelivery{},
+			wantOutcome: OutcomeAIFailed, wantPostCount: 1,
+		},
+		{
+			name: "delivery failed", channels: []string{"ok"},
+			posts:    map[string][]parser.ParsedPost{"ok": {{MessageID: 4, Text: "пост", PostedAt: time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)}}},
+			provider: successfulDigestProvider{}, delivery: outcomeDelivery{err: errors.New("Telegram sendMessage failed")},
+			wantOutcome: OutcomeDeliveryFailed, wantPostCount: 1, wantSaved: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			database, err := db.Open(":memory:")
+			if err != nil {
+				t.Fatalf("open database: %v", err)
+			}
+			defer database.Close()
+			groupID, err := database.Groups.Insert(&model.Group{TelegramChatID: -10077, Title: "Outcome"})
+			if err != nil {
+				t.Fatalf("insert group: %v", err)
+			}
+			for _, username := range test.channels {
+				channelID, insertErr := database.Channels.Insert(&model.Channel{Username: username, Enabled: true})
+				if insertErr != nil {
+					t.Fatalf("insert channel: %v", insertErr)
+				}
+				if assignErr := database.Groups.AssignChannel(groupID, channelID, nil); assignErr != nil {
+					t.Fatalf("assign channel: %v", assignErr)
+				}
+			}
+			processor := parser.NewChannelProcessor(
+				outcomeFetcher{posts: test.posts, errs: test.errs},
+				parser.NewPostStorage(database.Channels, database.Posts),
+			)
+			service := NewWithProcessor(database, processor)
+			service.aiConfigSource = database.Groups
+			service.providerFactory = func(summarizer.GroupAIConfigSource, int64, *http.Client, func(error)) (summarizer.Provider, error) {
+				return test.provider, nil
+			}
+			service.delivery = test.delivery
+
+			result, err := service.GenerateManualResult(groupID)
+			if err != nil {
+				t.Fatalf("GenerateManualResult: %v", err)
+			}
+			if result.Outcome != test.wantOutcome {
+				t.Fatalf("outcome = %q, want %q", result.Outcome, test.wantOutcome)
+			}
+			if result.PostCount != test.wantPostCount || len(result.FailedChannels) != test.wantFailedCount {
+				t.Fatalf("counts = posts:%d failed:%v, want posts:%d failed:%d", result.PostCount, result.FailedChannels, test.wantPostCount, test.wantFailedCount)
+			}
+			if result.Delivered != test.wantSent || result.SummariesSaved != test.wantSaved {
+				t.Fatalf("delivery state = delivered:%v saved:%v, want delivered:%v saved:%v", result.Delivered, result.SummariesSaved, test.wantSent, test.wantSaved)
+			}
+			if result.Outcome == OutcomeNoPosts || result.Outcome == OutcomeAllChannelsFailed || result.Outcome == OutcomeAIFailed {
+				if result.Delivered {
+					t.Fatal("terminal non-delivery outcome reported delivered")
+				}
+			}
+			if result.Outcome == OutcomeDeliveryFailed && !result.SummariesSaved {
+				t.Fatal("delivery failure must preserve saved summaries")
+			}
+		})
+	}
+}
+
 func (p *recordingDigestProvider) Summarize(_ context.Context, posts []summarizer.Post) ([]summarizer.Summary, error) {
 	copied := append([]summarizer.Post(nil), posts...)
 	p.calls = append(p.calls, copied)

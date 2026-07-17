@@ -137,6 +137,10 @@ input[aria-invalid="true"], select[aria-invalid="true"] { border-color: var(--da
 .progress-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--border); }
 .active .progress-dot { background: var(--accent); box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 18%, transparent); }
 .done .progress-dot { background: var(--success); }
+.digest-result { margin-top: 12px; border-left: 4px solid var(--muted); border-radius: 10px; padding: 12px; background: var(--surface-muted); font-size: 13px; font-weight: 800; }
+.digest-result.success { border-left-color: var(--success); color: var(--success); }
+.digest-result.warning { border-left-color: var(--warning); color: var(--warning); }
+.digest-result.error { border-left-color: var(--danger); color: var(--danger); }
 
 .not-telegram { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
 .not-telegram .panel { width: min(460px, 100%); padding: 28px; text-align: center; }

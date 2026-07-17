@@ -89,9 +89,6 @@ func main() {
 	digestService := digest.NewWithProcessorAndAIWithMaxPostsPerChannel(store, channelProcessor, store.Groups, http.DefaultClient, cfg.MaxPostsPerChan, ownerNotifier)
 	srv.SetDigestRunner(digestService)
 	sched := scheduler.New(digestService, scheduler.WithGroupSource(store.Groups))
-	if err := sched.Start(); err != nil {
-		log.Fatalf("failed to start scheduler: %v", err)
-	}
 
 	telegramBot, err := bot.NewWithConfig(
 		cfg.BotToken,
@@ -104,6 +101,10 @@ func main() {
 	)
 	if err != nil {
 		log.Fatalf("failed to configure Telegram bot: %v", err)
+	}
+	digestService.SetDelivery(telegramBot)
+	if err := sched.Start(); err != nil {
+		log.Fatalf("failed to start scheduler: %v", err)
 	}
 	telegramBot.SetSettingsApplier(func(ctx context.Context, _ *telego.Message, settings bot.BotSettings) error {
 		return applyProductionSettings(ctx, store, sched, settings)

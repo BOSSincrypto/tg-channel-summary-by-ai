@@ -756,7 +756,14 @@
         run.disabled = true; progress.hidden = false; state.digestJob = { stage: "parsing", detail: "Подготовка…" }; appendDigestProgress(progress, state.digestJob);
         mutation("/api/digest/test", "POST", { group_id: String(group.id) }).then(function (result) {
           var jobId = String(pick(result, ["job_id", "JobID", "id", "ID"], ""));
-          if (!jobId) { state.digestJob = normalizeDigestResult(result); appendDigestProgress(progress, state.digestJob); return; }
+          if (!jobId) {
+            state.digestJob = normalizeDigestResult(result);
+            appendDigestProgress(progress, state.digestJob);
+            run.disabled = false;
+            if (state.digestJob.outcome === "succeeded") showToast("Дайджест отправлен.", "success");
+            else if (state.digestJob.outcome) showToast(digestOutcomeText(state.digestJob), "error", true);
+            return;
+          }
           pollDigest(jobId, progress, run);
         }).catch(function (error) { state.digestJob = { stage: "error", detail: apiErrorMessage(error) }; appendDigestProgress(progress, state.digestJob); run.disabled = false; showToast(apiErrorMessage(error), "error", true); });
       });
@@ -765,7 +772,43 @@
   }
   function normalizeDigestResult(result) {
     var status = String(pick(result, ["status", "Status", "stage", "Stage"], "completed")).toLowerCase();
-    return { stage: status.indexOf("error") >= 0 || status.indexOf("fail") >= 0 ? "error" : status, detail: String(pick(result, ["message", "Message", "detail", "Detail"], "")), posts: pick(result, ["post_count", "PostCount"], null), channels: pick(result, ["channel_count", "ChannelCount"], null) };
+    var outcome = String(pick(result, ["outcome", "Outcome"], "")).toLowerCase();
+    var terminalOutcomes = ["succeeded", "no_posts", "partial", "all_channels_failed", "ai_failed", "delivery_failed"];
+    var terminal = terminalOutcomes.indexOf(outcome) >= 0;
+    return {
+      stage: terminal ? "terminal" : (status.indexOf("error") >= 0 || status.indexOf("fail") >= 0 ? "error" : status),
+      outcome: outcome,
+      detail: String(pick(result, ["message", "Message", "detail", "Detail"], "")),
+      posts: pick(result, ["post_count", "PostCount"], null),
+      channels: pick(result, ["channel_count", "ChannelCount"], null),
+      failedChannels: asArray(pick(result, ["failed_channels", "FailedChannels"], [])),
+      messageId: pick(result, ["message_id", "MessageID"], null),
+      messageUrl: String(pick(result, ["message_url", "MessageURL"], "")),
+      summariesSaved: Boolean(pick(result, ["summaries_saved", "SummariesSaved"], false)),
+      delivered: Boolean(pick(result, ["delivered", "Delivered"], false))
+    };
+  }
+  function digestOutcomeText(job) {
+    var posts = job.posts === null || job.posts === undefined ? "" : String(job.posts);
+    var channels = job.channels === null || job.channels === undefined ? "" : String(job.channels);
+    var failed = job.failedChannels && job.failedChannels.length ? job.failedChannels.join(", ") : "неизвестные каналы";
+    switch (job.outcome) {
+      case "succeeded":
+        return "✅ Дайджест отправлен! " + posts + " постов от " + channels + " каналов.";
+      case "no_posts":
+        return "ℹ️ Нет новых постов для дайджеста.";
+      case "partial":
+        return "⚠️ Дайджест отправлен частично. Не удалось обработать: " + failed + ". " + posts + " постов от " + channels + " каналов.";
+      case "all_channels_failed":
+        return "❌ Не удалось собрать посты. Все каналы недоступны.";
+      case "ai_failed":
+        return "❌ Ошибка суммаризации: " + (job.detail || "проверьте провайдера AI.") + ".";
+      case "delivery_failed":
+        return "❌ Ошибка отправки: " + (job.detail || "Telegram не принял сообщение.") + ". " +
+          (job.summariesSaved ? "Сводки сохранены, но не доставлены." : "Сводки не доставлены.");
+      default:
+        return "";
+    }
   }
   function appendDigestProgress(node, job) {
     while (node.firstChild) node.removeChild(node.firstChild);
@@ -779,7 +822,20 @@
       if ((current === "completed" && index < 3) || (current === "sending" && index < 2) || (current === "summarizing" && index < 1)) item.className += " done";
       item.appendChild(el("span", "progress-dot")); item.appendChild(el("span", "", stage[1])); node.appendChild(item);
     });
-    if (job.stage === "error") node.appendChild(el("div", "error-text", job.detail || "Ошибка выполнения дайджеста."));
+    if (job.outcome) {
+      var outcomeText = digestOutcomeText(job);
+      node.appendChild(el("div", "digest-result " + (job.outcome === "succeeded" || job.outcome === "no_posts" ? "success" : (job.outcome === "partial" ? "warning" : "error")), outcomeText));
+      if (job.messageId) {
+        node.appendChild(el("p", "muted", "Идентификатор сообщения: " + job.messageId));
+      }
+      if (job.messageUrl) {
+        var link = el("a", "subline", "Открыть сообщение в Telegram");
+        link.href = job.messageUrl;
+        link.target = "_blank";
+        link.rel = "noopener";
+        node.appendChild(link);
+      }
+    } else if (job.stage === "error") node.appendChild(el("div", "error-text", job.detail || "Ошибка выполнения дайджеста."));
     else if (job.stage === "completed") node.appendChild(el("p", "muted", job.detail || "Дайджест отправлен."));
     else if (job.detail) node.appendChild(el("p", "muted", job.detail));
   }
@@ -789,9 +845,13 @@
       attempts += 1;
       api("/api/digest/status?id=" + encodeURIComponent(jobId)).then(function (result) {
         state.digestJob = normalizeDigestResult(result); appendDigestProgress(progress, state.digestJob);
-        if (state.digestJob.stage === "completed" || state.digestJob.stage === "error" || attempts > 60) {
+        if (state.digestJob.outcome || state.digestJob.stage === "completed" || state.digestJob.stage === "error" || attempts > 60) {
           run.disabled = false;
-          if (state.digestJob.stage === "completed") showToast("Дайджест отправлен.", "success");
+          if (state.digestJob.outcome === "succeeded") showToast("Дайджест отправлен.", "success");
+          else if (state.digestJob.outcome === "no_posts") showToast("Нет новых постов для дайджеста.", "warning");
+          else if (state.digestJob.outcome === "partial") showToast("Дайджест отправлен частично.", "warning", true);
+          else if (state.digestJob.outcome) showToast(digestOutcomeText(state.digestJob), "error", true);
+          else if (state.digestJob.stage === "completed") showToast("Дайджест отправлен.", "success");
           else if (state.digestJob.stage === "error") showToast(state.digestJob.detail || "Ошибка дайджеста.", "error", true);
           return;
         }

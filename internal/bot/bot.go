@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
+	"github.com/boss/tg-channel-summary-by-ai/internal/digest"
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
 	"github.com/mymmrac/telego"
 )
@@ -484,6 +485,43 @@ func decodeAndValidateSettings(data string, settings *BotSettings) error {
 func (s *Service) sendPlain(ctx context.Context, chatID telego.ChatID, text string) error {
 	_, err := s.api.SendMessage(ctx, &telego.SendMessageParams{ChatID: chatID, Text: text})
 	return err
+}
+
+// Deliver sends one assembled digest to its configured Telegram group and
+// returns the message metadata needed by the WebApp result contract.
+func (s *Service) Deliver(ctx context.Context, groupID int64, result *digest.Digest) (digest.DeliveryReceipt, error) {
+	if s == nil || s.api == nil || s.groups == nil {
+		return digest.DeliveryReceipt{}, errors.New("Telegram delivery is not configured")
+	}
+	if result == nil || strings.TrimSpace(result.Text) == "" {
+		return digest.DeliveryReceipt{}, errors.New("digest message is empty")
+	}
+	group, err := s.groups.GetByID(groupID)
+	if err != nil {
+		return digest.DeliveryReceipt{}, fmt.Errorf("load digest group %d: %w", groupID, err)
+	}
+	params := &telego.SendMessageParams{
+		ChatID: groupTelegramChatID(group.TelegramChatID),
+		Text:   result.Text,
+	}
+	assignments, err := s.groups.GetChannelAssignments(groupID)
+	if err != nil {
+		return digest.DeliveryReceipt{}, fmt.Errorf("load digest topics for group %d: %w", groupID, err)
+	}
+	for _, assignment := range assignments {
+		if assignment.TopicThreadID != nil {
+			params.MessageThreadID = int(*assignment.TopicThreadID)
+			break
+		}
+	}
+	message, err := s.api.SendMessage(ctx, params)
+	if err != nil {
+		return digest.DeliveryReceipt{}, fmt.Errorf("send digest to group %d: %w", groupID, err)
+	}
+	if message == nil || message.MessageID == 0 {
+		return digest.DeliveryReceipt{}, errors.New("Telegram delivery returned no message metadata")
+	}
+	return digest.DeliveryReceipt{MessageID: int64(message.MessageID)}, nil
 }
 
 func (s *Service) handleMyChatMember(ctx context.Context, update *telego.ChatMemberUpdated) error {

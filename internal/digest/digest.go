@@ -22,10 +22,40 @@ import (
 
 // Digest represents a single digest for a group.
 type Digest struct {
-	GroupID   int64
-	PostCount int
-	WindowID  string
-	// TODO: formatted message parts
+	GroupID        int64
+	PostCount      int
+	WindowID       string
+	ChannelCount   int
+	Outcome        string
+	FailedChannels []string
+	Message        string
+	Text           string
+	MessageID      *int64
+	MessageURL     string
+	SummariesSaved bool
+	Delivered      bool
+}
+
+const (
+	OutcomeSucceeded         = "succeeded"
+	OutcomeNoPosts           = "no_posts"
+	OutcomePartial           = "partial"
+	OutcomeAllChannelsFailed = "all_channels_failed"
+	OutcomeAIFailed          = "ai_failed"
+	OutcomeDeliveryFailed    = "delivery_failed"
+)
+
+// DeliveryReceipt contains Telegram metadata for a successfully delivered
+// digest message.
+type DeliveryReceipt struct {
+	MessageID  int64
+	MessageURL string
+}
+
+// Delivery is the narrow transport boundary used after summaries are saved.
+// A delivery error must never be reported as a successful digest.
+type Delivery interface {
+	Deliver(context.Context, int64, *Digest) (DeliveryReceipt, error)
 }
 
 // Service assembles and delivers digests.
@@ -36,6 +66,7 @@ type Service struct {
 	providerFactory    func(summarizer.GroupAIConfigSource, int64, *http.Client, func(error)) (summarizer.Provider, error)
 	providerHTTPClient *http.Client
 	notifier           OwnerNotifier
+	delivery           Delivery
 	maxPostsPerChannel int
 
 	notificationMu      sync.Mutex
@@ -151,6 +182,14 @@ func NewWithProcessorAndAIForTestingWithMaxPostsPerChannel(database *db.DB, proc
 	return service
 }
 
+// SetDelivery configures the Telegram delivery boundary shared by scheduled
+// and manual digest execution.
+func (s *Service) SetDelivery(delivery Delivery) {
+	if s != nil {
+		s.delivery = delivery
+	}
+}
+
 // FetchAndStore processes all enabled channels assigned to a group. Individual
 // channel failures are captured in the batch result so other channels continue.
 func (s *Service) FetchAndStore(groupID int64) (parser.ChannelBatchResult, error) {
@@ -177,16 +216,17 @@ func (s *Service) FetchAndStore(groupID int64) (parser.ChannelBatchResult, error
 // to all groups in a logical scheduled window. Direct callers receive their
 // own logical window.
 func (s *Service) Generate(groupID int64) (*Digest, error) {
-	return s.generate(groupID, NewWindowID("scheduled"))
+	return s.generate(groupID, NewWindowID("scheduled"), false)
 }
 
 // GenerateWithWindow runs a scheduled digest with an explicit correlation ID.
 func (s *Service) GenerateWithWindow(groupID int64, windowID string) (*Digest, error) {
-	return s.generate(groupID, firstWindowID([]string{windowID}, NewWindowID("scheduled")))
+	return s.generate(groupID, firstWindowID([]string{windowID}, NewWindowID("scheduled")), false)
 }
 
-func (s *Service) generate(groupID int64, windowID string) (*Digest, error) {
-	if _, err := s.FetchAndStore(groupID); err != nil {
+func (s *Service) generate(groupID int64, windowID string, manual bool) (*Digest, error) {
+	batch, err := s.FetchAndStore(groupID)
+	if err != nil {
 		return nil, err
 	}
 	posts, err := s.database.Posts.ListUnsummarized(groupID, 24)
@@ -194,10 +234,136 @@ func (s *Service) generate(groupID int64, windowID string) (*Digest, error) {
 		return nil, fmt.Errorf("list digest posts for group %d: %w", groupID, err)
 	}
 	posts = capPostsPerChannel(posts, s.maxPostsPerChannel)
-	if err := s.summarizeWithWindow(groupID, posts, windowID); err != nil {
-		return nil, err
+	result := &Digest{
+		GroupID: groupID, PostCount: len(posts), ChannelCount: len(batch.Results),
+		WindowID: windowID, FailedChannels: failedChannelNames(batch),
 	}
-	return &Digest{GroupID: groupID, PostCount: len(posts), WindowID: windowID}, nil
+	if len(batch.Results) == 0 && len(batch.Failures) > 0 {
+		result.Outcome = OutcomeAllChannelsFailed
+		result.Message = "Не удалось собрать посты. Все каналы недоступны."
+		s.notifyDigestOutcome(result)
+		return result, terminalDigestError(result, nil, manual)
+	}
+	if len(posts) == 0 {
+		result.Outcome = OutcomeNoPosts
+		result.Message = "Нет новых постов для дайджеста."
+		if len(batch.Failures) > 0 {
+			result.Outcome = OutcomePartial
+			result.Message = "Новых постов нет, часть каналов недоступна."
+			s.notifyDigestOutcome(result)
+		}
+		return result, terminalDigestError(result, nil, manual)
+	}
+	if err := s.summarizeWithWindow(groupID, posts, windowID); err != nil {
+		result.Outcome = OutcomeAIFailed
+		result.Message = safeDigestMessage(err)
+		// summarizeWithWindow already emits the detailed provider alert.
+		return result, terminalDigestError(result, err, manual)
+	}
+	result.SummariesSaved = true
+	result.Text = s.formatDigestMessage(groupID, posts)
+	if s.delivery != nil {
+		receipt, err := s.delivery.Deliver(context.Background(), groupID, result)
+		if err != nil {
+			result.Outcome = OutcomeDeliveryFailed
+			result.Message = safeDigestMessage(err)
+			s.notifyDigestOutcome(result)
+			return result, terminalDigestError(result, err, manual)
+		}
+		result.MessageID = optionalInt64(receipt.MessageID)
+		result.MessageURL = receipt.MessageURL
+		result.Delivered = true
+	}
+	if len(batch.Failures) > 0 {
+		result.Outcome = OutcomePartial
+		result.Message = "Дайджест отправлен частично."
+		s.notifyDigestOutcome(result)
+	} else {
+		result.Outcome = OutcomeSucceeded
+		result.Message = "Дайджест отправлен."
+	}
+	return result, nil
+}
+
+func (s *Service) notifyDigestOutcome(result *Digest) {
+	if s == nil || s.notifier == nil || result == nil {
+		return
+	}
+	message := result.Message
+	if len(result.FailedChannels) > 0 {
+		message += " Не удалось обработать: " + strings.Join(result.FailedChannels, ", ") + "."
+	}
+	if result.Outcome == OutcomeDeliveryFailed && result.SummariesSaved {
+		message += " Сводки сохранены, но не доставлены."
+	}
+	if err := s.notifier.NotifyOwner(context.Background(), message); err != nil {
+		log.Printf("failed to notify owner about digest outcome %s for group %d: %v", result.Outcome, result.GroupID, err)
+	}
+}
+
+func failedChannelNames(batch parser.ChannelBatchResult) []string {
+	names := make([]string, 0, len(batch.Failures))
+	for _, failure := range batch.Failures {
+		name := strings.TrimSpace(failure.Channel.Username)
+		if name != "" {
+			names = append(names, "@"+name)
+		}
+	}
+	return names
+}
+
+func optionalInt64(value int64) *int64 {
+	if value == 0 {
+		return nil
+	}
+	return &value
+}
+
+func safeDigestMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	message := strings.TrimSpace(err.Error())
+	if len(message) > 300 {
+		return message[:300]
+	}
+	return message
+}
+
+func terminalDigestError(result *Digest, err error, manual bool) error {
+	if manual || result == nil || result.Outcome == OutcomeNoPosts || result.Outcome == OutcomePartial {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return errors.New(result.Message)
+}
+
+func (s *Service) formatDigestMessage(groupID int64, posts []model.Post) string {
+	var builder strings.Builder
+	builder.WriteString("📋 ")
+	builder.WriteString(s.groupTitle(groupID))
+	builder.WriteString("\n\n")
+	for _, post := range posts {
+		summary := post.Summary
+		if refreshed, err := s.database.Posts.GetByID(post.ID); err == nil {
+			summary = refreshed.Summary
+		}
+		text := post.Text
+		if summary != nil && strings.TrimSpace(*summary) != "" {
+			text = *summary
+		}
+		builder.WriteString("• ")
+		builder.WriteString(strings.TrimSpace(text))
+		if strings.TrimSpace(post.URL) != "" {
+			builder.WriteString(" (")
+			builder.WriteString(post.URL)
+			builder.WriteString(")")
+		}
+		builder.WriteString("\n")
+	}
+	return strings.TrimSpace(builder.String())
 }
 
 func capPostsPerChannel(posts []model.Post, limit int) []model.Post {
@@ -222,13 +388,26 @@ func capPostsPerChannel(posts []model.Post, limit int) []model.Post {
 // A manual invocation always creates a new window. Callers coordinating
 // several affected groups use GenerateManualWithWindow to share one ID.
 func (s *Service) GenerateManual(groupID int64) (*Digest, error) {
-	return s.generate(groupID, NewWindowID("manual"))
+	return s.generate(groupID, NewWindowID("manual"), false)
 }
 
 // GenerateManualWithWindow runs one group as part of an explicit manual
 // digest window shared by all groups in that invocation.
 func (s *Service) GenerateManualWithWindow(groupID int64, windowID string) (*Digest, error) {
-	return s.generate(groupID, firstWindowID([]string{windowID}, NewWindowID("manual")))
+	return s.generate(groupID, firstWindowID([]string{windowID}, NewWindowID("manual")), false)
+}
+
+// GenerateManualResult is the typed manual WebApp entry point. Terminal
+// outcomes are returned as data so polling clients can distinguish expected
+// digest failures from transport errors.
+func (s *Service) GenerateManualResult(groupID int64) (*Digest, error) {
+	return s.generate(groupID, NewWindowID("manual"), true)
+}
+
+// GenerateManualResultWithWindow coordinates typed outcomes across a shared
+// manual digest window.
+func (s *Service) GenerateManualResultWithWindow(groupID int64, windowID string) (*Digest, error) {
+	return s.generate(groupID, firstWindowID([]string{windowID}, NewWindowID("manual")), true)
 }
 
 func (s *Service) summarize(groupID int64, posts []model.Post) error {

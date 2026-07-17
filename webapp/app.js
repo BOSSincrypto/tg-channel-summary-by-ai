@@ -13,6 +13,7 @@
     modal: null,
     readonly: false,
     settingsDraft: null,
+    pendingChannelToggles: {},
     digestJob: null,
     digestTimer: null,
     retryAfter: 0,
@@ -102,7 +103,7 @@
   function normalizeGroup(item) {
     var assignments = pick(item, ["assignments", "channels", "Assignments", "Channels"], []);
     var status = String(pick(item, ["status", "Status"], "active"));
-    var forumValue = pick(item, ["is_forum", "IsForum"], status !== "ineligible");
+    var forumValue = pick(item, ["is_forum", "IsForum"], status === "" || status === "active");
     return {
       id: idOf(item),
       chatId: String(pick(item, ["telegram_chat_id", "TelegramChatID", "chat_id", "chatId"], "")),
@@ -209,7 +210,9 @@
         return response.text().then(function (body) {
           var message = "";
           try { message = JSON.parse(body).error || JSON.parse(body).message; } catch (_) { message = ""; }
-          throw new Error(message || "Ошибка сервера (" + response.status + ")");
+          var apiError = new Error(message || "Ошибка сервера (" + response.status + ")");
+          apiError.status = response.status;
+          throw apiError;
         });
       }
       if (response.status === 204) return null;
@@ -375,22 +378,39 @@
       tr.appendChild(identity);
       var status = el("td");
       var toggleLabel = el("span", "toggle-label");
-      var toggle = button("", "toggle" + (channel.enabled ? " on" : ""), function () {
-        if (state.readonly) return;
+      var channelKey = String(channel.id);
+      var pendingToggle = state.pendingChannelToggles[channelKey];
+      var toggle = button("", "toggle" + (channel.enabled ? " on" : "") + (pendingToggle ? " pending" : ""), function () {
+        if (state.readonly || state.pendingChannelToggles[channelKey]) return;
         var before = channel.enabled;
         var beforeVersion = channel.version;
+        var request = { before: before, beforeVersion: beforeVersion };
+        state.pendingChannelToggles[channelKey] = request;
         channel.enabled = !before;
         render();
         mutation("/api/channels/" + encodeURIComponent(channel.id), "PATCH", { enabled: channel.enabled, version: beforeVersion }).then(function (updated) {
+          if (state.pendingChannelToggles[channelKey] !== request) return;
           if (updated) Object.assign(channel, normalizeChannel(updated));
+          delete state.pendingChannelToggles[channelKey];
           showToast(channel.enabled ? "Канал включён." : "Канал выключен.", "success");
+          render();
         }).catch(function (error) {
+          if (state.pendingChannelToggles[channelKey] !== request) return;
+          delete state.pendingChannelToggles[channelKey];
+          if (error && error.status === 409) {
+            showToast("Статус канала изменился. Загружаем актуальное состояние.", "error", true);
+            state.loadedAt.channels = 0;
+            loadChannels(true);
+            return;
+          }
           channel.enabled = before;
           channel.version = beforeVersion;
           showToast("Не удалось обновить статус канала: " + apiErrorMessage(error), "error", true);
           render();
         });
       });
+      toggle.disabled = Boolean(pendingToggle) || state.readonly;
+      if (pendingToggle) attr(toggle, "aria-busy", "true");
       attr(toggle, "aria-label", channel.enabled ? "Выключить канал" : "Включить канал");
       toggleLabel.appendChild(toggle);
       toggleLabel.appendChild(el("span", "", channel.enabled ? "Включён" : "Выключен"));
@@ -550,13 +570,25 @@
           var selected = Array.from(list.querySelectorAll("input:checked")).map(function (item) { return item.value; });
           if (!selected.length) { showToast("Выберите хотя бы один канал.", "warning"); return; }
           save.disabled = true;
-          Promise.all(selected.map(function (channelId) {
+          Promise.allSettled(selected.map(function (channelId) {
             var payload = { channel_id: channelId };
             if (group.isForum && topic && topic.input.value) payload.topic_thread_id = topic.input.value;
             return mutation("/api/groups/" + encodeURIComponent(group.id) + "/channels", "POST", payload);
-          })).then(function () {
-            close(); showToast("Каналы назначены.", "success"); state.loadedAt.groups = 0; return loadGroups(true);
-          }).catch(function (error) { showToast(apiErrorMessage(error), "error", true); }).finally(function () { save.disabled = false; });
+          })).then(function (results) {
+            var failed = results.filter(function (result) { return result.status === "rejected"; });
+            state.loadedAt.groups = 0;
+            return loadGroups(true).then(function () {
+              close();
+              if (failed.length) {
+                showToast("Часть каналов не удалось назначить. Состояние обновлено.", "error", true);
+              } else {
+                showToast("Каналы назначены.", "success");
+              }
+            });
+          }).catch(function (error) {
+            state.loadedAt.groups = 0;
+            showToast(apiErrorMessage(error), "error", true);
+          }).finally(function () { save.disabled = false; });
         });
         body.appendChild(form);
       });
@@ -652,7 +684,15 @@
     grid.appendChild(time.wrap); grid.appendChild(tz.wrap); grid.appendChild(model.wrap); grid.appendChild(datalist); form.appendChild(grid);
     var actions = el("div", "actions");
     var save = button("Сохранить настройки", "primary");
-    var cancel = button("Отмена", "secondary", function () { if (settingsChanged(form, saved)) openConfirm("Отменить изменения?", "Введённые значения будут заменены последними сохранёнными.", "Выйти без сохранения", function () { render(); }); else switchTab("channels"); });
+    var cancel = button("Отмена", "secondary", function () {
+      if (settingsChanged(form, saved)) {
+        openConfirm("Отменить изменения?", "Введённые значения будут заменены последними сохранёнными.", "Выйти без сохранения", function () {
+          discardSettingsAndNavigate("channels");
+        });
+      } else {
+        switchTab("channels");
+      }
+    });
     actions.appendChild(save); actions.appendChild(cancel); form.appendChild(actions);
     [time.input, tz.input, model.input].forEach(function (input) { input.addEventListener("input", function () { state.settingsDraft = readSettings(form); }); });
     form.addEventListener("submit", function (event) {
@@ -769,6 +809,14 @@
     if (state.tab === "settings") return dataBody("settings", renderSettings);
     return dataBody("groups", renderDigest);
   }
+  function discardSettingsAndNavigate(tab) {
+    state.settingsDraft = null;
+    state.tab = tab;
+    refresh(tab, false);
+    configureTelegramButtons();
+    render();
+    haptic("light");
+  }
   function refresh(tab, force) {
     if (tab === "channels") return loadChannels(force);
     if (tab === "groups") return loadGroups(force);
@@ -780,7 +828,7 @@
     if (state.tab === "settings" && state.settingsDraft && state.data.settings && JSON.stringify(state.settingsDraft) !== JSON.stringify({
       digest_time: state.data.settings.digestTime, timezone: state.data.settings.timezone, default_model: state.data.settings.model
     })) {
-      openConfirm("У вас есть несохранённые изменения.", "Выйти без сохранения?", "Выйти", function () { state.settingsDraft = null; state.tab = tab; refresh(tab, false); });
+      openConfirm("У вас есть несохранённые изменения.", "Выйти без сохранения?", "Выйти", function () { discardSettingsAndNavigate(tab); });
       return;
     }
     state.tab = tab; state.settingsDraft = null; refresh(tab, false); configureTelegramButtons(); render();

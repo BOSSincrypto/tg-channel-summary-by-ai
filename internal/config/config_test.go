@@ -103,6 +103,7 @@ func TestLoad_MissingDotEnvUsesProvidedDBPath(t *testing.T) {
 }
 
 func TestParse_AllRequiredFields(t *testing.T) {
+	t.Setenv("WEBAPP_URL", "")
 	input := strings.NewReader(`
 BOT_TOKEN=test_bot_token_123
 OWNER_TELEGRAM_ID=123456789
@@ -120,6 +121,26 @@ OPENROUTER_API_KEY=test-openrouter-placeholder
 	}
 	if cfg.OpenRouterKey != "test-openrouter-placeholder" {
 		t.Errorf("OpenRouterKey = %q, want %q", cfg.OpenRouterKey, "test-openrouter-placeholder")
+	}
+	if cfg.WebAppURL != "https://tg-channel-summary.fly.dev/webapp/" {
+		t.Errorf("WebAppURL = %q, want default HTTPS URL", cfg.WebAppURL)
+	}
+}
+
+func TestParse_WebAppURLCanBeConfigured(t *testing.T) {
+	t.Setenv("WEBAPP_URL", "")
+	input := strings.NewReader(`
+BOT_TOKEN=test
+OWNER_TELEGRAM_ID=123
+OPENROUTER_API_KEY=test
+WEBAPP_URL=https://settings.example.test/
+`)
+	cfg, err := Parse(input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.WebAppURL != "https://settings.example.test/" {
+		t.Fatalf("WebAppURL = %q, want configured URL", cfg.WebAppURL)
 	}
 }
 
@@ -189,6 +210,18 @@ OPENROUTER_API_KEY=test
 	}
 }
 
+func TestParse_InvalidOwnerTelegramID(t *testing.T) {
+	input := strings.NewReader(`
+BOT_TOKEN=test
+OWNER_TELEGRAM_ID=not-a-number
+OPENROUTER_API_KEY=test
+`)
+	_, err := Parse(input)
+	if err == nil || !strings.Contains(err.Error(), "OWNER_TELEGRAM_ID") {
+		t.Fatalf("error = %v, want invalid OWNER_TELEGRAM_ID error", err)
+	}
+}
+
 func TestParse_EmptyOpenRouterKey(t *testing.T) {
 	input := strings.NewReader(`
 BOT_TOKEN=test
@@ -216,6 +249,9 @@ OPENROUTER_API_KEY=test
 	}
 	if cfg.Timezone != "Europe/Moscow" {
 		t.Errorf("Timezone = %q, want %q", cfg.Timezone, "Europe/Moscow")
+	}
+	if cfg.WebAppURL != "https://tg-channel-summary.fly.dev/webapp/" {
+		t.Errorf("WebAppURL = %q, want default HTTPS URL", cfg.WebAppURL)
 	}
 	if cfg.Port != "8080" {
 		t.Errorf("Port = %q, want %q", cfg.Port, "8080")

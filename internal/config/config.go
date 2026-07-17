@@ -21,6 +21,7 @@ type Config struct {
 	CustomProviders   string
 	DigestTime        string
 	Timezone          string
+	WebAppURL         string
 	Port              string
 	DBPath            string
 	LogLevel          string
@@ -73,6 +74,10 @@ func Parse(r io.Reader) (*Config, error) {
 	if cfg.OwnerTelegramID == "" {
 		return nil, fmt.Errorf("OWNER_TELEGRAM_ID is required but not set")
 	}
+	ownerID, err := strconv.ParseInt(cfg.OwnerTelegramID, 10, 64)
+	if err != nil || ownerID <= 0 {
+		return nil, fmt.Errorf("OWNER_TELEGRAM_ID is not set or invalid")
+	}
 
 	cfg.OpenRouterKey = values["OPENROUTER_API_KEY"]
 	if cfg.OpenRouterKey == "" {
@@ -82,6 +87,7 @@ func Parse(r io.Reader) (*Config, error) {
 	// Optional fields with defaults
 	cfg.DigestTime = stringDefault(values, "DIGEST_TIME", "21:00")
 	cfg.Timezone = stringDefault(values, "TIMEZONE", "Europe/Moscow")
+	cfg.WebAppURL = stringDefault(values, "WEBAPP_URL", "https://tg-channel-summary.fly.dev/webapp/")
 	cfg.Port = stringDefault(values, "PORT", "8080")
 	cfg.DBPath = stringDefault(values, "DB_PATH", "bot.db")
 	cfg.LogLevel = stringDefault(values, "LOG_LEVEL", "info")
@@ -105,6 +111,7 @@ var allKeys = []string{
 	"CUSTOM_PROVIDERS",
 	"DIGEST_TIME",
 	"TIMEZONE",
+	"WEBAPP_URL",
 	"PORT",
 	"DB_PATH",
 	"LOG_LEVEL",

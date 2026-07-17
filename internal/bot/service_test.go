@@ -122,6 +122,169 @@ func TestParseCommandNormalizesCaseAndBotSuffix(t *testing.T) {
 	}
 }
 
+func TestServiceAdminCommandsAuthorizeOwnerAndSendWebAppButton(t *testing.T) {
+	api := &fakeTelegramClient{
+		me:    &telego.User{ID: 123, Username: "DigestBot"},
+		chats: map[int64]*telego.ChatFullInfo{},
+	}
+	service := newServiceForTest(api, api)
+	service.ownerID = "123"
+	service.botName = "DigestBot"
+	service.webAppURL = "https://example.test/webapp/"
+	service.configureAdminCommands()
+
+	message := &telego.Message{
+		Chat: telego.Chat{ID: 123},
+		From: &telego.User{ID: 123, FirstName: "Owner_[test]"},
+	}
+	for _, command := range []string{"start", "settings"} {
+		service.commands[command](context.Background(), message, "")
+	}
+
+	if len(api.messages) != 2 {
+		t.Fatalf("messages = %d, want 2", len(api.messages))
+	}
+	if !strings.Contains(api.messages[0].Text, "@DigestBot") ||
+		!strings.Contains(api.messages[0].Text, "daily digests") {
+		t.Fatalf("welcome text = %q", api.messages[0].Text)
+	}
+	for i, sent := range api.messages {
+		keyboard, ok := sent.ReplyMarkup.(*telego.InlineKeyboardMarkup)
+		if !ok || len(keyboard.InlineKeyboard) != 1 || len(keyboard.InlineKeyboard[0]) != 1 {
+			t.Fatalf("message %d keyboard = %#v, want one inline button", i, sent.ReplyMarkup)
+		}
+		button := keyboard.InlineKeyboard[0][0]
+		if button.Text != "Open Settings" || button.CallbackData != "" ||
+			button.WebApp == nil || button.WebApp.URL != service.webAppURL {
+			t.Fatalf("message %d button = %#v, want WebApp settings button", i, button)
+		}
+	}
+	if !strings.Contains(api.messages[0].Text, `\_`) ||
+		!strings.Contains(api.messages[0].Text, `\[`) {
+		t.Fatalf("welcome text did not escape MarkdownV2 dynamic content: %q", api.messages[0].Text)
+	}
+	if api.messages[0].ParseMode != "MarkdownV2" {
+		t.Fatalf("welcome parse mode = %q, want MarkdownV2", api.messages[0].ParseMode)
+	}
+}
+
+func TestServiceAdminCommandsDenyNonOwnerWithoutMarkup(t *testing.T) {
+	api := &fakeTelegramClient{
+		me:    &telego.User{ID: 123, Username: "DigestBot"},
+		chats: map[int64]*telego.ChatFullInfo{},
+	}
+	service := newServiceForTest(api, api)
+	service.ownerID = "123"
+	service.webAppURL = "https://example.test/webapp/"
+	service.configureAdminCommands()
+
+	message := &telego.Message{
+		Chat: telego.Chat{ID: 999},
+		From: &telego.User{ID: 999},
+	}
+	for _, command := range []string{"start", "settings"} {
+		if err := service.commands[command](context.Background(), message, ""); err != nil {
+			t.Fatalf("%s error = %v", command, err)
+		}
+	}
+
+	if len(api.messages) != 2 {
+		t.Fatalf("messages = %d, want 2", len(api.messages))
+	}
+	for _, sent := range api.messages {
+		if sent.ReplyMarkup != nil {
+			t.Fatalf("denial message contains reply markup: %#v", sent.ReplyMarkup)
+		}
+		if !strings.Contains(strings.ToLower(sent.Text), "access denied") {
+			t.Fatalf("denial text = %q", sent.Text)
+		}
+		if sent.ParseMode != "" {
+			t.Fatalf("denial parse mode = %q, want plain text", sent.ParseMode)
+		}
+	}
+}
+
+func TestServiceAdminCommandsIgnoreMalformedSender(t *testing.T) {
+	api := &fakeTelegramClient{
+		me:    &telego.User{ID: 123, Username: "DigestBot"},
+		chats: map[int64]*telego.ChatFullInfo{},
+	}
+	service := newServiceForTest(api, api)
+	service.ownerID = "123"
+	service.webAppURL = "https://example.test/webapp/"
+	service.configureAdminCommands()
+
+	if err := service.HandleUpdate(context.Background(), &telego.Update{
+		Message: &telego.Message{Chat: telego.Chat{ID: 123}, From: nil, Text: "/start"},
+	}); err != nil {
+		t.Fatalf("malformed update error = %v", err)
+	}
+	if len(api.messages) != 0 {
+		t.Fatalf("malformed sender produced messages = %#v", api.messages)
+	}
+}
+
+func TestServiceCallbackActionsRequireOwner(t *testing.T) {
+	api := &fakeTelegramClient{
+		me:    &telego.User{ID: 123, Username: "DigestBot"},
+		chats: map[int64]*telego.ChatFullInfo{},
+	}
+	service := newServiceForTest(api, api)
+	service.ownerID = "123"
+	service.SetCommandHandler("admin_action", func(context.Context, *telego.Message, string) error {
+		t.Fatal("non-owner callback handler must not run")
+		return nil
+	})
+
+	err := service.HandleUpdate(context.Background(), &telego.Update{
+		CallbackQuery: &telego.CallbackQuery{
+			ID:      "callback-1",
+			From:    telego.User{ID: 999},
+			Data:    "admin_action",
+			Message: &telego.Message{Chat: telego.Chat{ID: 999}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("callback handling error = %v", err)
+	}
+	if len(api.callbacks) != 1 || len(api.messages) != 1 {
+		t.Fatalf("callback responses = callbacks:%d messages:%d, want one each", len(api.callbacks), len(api.messages))
+	}
+	if !strings.Contains(strings.ToLower(api.messages[0].Text), "access denied") {
+		t.Fatalf("callback denial text = %q", api.messages[0].Text)
+	}
+}
+
+func TestServiceCallbackActionsRunForOwner(t *testing.T) {
+	api := &fakeTelegramClient{
+		me:    &telego.User{ID: 123, Username: "DigestBot"},
+		chats: map[int64]*telego.ChatFullInfo{},
+	}
+	service := newServiceForTest(api, api)
+	service.ownerID = "123"
+	service.SetCommandHandler("admin_action", func(_ context.Context, message *telego.Message, _ string) error {
+		if message.From == nil || message.From.ID != 123 {
+			t.Fatalf("callback handler sender = %#v, want owner", message.From)
+		}
+		return nil
+	})
+
+	err := service.HandleUpdate(context.Background(), &telego.Update{
+		CallbackQuery: &telego.CallbackQuery{
+			ID:      "callback-owner",
+			From:    telego.User{ID: 123},
+			Data:    "admin_action",
+			Message: &telego.Message{Chat: telego.Chat{ID: 123}, From: &telego.User{ID: 999}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("callback handling error = %v", err)
+	}
+	if len(api.callbacks) != 1 {
+		t.Fatalf("callback answers = %d, want 1", len(api.callbacks))
+	}
+}
+
 func TestServiceStartVerifiesIdentityRegistersPrivateCommandsAndAnswersCallbacks(t *testing.T) {
 	api := &fakeTelegramClient{
 		me:      &telego.User{ID: 123, Username: "DigestBot"},

@@ -99,7 +99,7 @@ func main() {
 	telegramBot, err := bot.NewWithConfig(
 		cfg.BotToken,
 		cfg.OwnerTelegramID,
-		"",
+		cfg.WebAppURL,
 		store.Groups,
 		store.Channels,
 		ownerNotifier,

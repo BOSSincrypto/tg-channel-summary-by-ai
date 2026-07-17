@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -65,6 +66,7 @@ type Service struct {
 	logger    logger
 	ownerID   string
 	botName   string
+	webAppURL string
 	commands  map[string]CommandHandler
 	applyData func(context.Context, *telego.Message, BotSettings) error
 
@@ -75,10 +77,12 @@ type Service struct {
 
 // New creates an unconfigured service. Use NewWithConfig for production.
 func New() *Service {
-	return &Service{
+	service := &Service{
 		logger:   log.Default(),
 		commands: make(map[string]CommandHandler),
 	}
+	service.configureAdminCommands()
+	return service
 }
 
 // NewWithConfig creates a Telegram service backed by telego long polling.
@@ -105,18 +109,8 @@ func NewWithConfig(token, ownerID, webAppURL string, groups *db.GroupRepository,
 	service.lifecycle = lifecycle
 	service.ownerID = strings.TrimSpace(ownerID)
 	service.botName = strings.TrimPrefix(client.Username(), "@")
-	if webAppURL != "" {
-		service.SetCommandHandler("settings", func(ctx context.Context, message *telego.Message, _ string) error {
-			_, err := service.api.SendMessage(ctx, &telego.SendMessageParams{
-				ChatID: message.Chat.ChatID(),
-				Text:   "Open settings",
-				ReplyMarkup: (&telego.InlineKeyboardMarkup{}).WithInlineKeyboard([]telego.InlineKeyboardButton{
-					{Text: "Open Settings", WebApp: &telego.WebAppInfo{URL: webAppURL}},
-				}),
-			})
-			return err
-		})
-	}
+	service.webAppURL = strings.TrimSpace(webAppURL)
+	service.configureAdminCommands()
 	return service, nil
 }
 
@@ -133,7 +127,21 @@ func (s *Service) SetCommandHandler(command string, handler CommandHandler) {
 	if command == "" || handler == nil {
 		return
 	}
-	s.commands[command] = handler
+	// All commands registered by this service are administrative operations.
+	// Guard them at the dispatch boundary so a future handler cannot
+	// accidentally expose a sensitive action without the owner check.
+	s.commands[command] = func(ctx context.Context, message *telego.Message, argument string) error {
+		if message == nil || message.From == nil || message.From.ID <= 0 {
+			return nil
+		}
+		if !s.isConfigured() {
+			return s.sendPlain(ctx, message.Chat.ChatID(), "Bot is not configured.")
+		}
+		if !s.isOwner(message.From.ID) {
+			return s.sendPlain(ctx, message.Chat.ChatID(), "Access denied.")
+		}
+		return handler(ctx, message, argument)
+	}
 }
 
 // SetSettingsApplier configures the persistence callback for WebApp data.
@@ -235,12 +243,32 @@ func (s *Service) HandleUpdate(ctx context.Context, update *telego.Update) error
 		query := update.CallbackQuery
 		// Answer before dispatching any action so Telegram always dismisses the
 		// client-side loading spinner, including unknown or failed callbacks.
-		if err := s.api.AnswerCallbackQuery(ctx, &telego.AnswerCallbackQueryParams{CallbackQueryID: query.ID}); err != nil {
-			s.logf("answer callback query: %v", err)
+		if s.api != nil {
+			if err := s.api.AnswerCallbackQuery(ctx, &telego.AnswerCallbackQueryParams{CallbackQueryID: query.ID}); err != nil {
+				s.logf("answer callback query: %v", err)
+			}
+		}
+		if query.From.ID <= 0 || !s.isConfigured() || !s.isOwner(query.From.ID) {
+			if query.Message != nil {
+				if message := query.Message.Message(); message != nil && query.From.ID > 0 {
+					return s.sendPlain(ctx, message.Chat.ChatID(), s.accessDeniedMessage())
+				}
+			}
+			return nil
 		}
 		if handler, ok := s.commands[strings.ToLower(strings.TrimSpace(query.Data))]; ok {
-			if message := query.Message.Message(); message != nil {
-				return handler(ctx, message, "")
+			if query.Message != nil {
+				if message := query.Message.Message(); message != nil {
+					// The message attached to a callback is the bot's
+					// original message, so its From field is not the user
+					// who pressed the button. Preserve the chat and content
+					// while supplying the authenticated callback sender to
+					// the centralized command guard.
+					callbackMessage := *message
+					callbackUser := query.From
+					callbackMessage.From = &callbackUser
+					return handler(ctx, &callbackMessage, "")
+				}
 			}
 		}
 		return nil
@@ -271,6 +299,91 @@ func (s *Service) handleMessage(ctx context.Context, message *telego.Message) er
 		return nil
 	}
 	return handler(ctx, message, argument)
+}
+
+func (s *Service) configureAdminCommands() {
+	s.SetCommandHandler("start", s.handleStart)
+	s.SetCommandHandler("settings", s.handleSettings)
+}
+
+func (s *Service) handleStart(ctx context.Context, message *telego.Message, _ string) error {
+	botName := strings.TrimSpace(s.botName)
+	if botName == "" {
+		botName = "tgaidigestbot"
+	}
+	greeting := "Welcome"
+	if message != nil && message.From != nil && strings.TrimSpace(message.From.FirstName) != "" {
+		greeting += ", " + escapeMarkdownV2(message.From.FirstName)
+	}
+	text := fmt.Sprintf(
+		"%s to *%s*\\. This bot summarizes Telegram channels and creates daily digests\\.",
+		greeting,
+		escapeMarkdownV2("@"+botName),
+	)
+	return s.sendAdminWebAppMessage(ctx, message.Chat.ChatID(), text, true)
+}
+
+func (s *Service) handleSettings(ctx context.Context, message *telego.Message, _ string) error {
+	return s.sendAdminWebAppMessage(ctx, message.Chat.ChatID(), "Open settings", false)
+}
+
+func (s *Service) sendAdminWebAppMessage(ctx context.Context, chatID telego.ChatID, text string, markdown bool) error {
+	if !isHTTPSWebAppURL(s.webAppURL) {
+		return s.sendPlain(ctx, chatID, "Bot is not configured.")
+	}
+	params := &telego.SendMessageParams{
+		ChatID: chatID,
+		Text:   text,
+		ReplyMarkup: (&telego.InlineKeyboardMarkup{}).WithInlineKeyboard([]telego.InlineKeyboardButton{
+			{Text: "Open Settings", WebApp: &telego.WebAppInfo{URL: s.webAppURL}},
+		}),
+	}
+	if markdown {
+		params.ParseMode = "MarkdownV2"
+	}
+	_, err := s.api.SendMessage(ctx, params)
+	return err
+}
+
+func (s *Service) isConfigured() bool {
+	if s == nil {
+		return false
+	}
+	ownerID, err := strconv.ParseInt(strings.TrimSpace(s.ownerID), 10, 64)
+	return err == nil && ownerID > 0
+}
+
+func (s *Service) isOwner(userID int64) bool {
+	if s == nil || userID <= 0 {
+		return false
+	}
+	ownerID, err := strconv.ParseInt(strings.TrimSpace(s.ownerID), 10, 64)
+	return err == nil && ownerID > 0 && ownerID == userID
+}
+
+func (s *Service) accessDeniedMessage() string {
+	if !s.isConfigured() {
+		return "Bot is not configured."
+	}
+	return "Access denied."
+}
+
+func escapeMarkdownV2(value string) string {
+	const special = `_*[]()~` + "`" + `>#+-=|{}.!`
+	var escaped strings.Builder
+	escaped.Grow(len(value))
+	for _, char := range value {
+		if strings.ContainsRune(special, char) {
+			escaped.WriteByte('\\')
+		}
+		escaped.WriteRune(char)
+	}
+	return escaped.String()
+}
+
+func isHTTPSWebAppURL(rawURL string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	return err == nil && parsed.Scheme == "https" && parsed.Host != ""
 }
 
 // ParseCommand extracts a lower-case command and argument. A command addressed
@@ -308,10 +421,10 @@ func (s *Service) handleWebAppData(ctx context.Context, message *telego.Message)
 	if message.From == nil || message.From.ID == 0 {
 		return nil
 	}
-	if s.ownerID == "" {
+	if !s.isConfigured() {
 		return s.sendPlain(ctx, message.Chat.ChatID(), "Bot is not configured.")
 	}
-	if strconv.FormatInt(message.From.ID, 10) != s.ownerID {
+	if !s.isOwner(message.From.ID) {
 		return s.sendPlain(ctx, message.Chat.ChatID(), "Access denied.")
 	}
 	var settings BotSettings

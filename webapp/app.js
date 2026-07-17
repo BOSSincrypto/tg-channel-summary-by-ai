@@ -15,6 +15,8 @@
     settingsDraft: null,
     digestJob: null,
     digestTimer: null,
+    retryAfter: 0,
+    fatal: false,
     destroyed: false
   };
   var tabs = [
@@ -121,7 +123,7 @@
       name: String(pick(item, ["name", "Name"], "")),
       baseUrl: String(pick(item, ["base_url", "BaseURL"], "")),
       model: String(pick(item, ["default_model", "DefaultModel", "model", "Model"], "")),
-      apiKey: String(pick(item, ["api_key", "APIKey"], "")),
+      hasKey: Boolean(pick(item, ["has_key", "HasKey"], false)),
       isDefault: Boolean(pick(item, ["is_default", "IsDefault"], false))
     };
   }
@@ -151,9 +153,18 @@
     region.appendChild(toast);
     if (!persistent) window.setTimeout(function () { if (toast.parentNode) toast.remove(); }, 5000);
   }
+  function haptic(type) {
+    if (!telegram || !telegram.HapticFeedback) return;
+    if (telegram.HapticFeedback.notificationOccurred && (type === "error" || type === "success")) {
+      telegram.HapticFeedback.notificationOccurred(type);
+    } else if (telegram.HapticFeedback.impactOccurred) {
+      telegram.HapticFeedback.impactOccurred("light");
+    }
+  }
   function setError(tab, message) {
     state.errors[tab] = message;
     showToast(message, "error", true);
+    haptic("error");
     render();
   }
   function clearError(tab) {
@@ -183,8 +194,10 @@
       }
       if (response.status === 429) {
         var retryAfter = response.headers.get("Retry-After") || "несколько";
+        state.retryAfter = Date.now() + ((Number(retryAfter) || 5) * 1000);
         var rateError = new Error("Слишком много запросов. Подождите " + retryAfter + " секунд.");
         rateError.retryAfter = Number(retryAfter) || 5;
+        haptic("error");
         throw rateError;
       }
       if (!response.ok) {
@@ -207,6 +220,10 @@
   }
   function mutation(path, method, payload) {
     if (state.readonly) return Promise.reject(new Error("Сессия истекла. Доступно только чтение."));
+    if (Date.now() < state.retryAfter) {
+      var remaining = Math.max(1, Math.ceil((state.retryAfter - Date.now()) / 1000));
+      return Promise.reject(new Error("Слишком много запросов. Подождите " + remaining + " секунд."));
+    }
     return api(path, {
       method: method,
       body: payload === undefined ? undefined : JSON.stringify(payload)
@@ -542,7 +559,7 @@
     var body = el("tbody");
     list.forEach(function (provider) {
       var tr = el("tr");
-      var identity = el("td"); identity.appendChild(el("strong", "truncate", provider.name)); if (provider.apiKey) identity.appendChild(el("span", "subline", "Ключ: " + provider.apiKey)); tr.appendChild(identity);
+      var identity = el("td"); identity.appendChild(el("strong", "truncate", provider.name)); identity.appendChild(el("span", "subline", provider.hasKey ? "Ключ сохранён" : "Ключ не задан")); tr.appendChild(identity);
       tr.appendChild(el("td", "truncate", provider.baseUrl));
       tr.appendChild(el("td", "truncate", provider.model));
       var status = el("td"); if (provider.isDefault) status.appendChild(el("span", "badge system", "★ По умолчанию")); else status.appendChild(el("span", "badge", "Дополнительный")); tr.appendChild(status);
@@ -739,6 +756,7 @@
       return;
     }
     state.tab = tab; state.settingsDraft = null; refresh(tab, false); configureTelegramButtons(); render();
+    haptic("light");
   }
   function render() {
     if (state.destroyed) return;
@@ -781,7 +799,7 @@
     }
     telegram.BackButton.hide();
     var labels = { channels: "Добавить канал", groups: "Добавить группу", providers: "Добавить провайдера", settings: "Сохранить настройки", digest: "Запустить дайджест" };
-    if (state.tab === "channels" || state.tab === "groups" || state.tab === "providers") {
+    if (state.tab === "channels" || state.tab === "groups" || state.tab === "providers" || state.tab === "settings" || state.tab === "digest") {
       telegram.MainButton.setText(labels[state.tab]);
       telegram.MainButton.show();
       telegram.MainButton.offClick(mainButtonAction);
@@ -789,12 +807,19 @@
     } else telegram.MainButton.hide();
   }
   function mainButtonAction() {
-    var target = document.querySelector(state.tab === "channels" ? "#channel-username" : state.tab === "groups" ? "#group-chat-id" : state.tab === "providers" ? "[id='provider-name']" : "");
+    var target = document.querySelector(
+      state.tab === "channels" ? "#channel-username" :
+      state.tab === "groups" ? "#group-chat-id" :
+      state.tab === "providers" ? "[id='provider-name']" :
+      state.tab === "settings" ? "#settings-time" :
+      state.tab === "digest" ? "#digest-group" : ""
+    );
     if (target) target.form ? target.form.requestSubmit() : target.focus();
     else if (state.tab === "providers") openProviderForm();
   }
   function setupTelegram() {
     if (!telegram) return false;
+    if (!telegram.initData) return false;
     telegram.ready();
     telegram.expand();
     applyTheme();
@@ -821,11 +846,29 @@
     card.appendChild(el("p", "muted", "Это приложение должно быть открыто из Telegram. Откройте бота @tgaidigestbot и нажмите «Настройки»."));
     wrap.appendChild(card); app.appendChild(wrap);
   }
+  function fatalError(message) {
+    if (state.fatal || state.destroyed) return;
+    state.fatal = true;
+    var wrap = el("div", "not-telegram"), card = el("section", "panel");
+    card.appendChild(el("div", "empty-icon", "⚠️"));
+    card.appendChild(el("h1", "", "Что-то пошло не так"));
+    card.appendChild(el("p", "muted", message || "Не удалось загрузить приложение. Попробуйте перезагрузить страницу."));
+    card.appendChild(button("Перезагрузить", "primary", function () { window.location.reload(); }));
+    wrap.appendChild(card);
+    while (app.firstChild) app.removeChild(app.firstChild);
+    app.appendChild(wrap);
+  }
   function start() {
     if (!setupTelegram()) { outsideTelegram(); return; }
     render();
     refresh(state.tab, false);
   }
+  window.addEventListener("error", function () {
+    fatalError("Произошла ошибка интерфейса. Попробуйте перезагрузить приложение.");
+  });
+  window.addEventListener("unhandledrejection", function () {
+    fatalError("Не удалось выполнить операцию. Попробуйте перезагрузить приложение.");
+  });
   window.addEventListener("beforeunload", function () {
     state.destroyed = true;
     if (state.digestTimer) window.clearTimeout(state.digestTimer);

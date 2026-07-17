@@ -94,8 +94,8 @@ func TestAuthenticatedProviderRoutesMaskSecrets(t *testing.T) {
 	if strings.Contains(body, "unit-provider-value") {
 		t.Fatalf("provider response leaked API key: %s", body)
 	}
-	if !strings.Contains(body, maskedAPIKey) {
-		t.Fatalf("provider response did not include masked API key: %s", body)
+	if !strings.Contains(body, `"has_key":true`) || strings.Contains(body, `"api_key"`) {
+		t.Fatalf("provider response did not use transmission-safe key metadata: %s", body)
 	}
 }
 

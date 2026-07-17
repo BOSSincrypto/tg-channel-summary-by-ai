@@ -188,7 +188,6 @@ func providerJSON(provider model.AIProvider) map[string]any {
 		"version":       provider.Version,
 		"name":          provider.Name,
 		"base_url":      provider.BaseURL,
-		"api_key":       maskAPIKey(provider.APIKey),
 		"has_key":       strings.TrimSpace(provider.APIKey) != "",
 		"default_model": provider.DefaultModel,
 		"is_default":    provider.IsDefault,

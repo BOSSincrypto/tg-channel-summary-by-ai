@@ -72,7 +72,7 @@ func main() {
 	// go bot.Start()
 
 	// Start HTTP server (health check + WebApp)
-	webAppAuth, err := webapp.NewWebAppAuth(cfg.BotToken, cfg.OwnerTelegramID)
+	webAppAuth, err := webapp.NewWebAppAuthWithOrigin(cfg.BotToken, cfg.OwnerTelegramID, cfg.WebAppURL)
 	if err != nil {
 		log.Fatalf("failed to configure WebApp authentication: %v", err)
 	}

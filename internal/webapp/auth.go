@@ -24,14 +24,29 @@ const (
 // configured owner. It intentionally keeps initData and bot token private and
 // never includes either value in an error or log message.
 type WebAppAuth struct {
-	botToken string
-	ownerID  int64
-	maxAge   time.Duration
-	now      func() time.Time
+	botToken      string
+	ownerID       int64
+	maxAge        time.Duration
+	now           func() time.Time
+	allowedOrigin string
 }
 
 // NewWebAppAuth creates the authentication boundary used by WebApp APIs.
 func NewWebAppAuth(botToken, ownerTelegramID string) (*WebAppAuth, error) {
+	return newWebAppAuth(botToken, ownerTelegramID, "")
+}
+
+// NewWebAppAuthWithOrigin creates the authentication boundary used by WebApp
+// APIs and restricts browser requests to the origin hosting the WebApp.
+func NewWebAppAuthWithOrigin(botToken, ownerTelegramID, webAppURL string) (*WebAppAuth, error) {
+	allowedOrigin, err := webAppOrigin(webAppURL)
+	if err != nil {
+		return nil, err
+	}
+	return newWebAppAuth(botToken, ownerTelegramID, allowedOrigin)
+}
+
+func newWebAppAuth(botToken, ownerTelegramID, allowedOrigin string) (*WebAppAuth, error) {
 	if strings.TrimSpace(botToken) == "" {
 		return nil, errors.New("WebApp bot token is required")
 	}
@@ -40,11 +55,25 @@ func NewWebAppAuth(botToken, ownerTelegramID string) (*WebAppAuth, error) {
 		return nil, errors.New("WebApp owner Telegram ID is invalid")
 	}
 	return &WebAppAuth{
-		botToken: botToken,
-		ownerID:  ownerID,
-		maxAge:   defaultInitDataMaxAge,
-		now:      time.Now,
+		botToken:      botToken,
+		ownerID:       ownerID,
+		maxAge:        defaultInitDataMaxAge,
+		now:           time.Now,
+		allowedOrigin: allowedOrigin,
 	}, nil
+}
+
+func webAppOrigin(rawURL string) (string, error) {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return "", errors.New("WebApp URL is required for CORS")
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Host == "" || parsed.User != nil ||
+		(parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "", errors.New("WebApp URL must be a valid http or https URL")
+	}
+	return parsed.Scheme + "://" + parsed.Host, nil
 }
 
 // ValidateInitData validates the Telegram HMAC, auth_date freshness, and
@@ -108,6 +137,13 @@ func (a *WebAppAuth) ValidateInitData(initData string) (int64, error) {
 // Authorization: tma is supported for clients that cannot set custom headers.
 func (a *WebAppAuth) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !a.allowOrigin(w, r) {
+			return
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		initData := r.Header.Get(initDataHeader)
 		if initData == "" {
 			authorization := r.Header.Get("Authorization")
@@ -121,6 +157,23 @@ func (a *WebAppAuth) Middleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (a *WebAppAuth) allowOrigin(w http.ResponseWriter, r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	if a == nil || a.allowedOrigin == "" || !strings.EqualFold(origin, a.allowedOrigin) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden origin"})
+		return false
+	}
+	w.Header().Set("Access-Control-Allow-Origin", a.allowedOrigin)
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Telegram-Init-Data")
+	w.Header().Set("Access-Control-Max-Age", "600")
+	w.Header().Add("Vary", "Origin")
+	return true
 }
 
 func makeDataCheckString(values url.Values) string {

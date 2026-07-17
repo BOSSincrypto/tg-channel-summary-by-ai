@@ -16,6 +16,7 @@ import (
 // Server handles HTTP requests for the health check and WebApp.
 type Server struct {
 	router          chi.Router
+	apiRouter       chi.Router
 	srv             *http.Server
 	providerService *ProviderService
 }
@@ -75,12 +76,13 @@ func newWithProviders(store *db.DB, timeout time.Duration, client *http.Client, 
 	s.providerService = service
 	providersHandler := http.Handler(http.HandlerFunc(s.handleProviders))
 	providerByIDHandler := http.Handler(http.HandlerFunc(s.handleProviderByID))
+	s.apiRouter = chi.NewRouter()
 	if auth != nil {
-		providersHandler = auth.Middleware(providersHandler)
-		providerByIDHandler = auth.Middleware(providerByIDHandler)
+		s.apiRouter.Use(auth.Middleware)
 	}
-	s.router.Handle("/api/providers", providersHandler)
-	s.router.Handle("/api/providers/{id}", providerByIDHandler)
+	s.apiRouter.Handle("/providers", providersHandler)
+	s.apiRouter.Handle("/providers/{id}", providerByIDHandler)
+	s.router.Mount("/api", s.apiRouter)
 	return s
 }
 

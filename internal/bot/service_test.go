@@ -2,6 +2,8 @@ package bot
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -12,11 +14,14 @@ import (
 
 type fakeTelegramClient struct {
 	me            *telego.User
+	meErrors      []error
+	getMeCalls    int
 	updates       chan telego.Update
 	commands      *telego.SetMyCommandsParams
 	callbacks     []string
 	messages      []*telego.SendMessageParams
 	chats         map[int64]*telego.ChatFullInfo
+	getChatCalls  int
 	topics        []*telego.CreateForumTopicParams
 	closedTopics  []*telego.CloseForumTopicParams
 	editedTopics  []*telego.EditForumTopicParams
@@ -25,6 +30,11 @@ type fakeTelegramClient struct {
 }
 
 func (f *fakeTelegramClient) GetMe(context.Context) (*telego.User, error) {
+	index := f.getMeCalls
+	f.getMeCalls++
+	if index < len(f.meErrors) && f.meErrors[index] != nil {
+		return nil, f.meErrors[index]
+	}
 	return f.me, nil
 }
 
@@ -44,6 +54,7 @@ func (f *fakeTelegramClient) SendMessage(_ context.Context, params *telego.SendM
 }
 
 func (f *fakeTelegramClient) GetChat(_ context.Context, params *telego.GetChatParams) (*telego.ChatFullInfo, error) {
+	f.getChatCalls++
 	return f.chats[params.ChatID.ID], nil
 }
 
@@ -84,11 +95,17 @@ func (f *fakeOwnerNotifier) NotifyOwner(_ context.Context, message string) error
 }
 
 type fakeGroupLifecycle struct {
-	removed []int64
+	removed  []int64
+	restored []int64
 }
 
 func (f *fakeGroupLifecycle) RemoveGroup(groupID int64) {
 	f.removed = append(f.removed, groupID)
+}
+
+func (f *fakeGroupLifecycle) RestoreGroup(groupID int64) error {
+	f.restored = append(f.restored, groupID)
+	return nil
 }
 
 func TestParseCommandNormalizesCaseAndBotSuffix(t *testing.T) {
@@ -412,6 +429,121 @@ func TestServiceHandlesMembershipLifecycleAndForumEligibility(t *testing.T) {
 	}
 }
 
+func TestServiceIgnoresPrivateMembershipLifecycle(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+
+	api := &fakeTelegramClient{
+		me:    &telego.User{ID: 123, Username: "DigestBot"},
+		chats: map[int64]*telego.ChatFullInfo{},
+	}
+	lifecycle := &fakeGroupLifecycle{}
+	service := newServiceForTest(api, api)
+	service.groups = store.Groups
+	service.lifecycle = lifecycle
+
+	for _, status := range []string{"member", "left", "kicked"} {
+		err := service.HandleUpdate(context.Background(), &telego.Update{
+			MyChatMember: &telego.ChatMemberUpdated{
+				Chat:          telego.Chat{ID: 123, Type: "private", Title: "Owner"},
+				NewChatMember: &telego.ChatMemberMember{Status: status, User: telego.User{ID: 123}},
+			},
+		})
+		if err != nil {
+			t.Fatalf("private status %q error = %v", status, err)
+		}
+	}
+
+	groups, err := store.Groups.List()
+	if err != nil {
+		t.Fatalf("list groups: %v", err)
+	}
+	if len(groups) != 0 {
+		t.Fatalf("private membership inserted groups = %#v", groups)
+	}
+	if api.getChatCalls != 0 || len(api.messages) != 0 {
+		t.Fatalf("private membership Telegram side effects: getChat=%d messages=%d", api.getChatCalls, len(api.messages))
+	}
+	if len(lifecycle.removed) != 0 || len(lifecycle.restored) != 0 {
+		t.Fatalf("private membership scheduler side effects: removed=%v restored=%v", lifecycle.removed, lifecycle.restored)
+	}
+}
+
+func TestServiceReaddRestoresExistingForumGroupScheduler(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+
+	groupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: -1009,
+		Title:          "Forum",
+		Status:         model.GroupStatusInactive,
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	api := &fakeTelegramClient{
+		me: &telego.User{ID: 123, Username: "DigestBot"},
+		chats: map[int64]*telego.ChatFullInfo{
+			-1009: {ID: -1009, Type: "supergroup", Title: "Forum", IsForum: true},
+		},
+	}
+	lifecycle := &fakeGroupLifecycle{}
+	service := newServiceForTest(api, api)
+	service.groups = store.Groups
+	service.lifecycle = lifecycle
+
+	err = service.HandleUpdate(context.Background(), &telego.Update{
+		MyChatMember: &telego.ChatMemberUpdated{
+			Chat:          telego.Chat{ID: -1009, Type: "supergroup", Title: "Forum"},
+			NewChatMember: &telego.ChatMemberMember{Status: "member", User: telego.User{ID: 123}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("forum re-add error = %v", err)
+	}
+	group, err := store.Groups.GetByID(groupID)
+	if err != nil {
+		t.Fatalf("get restored group: %v", err)
+	}
+	if group.Status != model.GroupStatusActive {
+		t.Fatalf("restored group status = %q, want active", group.Status)
+	}
+	if len(lifecycle.restored) != 1 || lifecycle.restored[0] != groupID {
+		t.Fatalf("restored scheduler groups = %v, want [%d]", lifecycle.restored, groupID)
+	}
+}
+
+func TestServiceClassifiesPostStartUnauthorizedPollingAsRevocation(t *testing.T) {
+	api := &fakeTelegramClient{
+		me:       &telego.User{ID: 123, Username: "DigestBot"},
+		meErrors: []error{nil, errors.New("401 Unauthorized")},
+		updates:  make(chan telego.Update),
+		chats:    map[int64]*telego.ChatFullInfo{},
+	}
+	close(api.updates)
+
+	service := newServiceForTest(api, api)
+	logger := &recordingLogger{}
+	service.logger = logger
+	err := service.Start()
+	if !errors.Is(err, ErrTokenRevoked) {
+		t.Fatalf("Start() error = %v, want ErrTokenRevoked", err)
+	}
+	if api.getMeCalls != 2 {
+		t.Fatalf("getMe calls = %d, want startup verification plus post-start check", api.getMeCalls)
+	}
+	if len(logger.messages) == 0 || !strings.Contains(logger.messages[len(logger.messages)-1], "FATAL") ||
+		!strings.Contains(logger.messages[len(logger.messages)-1], "token has been revoked") {
+		t.Fatalf("revocation logs = %#v, want fatal revocation log", logger.messages)
+	}
+}
+
 func TestServiceTopicLifecyclePersistsThreadAndAvoidsDuplicates(t *testing.T) {
 	store, err := db.Open(":memory:")
 	if err != nil {
@@ -483,3 +615,11 @@ func newServiceForTest(api telegramClient, poller updatePoller) *Service {
 type testLogger struct{}
 
 func (testLogger) Printf(string, ...any) {}
+
+type recordingLogger struct {
+	messages []string
+}
+
+func (l *recordingLogger) Printf(format string, args ...any) {
+	l.messages = append(l.messages, fmt.Sprintf(format, args...))
+}

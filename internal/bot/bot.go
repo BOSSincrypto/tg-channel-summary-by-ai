@@ -52,6 +52,10 @@ type GroupLifecycle interface {
 	RemoveGroup(groupID int64)
 }
 
+type groupRestorer interface {
+	RestoreGroup(groupID int64) error
+}
+
 // CommandHandler handles a normalized bot command and its optional argument.
 type CommandHandler func(context.Context, *telego.Message, string) error
 
@@ -177,6 +181,10 @@ func (s *Service) Start() error {
 	s.botName = strings.TrimPrefix(strings.ToLower(me.Username), "@")
 	s.logf("Bot identity verified: @%s (ID: %d)", me.Username, me.ID)
 	if err := s.registerCommands(ctx); err != nil {
+		if isUnauthorizedError(err) {
+			s.logf("FATAL: Bot token has been revoked (401 Unauthorized). Shutting down.")
+			return fmt.Errorf("%w: register commands: %v", ErrTokenRevoked, err)
+		}
 		return fmt.Errorf("register bot commands: %w", err)
 	}
 
@@ -184,7 +192,7 @@ func (s *Service) Start() error {
 		Limit:          100,
 		Timeout:        30,
 		AllowedUpdates: []string{"message", "callback_query", "my_chat_member"},
-	})
+	}, telego.WithLongPollingRetryTimeout(0))
 	if err != nil {
 		if isUnauthorizedError(err) {
 			s.logf("FATAL: Bot token has been revoked. Shutting down.")
@@ -198,9 +206,26 @@ func (s *Service) Start() error {
 			return nil
 		case update, ok := <-updates:
 			if !ok {
+				if ctx.Err() != nil {
+					return nil
+				}
+				// telego closes the update channel when long polling stops,
+				// including after an API error. Probe the token once so a
+				// post-start 401 is not mistaken for a clean shutdown.
+				if _, probeErr := s.api.GetMe(ctx); probeErr != nil {
+					if isUnauthorizedError(probeErr) {
+						s.logf("FATAL: Bot token has been revoked (401 Unauthorized). Shutting down.")
+						return fmt.Errorf("%w: long polling stopped: %v", ErrTokenRevoked, probeErr)
+					}
+					return fmt.Errorf("long polling stopped: verify bot identity: %w", probeErr)
+				}
 				return nil
 			}
 			if err := s.HandleUpdate(ctx, &update); err != nil {
+				if isUnauthorizedError(err) {
+					s.logf("FATAL: Bot token has been revoked (401 Unauthorized). Shutting down.")
+					return fmt.Errorf("%w: update %d: %v", ErrTokenRevoked, update.UpdateID, err)
+				}
 				s.logf("update %d failed: %v", update.UpdateID, err)
 			}
 		}
@@ -246,6 +271,7 @@ func (s *Service) HandleUpdate(ctx context.Context, update *telego.Update) error
 		if s.api != nil {
 			if err := s.api.AnswerCallbackQuery(ctx, &telego.AnswerCallbackQueryParams{CallbackQueryID: query.ID}); err != nil {
 				s.logf("answer callback query: %v", err)
+				return err
 			}
 		}
 		if query.From.ID <= 0 || !s.isConfigured() || !s.isOwner(query.From.ID) {
@@ -464,6 +490,9 @@ func (s *Service) handleMyChatMember(ctx context.Context, update *telego.ChatMem
 	if update == nil || update.NewChatMember == nil {
 		return nil
 	}
+	if update.Chat.Type != "group" && update.Chat.Type != "supergroup" {
+		return nil
+	}
 	if s.groups == nil {
 		return errors.New("group repository is not configured")
 	}
@@ -511,6 +540,9 @@ func (s *Service) handleGroupJoin(ctx context.Context, chat telego.Chat) error {
 		if err != nil {
 			return err
 		}
+		if s.lifecycle != nil {
+			s.lifecycle.RemoveGroup(group.ID)
+		}
 		_, sendErr := s.api.SendMessage(ctx, &telego.SendMessageParams{
 			ChatID: chat.ChatID(),
 			Text:   "This bot requires a forum supergroup with topics enabled. Please convert the group to a forum or create a new forum group.",
@@ -518,12 +550,17 @@ func (s *Service) handleGroupJoin(ctx context.Context, chat telego.Chat) error {
 		if sendErr != nil {
 			return fmt.Errorf("send forum requirement: %w", sendErr)
 		}
-		if s.lifecycle != nil {
-			s.lifecycle.RemoveGroup(group.ID)
-		}
 		return nil
 	}
-	_, err = s.upsertGroup(chat, model.GroupStatusActive)
+	group, err := s.upsertGroup(chat, model.GroupStatusActive)
+	if err != nil {
+		return err
+	}
+	if restorer, ok := s.lifecycle.(groupRestorer); ok {
+		if err := restorer.RestoreGroup(group.ID); err != nil {
+			return fmt.Errorf("restore scheduler for group %d: %w", group.ID, err)
+		}
+	}
 	return err
 }
 

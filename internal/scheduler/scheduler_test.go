@@ -170,6 +170,39 @@ func TestSchedulerStartRegistersGroupJobsAndStopRemovesThem(t *testing.T) {
 	}
 }
 
+func TestSchedulerRestoreGroupReRegistersExactlyOneJob(t *testing.T) {
+	engine := newFakeCronEngine()
+	runner := &fakeRunner{}
+	source := fakeGroupSource{
+		groups: []model.Group{{ID: 7, Status: model.GroupStatusActive}},
+		settings: map[int64]*model.GroupSettings{
+			7: {GroupID: 7, DigestTime: "09:15", Timezone: "UTC"},
+		},
+	}
+	s := New(runner, WithGroupSource(source), withCronEngine(engine))
+	if err := s.Start(); err != nil {
+		t.Fatalf("start scheduler: %v", err)
+	}
+	if len(engine.entries) != 1 {
+		t.Fatalf("initial jobs = %d, want 1", len(engine.entries))
+	}
+
+	s.RemoveGroup(7)
+	if len(engine.entries) != 0 {
+		t.Fatalf("jobs after removal = %d, want 0", len(engine.entries))
+	}
+	if err := s.RestoreGroup(7); err != nil {
+		t.Fatalf("restore group: %v", err)
+	}
+	if err := s.RestoreGroup(7); err != nil {
+		t.Fatalf("idempotent restore group: %v", err)
+	}
+	if len(engine.entries) != 1 {
+		t.Fatalf("jobs after restore = %d, want exactly 1", len(engine.entries))
+	}
+	s.Stop()
+}
+
 func TestSchedulerSharesWindowIDAcrossGroupsAndChangesItPerWindow(t *testing.T) {
 	engine := newFakeCronEngine()
 	runner := &windowRecordingRunner{}

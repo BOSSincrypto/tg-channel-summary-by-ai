@@ -191,6 +191,74 @@ func (s *Scheduler) RemoveGroup(groupID int64) {
 	}
 }
 
+// RestoreGroup registers the scheduled digest job for an eligible group that
+// was previously removed from the scheduler. It is idempotent and preserves
+// the group's persisted settings and assignments.
+func (s *Scheduler) RestoreGroup(groupID int64) error {
+	if s == nil {
+		return errors.New("restore group: scheduler is not configured")
+	}
+
+	s.mu.Lock()
+	if !s.started {
+		s.mu.Unlock()
+		return nil
+	}
+	if _, exists := s.jobIDs[groupID]; exists {
+		s.mu.Unlock()
+		return nil
+	}
+	source := s.groups
+	engine := s.engine
+	if source == nil || engine == nil {
+		s.mu.Unlock()
+		return errors.New("restore group: scheduler dependencies are not configured")
+	}
+	group, err := source.List()
+	if err != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("restore group: list groups: %w", err)
+	}
+	var target *model.Group
+	for index := range group {
+		if group[index].ID == groupID {
+			target = &group[index]
+			break
+		}
+	}
+	if target == nil {
+		s.mu.Unlock()
+		return fmt.Errorf("restore group %d: group not found", groupID)
+	}
+	if target.Status != "" && target.Status != model.GroupStatusActive {
+		s.mu.Unlock()
+		return fmt.Errorf("restore group %d: group is not active", groupID)
+	}
+	settings, err := source.GetGroupSettings(groupID)
+	if err != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("restore group: load settings for group %d: %w", groupID, err)
+	}
+	spec, err := scheduleSpec(settings)
+	if err != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("restore group: build schedule for group %d: %w", groupID, err)
+	}
+	entryID, err := engine.AddFunc(spec, func() {
+		windowID := s.nextScheduledWindow(spec, 1)
+		if _, runErr := s.RunGroupWithWindow(groupID, windowID); runErr != nil {
+			log.Printf("scheduler group %d failed: %v", groupID, runErr)
+		}
+	})
+	if err != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("restore group: register group %d schedule %q: %w", groupID, spec, err)
+	}
+	s.jobIDs[groupID] = entryID
+	s.mu.Unlock()
+	return nil
+}
+
 // RunGroup executes one group's production digest path. The digest service
 // fetches and stores parser output before selecting digest candidates.
 func (s *Scheduler) RunGroup(groupID int64) (*digest.Digest, error) {

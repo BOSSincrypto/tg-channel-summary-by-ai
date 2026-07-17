@@ -38,8 +38,9 @@ type Service struct {
 	notifier           OwnerNotifier
 	maxPostsPerChannel int
 
-	notificationMu   sync.Mutex
-	notificationKeys map[string]notificationKeyState
+	notificationMu      sync.Mutex
+	notificationKeys    map[string]notificationKeyState
+	notificationWaiters map[string]chan struct{}
 }
 
 // notificationKeyState tracks delivery-aware outage notification deduplication.
@@ -228,13 +229,14 @@ func (s *Service) GenerateManualWithWindow(groupID int64, windowID string) (*Dig
 }
 
 func (s *Service) summarize(groupID int64, posts []model.Post) error {
-	return s.summarizeWithWindow(groupID, posts, "")
+	return s.summarizeWithWindow(groupID, posts, NewWindowID("scheduled"))
 }
 
 func (s *Service) summarizeWithWindow(groupID int64, posts []model.Post, windowID string) error {
 	if s.aiConfigSource == nil || len(posts) == 0 {
 		return nil
 	}
+	windowID = firstWindowID([]string{windowID}, NewWindowID("scheduled"))
 	if s.providerFactory == nil {
 		err := errors.New("provider factory is not configured")
 		s.notifyAIFailureForWindow(windowID, groupID, err)
@@ -320,6 +322,9 @@ func (s *Service) notifyAIFailure(groupID int64, err error) {
 
 func (s *Service) notifyAIFailureForWindow(windowID string, groupID int64, err error) {
 	class := classifyAIFailure(err)
+	if class == aiFailureOpenRouterOutage {
+		windowID = firstWindowID([]string{windowID}, NewWindowID("scheduled"))
+	}
 	key, claimed := s.claimAIFailureNotification(windowID, class)
 	if !claimed {
 		return
@@ -339,7 +344,8 @@ func (s *Service) notifyAIFailureForWindow(windowID string, groupID int64, err e
 
 // claimAIFailureNotification atomically claims delivery for an outage window/category.
 // Non-outage failures are always claimed (no dedup). Concurrent outage attempts for
-// the same key serialize: only one claim is active, and delivered keys stay suppressed.
+// the same key wait for the active delivery to finish, then retry if that delivery
+// failed, while delivered keys stay suppressed.
 func (s *Service) claimAIFailureNotification(windowID string, class aiFailureClass) (string, bool) {
 	if class != aiFailureOpenRouterOutage {
 		// Non-outage classes are not window-deduplicated; use a unique key so
@@ -352,20 +358,35 @@ func (s *Service) claimAIFailureNotification(windowID string, class aiFailureCla
 
 	windowID = strings.TrimSpace(windowID)
 	if windowID == "" {
-		windowID = "legacy"
+		windowID = NewWindowID("scheduled")
 	}
 	key := windowID + "|" + string(class)
-	s.notificationMu.Lock()
-	defer s.notificationMu.Unlock()
-	if s.notificationKeys == nil {
-		s.notificationKeys = make(map[string]notificationKeyState)
-	}
-	switch s.notificationKeys[key] {
-	case notificationKeyDelivered, notificationKeyClaimed:
-		return key, false
-	default:
-		s.notificationKeys[key] = notificationKeyClaimed
-		return key, true
+	for {
+		s.notificationMu.Lock()
+		if s.notificationKeys == nil {
+			s.notificationKeys = make(map[string]notificationKeyState)
+		}
+		if s.notificationWaiters == nil {
+			s.notificationWaiters = make(map[string]chan struct{})
+		}
+		switch s.notificationKeys[key] {
+		case notificationKeyDelivered:
+			s.notificationMu.Unlock()
+			return key, false
+		case notificationKeyClaimed:
+			waiter := s.notificationWaiters[key]
+			if waiter == nil {
+				waiter = make(chan struct{})
+				s.notificationWaiters[key] = waiter
+			}
+			s.notificationMu.Unlock()
+			<-waiter
+		default:
+			s.notificationKeys[key] = notificationKeyClaimed
+			s.notificationWaiters[key] = make(chan struct{})
+			s.notificationMu.Unlock()
+			return key, true
+		}
 	}
 }
 
@@ -379,6 +400,10 @@ func (s *Service) commitAIFailureNotification(key string) {
 		s.notificationKeys = make(map[string]notificationKeyState)
 	}
 	s.notificationKeys[key] = notificationKeyDelivered
+	if waiter := s.notificationWaiters[key]; waiter != nil {
+		close(waiter)
+		delete(s.notificationWaiters, key)
+	}
 }
 
 func (s *Service) releaseAIFailureNotification(key string) {
@@ -393,6 +418,10 @@ func (s *Service) releaseAIFailureNotification(key string) {
 	// Only release a transient claim; never clear a successfully delivered key.
 	if s.notificationKeys[key] == notificationKeyClaimed {
 		delete(s.notificationKeys, key)
+		if waiter := s.notificationWaiters[key]; waiter != nil {
+			close(waiter)
+			delete(s.notificationWaiters, key)
+		}
 	}
 }
 

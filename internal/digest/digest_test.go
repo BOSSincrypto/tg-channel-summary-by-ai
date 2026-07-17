@@ -62,13 +62,13 @@ func (n *failingThenSucceedingNotifier) NotifyOwner(_ context.Context, text stri
 // concurrentGateNotifier serializes concurrent NotifyOwner calls and records
 // how many deliveries overlapped. The first caller blocks until release is closed.
 type concurrentGateNotifier struct {
-	started  chan struct{}
-	release  chan struct{}
-	mu       sync.Mutex
-	messages []string
-	active   int32
+	started   chan struct{}
+	release   chan struct{}
+	mu        sync.Mutex
+	messages  []string
+	active    int32
 	maxActive int32
-	calls    int32
+	calls     int32
 }
 
 func (n *concurrentGateNotifier) NotifyOwner(_ context.Context, text string) error {
@@ -90,6 +90,29 @@ func (n *concurrentGateNotifier) NotifyOwner(_ context.Context, text string) err
 	n.messages = append(n.messages, text)
 	n.mu.Unlock()
 	atomic.AddInt32(&n.active, -1)
+	return nil
+}
+
+// blockingFailingNotifier keeps the first delivery in flight, then fails it.
+// A waiting retry should take over after that failure releases the claim.
+type blockingFailingNotifier struct {
+	started  chan struct{}
+	release  chan struct{}
+	mu       sync.Mutex
+	messages []string
+	attempts int32
+}
+
+func (n *blockingFailingNotifier) NotifyOwner(_ context.Context, text string) error {
+	attempt := atomic.AddInt32(&n.attempts, 1)
+	if attempt == 1 {
+		close(n.started)
+		<-n.release
+		return errors.New("telegram sendMessage temporarily unavailable")
+	}
+	n.mu.Lock()
+	n.messages = append(n.messages, text)
+	n.mu.Unlock()
 	return nil
 }
 
@@ -559,8 +582,8 @@ func TestOpenRouterOutageNotificationIsDeduplicatedAcrossGroups(t *testing.T) {
 		Provider:   "OpenRouter",
 	}
 
-	service.notifyAIFailure(101, err)
-	service.notifyAIFailure(202, err)
+	service.notifyAIFailureForWindow("shared-window", 101, err)
+	service.notifyAIFailureForWindow("shared-window", 202, err)
 
 	if len(notifier.messages) != 1 {
 		t.Fatalf("notifications = %d, want one outage notification across groups: %v", len(notifier.messages), notifier.messages)
@@ -639,6 +662,67 @@ func TestOpenRouterOutageNotificationRetriesAfterDeliveryFailure(t *testing.T) {
 	}
 	if len(notifier.messages) != 1 {
 		t.Fatalf("messages after success suppression = %v, want one", notifier.messages)
+	}
+}
+
+func TestOpenRouterOutageNotificationGeneratesWindowForEmptyIDs(t *testing.T) {
+	notifier := &recordingDigestNotifier{}
+	service := &Service{notifier: notifier}
+	err := &summarizer.ProviderError{
+		StatusCode: http.StatusBadGateway,
+		Provider:   "OpenRouter",
+	}
+
+	service.notifyAIFailureForWindow("", 101, err)
+	service.notifyAIFailureForWindow("", 202, err)
+
+	messages := notifier.snapshot()
+	if len(messages) != 2 {
+		t.Fatalf("notifications = %d, want one per generated window: %v", len(messages), messages)
+	}
+	for _, message := range messages {
+		if !strings.Contains(message, "Окно дайджеста: scheduled-") {
+			t.Fatalf("notification = %q, want generated scheduled window ID", message)
+		}
+	}
+	if messages[0] == messages[1] {
+		t.Fatalf("generated notifications unexpectedly identical: %v", messages)
+	}
+}
+
+func TestOpenRouterOutageNotificationWaitingClaimRetriesAfterFailure(t *testing.T) {
+	notifier := &blockingFailingNotifier{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	service := &Service{notifier: notifier}
+	err := &summarizer.ProviderError{
+		StatusCode: http.StatusBadGateway,
+		Provider:   "OpenRouter",
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		service.notifyAIFailureForWindow("window-waiting-retry", 101, err)
+	}()
+	<-notifier.started
+	go func() {
+		defer wg.Done()
+		service.notifyAIFailureForWindow("window-waiting-retry", 202, err)
+	}()
+
+	close(notifier.release)
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&notifier.attempts); got != 2 {
+		t.Fatalf("NotifyOwner attempts = %d, want failed owner plus waiting retry", got)
+	}
+	notifier.mu.Lock()
+	defer notifier.mu.Unlock()
+	if len(notifier.messages) != 1 || !strings.Contains(notifier.messages[0], "window-waiting-retry") {
+		t.Fatalf("delivered messages = %v, want one retry notification", notifier.messages)
 	}
 }
 

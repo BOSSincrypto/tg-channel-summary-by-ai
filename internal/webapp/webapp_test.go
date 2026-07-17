@@ -76,3 +76,38 @@ func TestNotFoundHandler(t *testing.T) {
 		t.Errorf("expected status 404, got %d", resp.StatusCode)
 	}
 }
+
+func TestEmbeddedWebAppIsServed(t *testing.T) {
+	srv := New()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/webapp/")
+	if err != nil {
+		t.Fatalf("failed to GET embedded WebApp: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("embedded WebApp status = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Type"); got != "text/html; charset=utf-8" {
+		t.Fatalf("embedded WebApp content type = %q, want HTML", got)
+	}
+}
+
+func TestEmbeddedWebAppAssetsAreServed(t *testing.T) {
+	srv := New()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	for _, asset := range []string{"app.js", "style.css"} {
+		resp, err := http.Get(ts.URL + "/webapp/" + asset)
+		if err != nil {
+			t.Fatalf("failed to GET %s: %v", asset, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("%s status = %d, want 200", asset, resp.StatusCode)
+		}
+	}
+}

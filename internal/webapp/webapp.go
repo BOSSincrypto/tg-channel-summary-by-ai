@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
+	staticwebapp "github.com/boss/tg-channel-summary-by-ai/webapp"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -28,6 +29,15 @@ func New() *Server {
 	}
 
 	r.Get("/health", s.handleHealth)
+	if staticFiles, err := staticwebapp.StaticFS(); err == nil {
+		r.Get("/webapp", func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/webapp/", http.StatusPermanentRedirect)
+		})
+		r.Handle("/webapp/*", http.StripPrefix("/webapp/", http.FileServer(http.FS(staticFiles))))
+		r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/webapp/", http.StatusTemporaryRedirect)
+		})
+	}
 
 	return s
 }

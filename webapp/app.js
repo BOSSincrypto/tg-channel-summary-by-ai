@@ -1,0 +1,835 @@
+/* Digest Control is intentionally framework-free so it can be embedded in the Go binary. */
+(function () {
+  "use strict";
+
+  var app = document.getElementById("app");
+  var telegram = window.Telegram && window.Telegram.WebApp;
+  var state = {
+    tab: "channels",
+    data: { channels: [], groups: [], providers: [], settings: null },
+    loadedAt: {},
+    loading: {},
+    errors: {},
+    modal: null,
+    readonly: false,
+    settingsDraft: null,
+    digestJob: null,
+    digestTimer: null,
+    destroyed: false
+  };
+  var tabs = [
+    { id: "channels", label: "Каналы", icon: "📡" },
+    { id: "groups", label: "Группы", icon: "👥" },
+    { id: "providers", label: "Провайдеры", icon: "🧠" },
+    { id: "settings", label: "Настройки", icon: "⚙️" },
+    { id: "digest", label: "Тест дайджеста", icon: "🧪" }
+  ];
+  var timezoneOptions = [
+    "Europe/Moscow", "Europe/London", "Europe/Berlin", "Europe/Paris",
+    "Asia/Almaty", "Asia/Dubai", "Asia/Tokyo", "Asia/Shanghai",
+    "America/New_York", "America/Los_Angeles", "America/Toronto",
+    "Australia/Sydney", "UTC"
+  ];
+
+  function el(tag, className, text) {
+    var node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined && text !== null) node.textContent = String(text);
+    return node;
+  }
+  function attr(node, name, value) {
+    if (value !== undefined && value !== null) node.setAttribute(name, String(value));
+    return node;
+  }
+  function button(label, className, handler) {
+    var node = el("button", "button " + (className || "secondary"), label);
+    node.type = "button";
+    if (handler) node.addEventListener("click", handler);
+    return node;
+  }
+  function field(label, name, value, type, options) {
+    options = options || {};
+    var wrap = el("div", "field" + (options.full ? " full" : ""));
+    var labelNode = el("label", "", label);
+    labelNode.htmlFor = name;
+    wrap.appendChild(labelNode);
+    var input = el(type === "select" ? "select" : "input");
+    input.id = name;
+    input.name = name;
+    input.type = type === "select" ? undefined : (type || "text");
+    if (type === "select") {
+      (options.choices || []).forEach(function (choice) {
+        var option = el("option", "", choice.label || choice);
+        option.value = choice.value === undefined ? choice : choice.value;
+        if (String(option.value) === String(value || "")) option.selected = true;
+        input.appendChild(option);
+      });
+    } else if (value !== undefined && value !== null) {
+      input.value = value;
+    }
+    if (options.placeholder) input.placeholder = options.placeholder;
+    if (options.required) input.required = true;
+    if (options.pattern) input.pattern = options.pattern;
+    if (options.inputMode) input.inputMode = options.inputMode;
+    wrap.appendChild(input);
+    if (options.help) wrap.appendChild(el("small", "", options.help));
+    var error = el("div", "error-text");
+    error.id = name + "-error";
+    wrap.appendChild(error);
+    return { wrap: wrap, input: input, error: error };
+  }
+  function pick(object, names, fallback) {
+    if (!object) return fallback;
+    for (var i = 0; i < names.length; i += 1) {
+      if (object[names[i]] !== undefined && object[names[i]] !== null) return object[names[i]];
+    }
+    return fallback;
+  }
+  function idOf(item) { return pick(item, ["id", "ID"], ""); }
+  function asArray(value) { return Array.isArray(value) ? value : []; }
+  function normalizeChannel(item) {
+    return {
+      id: idOf(item),
+      username: String(pick(item, ["username", "Username"], "")),
+      title: String(pick(item, ["title", "Title"], "")),
+      enabled: Boolean(pick(item, ["enabled", "Enabled"], true)),
+      fetchError: String(pick(item, ["fetch_error_message", "FetchErrorMessage"], ""))
+    };
+  }
+  function normalizeGroup(item) {
+    var assignments = pick(item, ["assignments", "channels", "Assignments", "Channels"], []);
+    return {
+      id: idOf(item),
+      chatId: String(pick(item, ["telegram_chat_id", "TelegramChatID", "chat_id", "chatId"], "")),
+      title: String(pick(item, ["title", "Title"], "")),
+      status: String(pick(item, ["status", "Status"], "active")),
+      assignments: asArray(assignments).map(normalizeAssignment),
+      botStatus: String(pick(item, ["bot_status", "BotStatus"], ""))
+    };
+  }
+  function normalizeAssignment(item) {
+    return {
+      channelId: String(pick(item, ["channel_id", "ChannelID", "channelId", "id", "ID"], "")),
+      username: String(pick(item, ["username", "Username"], "")),
+      title: String(pick(item, ["title", "Title"], "")),
+      topicId: String(pick(item, ["topic_thread_id", "TopicThreadID", "topicThreadId"], ""))
+    };
+  }
+  function normalizeProvider(item) {
+    return {
+      id: idOf(item),
+      name: String(pick(item, ["name", "Name"], "")),
+      baseUrl: String(pick(item, ["base_url", "BaseURL"], "")),
+      model: String(pick(item, ["default_model", "DefaultModel", "model", "Model"], "")),
+      apiKey: String(pick(item, ["api_key", "APIKey"], "")),
+      isDefault: Boolean(pick(item, ["is_default", "IsDefault"], false))
+    };
+  }
+  function normalizeSettings(item) {
+    item = item || {};
+    return {
+      digestTime: String(pick(item, ["digest_time", "DigestTime"], "21:00")),
+      timezone: String(pick(item, ["timezone", "Timezone"], "Europe/Moscow")),
+      model: String(pick(item, ["default_model", "DefaultModel", "model", "Model"], "openai/gpt-oss-120b")),
+      version: pick(item, ["version", "Version"], null)
+    };
+  }
+  function setText(node, value) { node.textContent = value === undefined || value === null ? "" : String(value); }
+  function showToast(message, kind, persistent) {
+    var region = document.querySelector(".toast-region");
+    if (!region) {
+      region = el("div", "toast-region");
+      attr(region, "aria-live", "polite");
+      document.body.appendChild(region);
+    }
+    var toast = el("div", "toast " + (kind || ""));
+    var text = el("span", "", message);
+    var close = button("×", "ghost toast-close", function () { toast.remove(); });
+    attr(close, "aria-label", "Закрыть уведомление");
+    toast.appendChild(text);
+    toast.appendChild(close);
+    region.appendChild(toast);
+    if (!persistent) window.setTimeout(function () { if (toast.parentNode) toast.remove(); }, 5000);
+  }
+  function setError(tab, message) {
+    state.errors[tab] = message;
+    showToast(message, "error", true);
+    render();
+  }
+  function clearError(tab) {
+    delete state.errors[tab];
+  }
+  function apiErrorMessage(error) {
+    return error && error.message ? error.message : "Что-то пошло не так. Попробуйте ещё раз.";
+  }
+  function authHeaders() {
+    return { "Content-Type": "application/json", "X-Telegram-Init-Data": telegram.initData || "" };
+  }
+  function api(path, options) {
+    options = options || {};
+    var controller = new AbortController();
+    var timer = window.setTimeout(function () { controller.abort(); }, 30000);
+    var headers = options.headers || authHeaders();
+    return fetch(path, {
+      method: options.method || "GET",
+      headers: headers,
+      body: options.body,
+      signal: controller.signal
+    }).then(function (response) {
+      window.clearTimeout(timer);
+      if (response.status === 401 || response.status === 403) {
+        state.readonly = true;
+        throw new Error("Сессия истекла или доступ запрещён. Перезапустите бота через /start.");
+      }
+      if (response.status === 429) {
+        var retryAfter = response.headers.get("Retry-After") || "несколько";
+        var rateError = new Error("Слишком много запросов. Подождите " + retryAfter + " секунд.");
+        rateError.retryAfter = Number(retryAfter) || 5;
+        throw rateError;
+      }
+      if (!response.ok) {
+        return response.text().then(function (body) {
+          var message = "";
+          try { message = JSON.parse(body).error || JSON.parse(body).message; } catch (_) { message = ""; }
+          throw new Error(message || "Ошибка сервера (" + response.status + ")");
+        });
+      }
+      if (response.status === 204) return null;
+      return response.text().then(function (body) {
+        if (!body) return null;
+        try { return JSON.parse(body); } catch (_) { return body; }
+      });
+    }).catch(function (error) {
+      window.clearTimeout(timer);
+      if (error.name === "AbortError") throw new Error("Превышено время ожидания. Проверьте соединение и повторите.");
+      throw error;
+    });
+  }
+  function mutation(path, method, payload) {
+    if (state.readonly) return Promise.reject(new Error("Сессия истекла. Доступно только чтение."));
+    return api(path, {
+      method: method,
+      body: payload === undefined ? undefined : JSON.stringify(payload)
+    });
+  }
+  function load(tab, path, mapper, force) {
+    if (!force && state.loadedAt[tab] && Date.now() - state.loadedAt[tab] < 30000) return Promise.resolve();
+    state.loading[tab] = true;
+    clearError(tab);
+    render();
+    return api(path).then(function (result) {
+      state.data[tab] = mapper(result);
+      state.loadedAt[tab] = Date.now();
+    }).catch(function (error) {
+      setError(tab, apiErrorMessage(error));
+    }).finally(function () {
+      state.loading[tab] = false;
+      render();
+    });
+  }
+  function loadChannels(force) { return load("channels", "/api/channels", function (data) { return asArray(data).map(normalizeChannel); }, force); }
+  function loadGroups(force) { return load("groups", "/api/groups?with_channels=true", function (data) { return asArray(data).map(normalizeGroup); }, force); }
+  function loadProviders(force) { return load("providers", "/api/providers", function (data) { return asArray(data).map(normalizeProvider); }, force); }
+  function loadSettings(force) { return load("settings", "/api/settings", normalizeSettings, force); }
+
+  function pageShell() {
+    var shell = el("div", "shell");
+    var topbar = el("header", "topbar");
+    var heading = el("div");
+    heading.appendChild(el("div", "eyebrow", "Digest Control"));
+    heading.appendChild(el("h1", "", "Центр управления"));
+    heading.appendChild(el("p", "subtitle", "Настройте каналы, группы и ежедневные дайджесты"));
+    topbar.appendChild(heading);
+    var user = pick(telegram.initDataUnsafe, ["user"], null);
+    if (user) topbar.appendChild(el("span", "badge", "👋 " + pick(user, ["first_name"], "Администратор")));
+    shell.appendChild(topbar);
+    var nav = el("nav", "tabs");
+    attr(nav, "aria-label", "Разделы приложения");
+    tabs.forEach(function (tab) {
+      var item = button("", "tab" + (state.tab === tab.id ? " active" : ""), function () { switchTab(tab.id); });
+      attr(item, "aria-current", state.tab === tab.id ? "page" : null);
+      var icon = el("span", "tab-icon", tab.icon);
+      item.appendChild(icon);
+      item.appendChild(el("span", "", tab.label));
+      nav.appendChild(item);
+    });
+    shell.appendChild(nav);
+    if (state.readonly) shell.appendChild(el("div", "readonly-banner", "Сессия истекла. Данные доступны только для чтения. Перезапустите бота через /start."));
+    var content = el("section");
+    content.appendChild(renderTab());
+    shell.appendChild(content);
+    return shell;
+  }
+  function panel(title, description, action) {
+    var outer = el("section", "panel");
+    var header = el("div", "panel-header");
+    var text = el("div");
+    text.appendChild(el("h2", "", title));
+    if (description) text.appendChild(el("p", "section-description", description));
+    header.appendChild(text);
+    if (action) header.appendChild(action);
+    outer.appendChild(header);
+    var body = el("div", "panel-body");
+    outer.appendChild(body);
+    return { outer: outer, body: body };
+  }
+  function loadingState() {
+    var node = el("div", "loading");
+    node.appendChild(el("div", "spinner"));
+    node.appendChild(el("p", "muted", "Загружаем данные…"));
+    return node;
+  }
+  function errorState(tab) {
+    var node = el("div", "error-state");
+    node.appendChild(el("div", "empty-icon", "⚠️"));
+    node.appendChild(el("h3", "", "Не удалось загрузить раздел"));
+    node.appendChild(el("p", "", state.errors[tab] || "Попробуйте ещё раз."));
+    node.appendChild(button("Повторить", "primary", function () {
+      state.loadedAt[tab] = 0;
+      refresh(tab, true);
+    }));
+    return node;
+  }
+  function emptyState(icon, title, description, action) {
+    var node = el("div", "empty");
+    node.appendChild(el("div", "empty-icon", icon));
+    node.appendChild(el("h3", "", title));
+    node.appendChild(el("p", "", description));
+    if (action) node.appendChild(action);
+    return node;
+  }
+  function dataBody(tab, renderData) {
+    if (state.loading[tab]) return loadingState();
+    if (state.errors[tab]) return errorState(tab);
+    return renderData();
+  }
+  function renderChannels() {
+    var addUser = field("Username канала", "channel-username", "", "text", {
+      placeholder: "@durov", required: true, help: "Можно указать с @ или без него. Допустимы латинские буквы, цифры и _."
+    });
+    var addButton = button("Добавить", "primary");
+    var form = el("form", "inline-form");
+    form.appendChild(addUser.wrap);
+    form.appendChild(addButton);
+    form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      var username = addUser.input.value.trim();
+      var normalized = username.charAt(0) === "@" ? username.slice(1) : username;
+      if (!/^[A-Za-z0-9_]{5,32}$/.test(normalized)) {
+        setText(addUser.error, "Неверный формат username (5–32 символа).");
+        addUser.input.setAttribute("aria-invalid", "true");
+        return;
+      }
+      addUser.error.textContent = "";
+      addUser.input.removeAttribute("aria-invalid");
+      addButton.disabled = true;
+      mutation("/api/channels", "POST", { username: "@" + normalized.toLowerCase() }).then(function () {
+        addUser.input.value = "";
+        showToast("Канал добавлен.", "success");
+        state.loadedAt.channels = 0;
+        return loadChannels(true);
+      }).catch(function (error) { showToast(apiErrorMessage(error), "error", true); }).finally(function () { addButton.disabled = false; });
+    });
+    var view = panel("Каналы", "Источники постов для ваших ежедневных дайджестов.", null);
+    view.body.appendChild(form);
+    var list = state.data.channels;
+    if (!list.length) {
+      view.body.appendChild(emptyState("📡", "Нет добавленных каналов", "Добавьте канал, чтобы начать сбор постов.", null));
+      return view.outer;
+    }
+    var tableWrap = el("div", "table-wrap");
+    var table = el("table", "data-table");
+    var head = el("thead");
+    var row = el("tr");
+    ["Канал", "Статус", "Управление"].forEach(function (label) { row.appendChild(el("th", "", label)); });
+    head.appendChild(row); table.appendChild(head);
+    var body = el("tbody");
+    list.forEach(function (channel) {
+      var tr = el("tr", channel.enabled ? "" : "row-muted");
+      var identity = el("td");
+      identity.appendChild(el("strong", "truncate", "@" + channel.username));
+      if (channel.title) identity.appendChild(el("span", "subline truncate", channel.title));
+      if (channel.fetchError) identity.appendChild(el("span", "subline warning-text truncate", channel.fetchError));
+      tr.appendChild(identity);
+      var status = el("td");
+      var toggleLabel = el("span", "toggle-label");
+      var toggle = button("", "toggle" + (channel.enabled ? " on" : ""), function () {
+        if (state.readonly) return;
+        var before = channel.enabled;
+        channel.enabled = !before;
+        render();
+        mutation("/api/channels/" + encodeURIComponent(channel.id), "PATCH", { enabled: channel.enabled }).then(function () {
+          showToast(channel.enabled ? "Канал включён." : "Канал выключен.", "success");
+        }).catch(function (error) {
+          channel.enabled = before;
+          showToast("Не удалось обновить статус канала: " + apiErrorMessage(error), "error", true);
+          render();
+        });
+      });
+      attr(toggle, "aria-label", channel.enabled ? "Выключить канал" : "Включить канал");
+      toggleLabel.appendChild(toggle);
+      toggleLabel.appendChild(el("span", "", channel.enabled ? "Включён" : "Выключен"));
+      status.appendChild(toggleLabel); tr.appendChild(status);
+      var actions = el("td", "row-actions");
+      actions.appendChild(button("Удалить", "danger small", function () { confirmDeleteChannel(channel); }));
+      tr.appendChild(actions);
+      body.appendChild(tr);
+    });
+    table.appendChild(body); tableWrap.appendChild(table); view.body.appendChild(tableWrap);
+    return view.outer;
+  }
+  function confirmDeleteChannel(channel) {
+    openConfirm("Удалить канал @" + channel.username + "?", "Сводки по этому каналу больше не будут приходить. Если канал используется в группах, он будет отвязан от них.", "Удалить", function () {
+      mutation("/api/channels/" + encodeURIComponent(channel.id), "DELETE").then(function () {
+        showToast("Канал удалён.", "success"); state.loadedAt.channels = 0; return loadChannels(true);
+      }).catch(function (error) { showToast(apiErrorMessage(error), "error", true); });
+    });
+  }
+  function renderGroups() {
+    var groupField = field("Chat ID группы", "group-chat-id", "", "text", {
+      placeholder: "-1001234567890", inputMode: "numeric", help: "Используйте числовой ID супергруппы, обычно начинается с -100."
+    });
+    var add = button("Добавить", "primary");
+    var choose = button("Выбрать из списка", "secondary", openAvailableGroups);
+    var form = el("form", "inline-form");
+    form.appendChild(groupField.wrap); form.appendChild(add); form.appendChild(choose);
+    form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      var chatId = groupField.input.value.trim();
+      if (!/^-?\d+$/.test(chatId)) {
+        setText(groupField.error, "Chat ID должен быть числом (например, -1001234567890).");
+        groupField.input.setAttribute("aria-invalid", "true"); return;
+      }
+      groupField.error.textContent = ""; groupField.input.removeAttribute("aria-invalid"); add.disabled = true;
+      mutation("/api/groups", "POST", { chat_id: chatId }).then(function () {
+        groupField.input.value = ""; showToast("Группа добавлена.", "success"); state.loadedAt.groups = 0; return loadGroups(true);
+      }).catch(function (error) { showToast(apiErrorMessage(error), "error", true); }).finally(function () { add.disabled = false; });
+    });
+    var view = panel("Группы", "Назначьте каналы и топики, куда будут отправляться дайджесты.", null);
+    view.body.appendChild(form);
+    if (!state.data.groups.length) {
+      view.body.appendChild(emptyState("👥", "Нет добавленных групп", "Добавьте бота в группу и укажите её chat_id.", null));
+      return view.outer;
+    }
+    var tableWrap = el("div", "table-wrap");
+    var table = el("table", "data-table");
+    var head = el("thead"), row = el("tr");
+    ["Группа", "Каналы", "Статус", "Управление"].forEach(function (label) { row.appendChild(el("th", "", label)); });
+    head.appendChild(row); table.appendChild(head);
+    var body = el("tbody");
+    state.data.groups.forEach(function (group) {
+      var tr = el("tr", "group-row");
+      tr.addEventListener("click", function (event) {
+        if (event.target.closest("button")) return;
+        var details = tr.nextElementSibling;
+        if (details) details.hidden = !details.hidden;
+      });
+      var title = el("td"); title.appendChild(el("strong", "truncate", group.title || "Без названия")); title.appendChild(el("span", "subline", group.chatId)); tr.appendChild(title);
+      tr.appendChild(el("td", "", String(group.assignments.length)));
+      var status = el("td");
+      if (group.status === "ineligible") status.appendChild(el("span", "badge danger", "Не подходит"));
+      else if (group.status === "inactive") status.appendChild(el("span", "badge warning", "Неактивна"));
+      else if (group.botStatus && group.botStatus !== "administrator") status.appendChild(el("span", "badge warning", "Нужны права"));
+      else status.appendChild(el("span", "badge success", "Активна"));
+      tr.appendChild(status);
+      var actions = el("td", "row-actions");
+      actions.appendChild(button("Назначить каналы", "secondary small", function () { openAssignment(group); }));
+      actions.appendChild(button("Удалить", "danger small", function () { confirmDeleteGroup(group); }));
+      tr.appendChild(actions); body.appendChild(tr);
+      var detailRow = el("tr");
+      var detailCell = el("td", "details-cell"); detailCell.colSpan = 4;
+      detailCell.hidden = false;
+      if (!group.assignments.length) detailCell.appendChild(el("span", "muted", "Каналы ещё не назначены."));
+      group.assignments.forEach(function (assignment) {
+        var assignmentNode = el("div", "assignment");
+        var line = el("div"); line.appendChild(el("strong", "", "@" + assignment.username)); if (assignment.title) line.appendChild(el("span", "subline", assignment.title));
+        if (assignment.topicId) line.appendChild(el("span", "subline", "Топик: " + assignment.topicId));
+        assignmentNode.appendChild(line);
+        assignmentNode.appendChild(button("Отвязать", "ghost small", function () {
+          openConfirm("Отвязать канал @" + assignment.username + "?", "Канал останется в списке каналов.", "Отвязать", function () {
+            mutation("/api/groups/" + encodeURIComponent(group.id) + "/channels/" + encodeURIComponent(assignment.channelId), "DELETE").then(function () {
+              showToast("Канал отвязан.", "success"); state.loadedAt.groups = 0; return loadGroups(true);
+            }).catch(function (error) { showToast(apiErrorMessage(error), "error", true); });
+          });
+        }));
+        detailCell.appendChild(assignmentNode);
+      });
+      detailRow.appendChild(detailCell); body.appendChild(detailRow);
+    });
+    table.appendChild(body); tableWrap.appendChild(table); view.body.appendChild(tableWrap);
+    return view.outer;
+  }
+  function confirmDeleteGroup(group) {
+    openConfirm("Удалить группу " + (group.title || group.chatId) + "?", "Все назначения каналов будут удалены.", "Удалить", function () {
+      mutation("/api/groups/" + encodeURIComponent(group.id), "DELETE").then(function () {
+        showToast("Группа удалена.", "success"); state.loadedAt.groups = 0; return loadGroups(true);
+      }).catch(function (error) { showToast(apiErrorMessage(error), "error", true); });
+    });
+  }
+  function openAvailableGroups() {
+    api("/api/groups/available").then(function (data) {
+      var choices = asArray(data);
+      if (!choices.length) { showToast("Нет доступных групп. Добавьте бота в группу.", "warning"); return; }
+      openModal("Выберите группу", function (body, close) {
+        var list = el("div", "choice-list");
+        choices.forEach(function (item) {
+          var chatId = String(pick(item, ["chat_id", "telegram_chat_id", "TelegramChatID"], ""));
+          var title = String(pick(item, ["title", "Title"], chatId));
+          list.appendChild(button(title + " (" + chatId + ")", "secondary", function () {
+            mutation("/api/groups", "POST", { chat_id: chatId }).then(function () {
+              close(); showToast("Группа добавлена.", "success"); state.loadedAt.groups = 0; return loadGroups(true);
+            }).catch(function (error) { showToast(apiErrorMessage(error), "error", true); });
+          }));
+        });
+        body.appendChild(list);
+      });
+    }).catch(function (error) { showToast(apiErrorMessage(error), "error", true); });
+  }
+  function openAssignment(group) {
+    Promise.all([loadChannels(false), api("/api/groups/" + encodeURIComponent(group.id) + "/topics").catch(function () { return []; })]).then(function (result) {
+      var assigned = {};
+      group.assignments.forEach(function (item) { assigned[item.channelId] = true; });
+      var available = state.data.channels.filter(function (channel) { return !assigned[String(channel.id)]; });
+      var topics = asArray(result[1]);
+      openModal("Назначить каналы", function (body, close) {
+        if (!available.length) {
+          body.appendChild(emptyState("✅", "Все каналы уже назначены этой группе", "Добавьте новый канал или отвяжите существующий."));
+          return;
+        }
+        var form = el("form", "stack");
+        var list = el("div", "choice-list");
+        available.forEach(function (channel) {
+          var choice = el("label", "choice");
+          var checkbox = el("input"); checkbox.type = "checkbox"; checkbox.value = channel.id;
+          choice.appendChild(checkbox); choice.appendChild(el("span", "", "@" + channel.username + (channel.title ? " · " + channel.title : "")));
+          list.appendChild(choice);
+        });
+        form.appendChild(list);
+        var topicChoices = [{ value: "", label: "Общий чат" }].concat(topics.map(function (topic) {
+          return { value: String(pick(topic, ["message_thread_id", "MessageThreadID", "id"], "")), label: String(pick(topic, ["name", "Name"], "Топик")) };
+        }));
+        var topic = field("Топик", "assignment-topic", "", "select", { choices: topicChoices, help: "Если список пуст, группа может быть не форумной." });
+        form.appendChild(topic.wrap);
+        var save = button("Назначить", "primary");
+        form.appendChild(el("div", "actions")).lastChild.appendChild(save);
+        form.addEventListener("submit", function (event) {
+          event.preventDefault();
+          var selected = Array.from(list.querySelectorAll("input:checked")).map(function (item) { return item.value; });
+          if (!selected.length) { showToast("Выберите хотя бы один канал.", "warning"); return; }
+          save.disabled = true;
+          Promise.all(selected.map(function (channelId) {
+            return mutation("/api/groups/" + encodeURIComponent(group.id) + "/channels", "POST", {
+              channel_id: channelId, topic_thread_id: topic.input.value || null
+            });
+          })).then(function () {
+            close(); showToast("Каналы назначены.", "success"); state.loadedAt.groups = 0; return loadGroups(true);
+          }).catch(function (error) { showToast(apiErrorMessage(error), "error", true); }).finally(function () { save.disabled = false; });
+        });
+        body.appendChild(form);
+      });
+    }).catch(function (error) { showToast(apiErrorMessage(error), "error", true); });
+  }
+  function renderProviders() {
+    var view = panel("AI-провайдеры", "OpenRouter используется по умолчанию. Секретные ключи никогда не отображаются в интерфейсе.", button("Добавить провайдера", "primary", function () { openProviderForm(); }));
+    var list = state.data.providers;
+    if (!list.length) {
+      view.body.appendChild(emptyState("🧠", "Провайдеры не настроены", "Добавьте совместимый с OpenAI API endpoint.", null));
+      return view.outer;
+    }
+    var tableWrap = el("div", "table-wrap"), table = el("table", "data-table"), head = el("thead"), headRow = el("tr");
+    ["Провайдер", "Endpoint", "Модель", "Статус", "Управление"].forEach(function (label) { headRow.appendChild(el("th", "", label)); });
+    head.appendChild(headRow); table.appendChild(head);
+    var body = el("tbody");
+    list.forEach(function (provider) {
+      var tr = el("tr");
+      var identity = el("td"); identity.appendChild(el("strong", "truncate", provider.name)); if (provider.apiKey) identity.appendChild(el("span", "subline", "Ключ: " + provider.apiKey)); tr.appendChild(identity);
+      tr.appendChild(el("td", "truncate", provider.baseUrl));
+      tr.appendChild(el("td", "truncate", provider.model));
+      var status = el("td"); if (provider.isDefault) status.appendChild(el("span", "badge system", "★ По умолчанию")); else status.appendChild(el("span", "badge", "Дополнительный")); tr.appendChild(status);
+      var actions = el("td", "row-actions");
+      actions.appendChild(button("Редактировать", "secondary small", function () { openProviderForm(provider); }));
+      if (!provider.isDefault && provider.name !== "OpenRouter") {
+        actions.appendChild(button("По умолчанию", "ghost small", function () {
+          openConfirm("Сделать " + provider.name + " провайдером по умолчанию?", "Новые группы без собственного провайдера будут использовать его.", "Подтвердить", function () {
+            mutation("/api/providers/" + encodeURIComponent(provider.id), "PATCH", { name: provider.name, base_url: provider.baseUrl, api_key: "********", default_model: provider.model, is_default: true }).then(function () {
+              showToast("Провайдер выбран по умолчанию.", "success"); state.loadedAt.providers = 0; return loadProviders(true);
+            }).catch(function (error) { showToast(apiErrorMessage(error), "error", true); });
+          });
+        }));
+        actions.appendChild(button("Удалить", "danger small", function () { confirmDeleteProvider(provider); }));
+      } else {
+        actions.appendChild(el("span", "badge system", "Системный"));
+      }
+      tr.appendChild(actions); body.appendChild(tr);
+    });
+    table.appendChild(body); tableWrap.appendChild(table); view.body.appendChild(tableWrap); return view.outer;
+  }
+  function openProviderForm(provider) {
+    provider = provider || { name: "", baseUrl: "https://api.openai.com/v1", apiKey: "", model: "", isDefault: false };
+    openModal(provider.id ? "Редактировать провайдера" : "Добавить провайдера", function (body, close) {
+      var form = el("form", "stack");
+      var name = field("Название", "provider-name", provider.name, "text", { required: true, placeholder: "Мой OpenAI endpoint" });
+      var base = field("Base URL", "provider-url", provider.baseUrl, "url", { required: true, placeholder: "https://api.example.com/v1", help: "Только http:// или https://." });
+      var key = field("API key", "provider-key", provider.apiKey, "password", { required: !provider.id, placeholder: provider.id ? "Оставьте ********, чтобы сохранить текущий" : "Введите ключ" });
+      var model = field("Модель", "provider-model", provider.model, "text", { required: true, placeholder: "openai/gpt-oss-120b" });
+      [name, base, key, model].forEach(function (item) { form.appendChild(item.wrap); });
+      var actions = el("div", "actions");
+      var cancel = button("Отмена", "secondary", close);
+      var save = button("Проверить и сохранить", "primary");
+      actions.appendChild(cancel); actions.appendChild(save); form.appendChild(actions);
+      form.addEventListener("submit", function (event) {
+        event.preventDefault();
+        var valid = true;
+        [[name, name.input.value.trim()], [base, base.input.value.trim()], [model, model.input.value.trim()]].forEach(function (item) {
+          item[0].error.textContent = "";
+          item[0].input.removeAttribute("aria-invalid");
+          if (!item[1]) { item[0].error.textContent = "Обязательное поле."; item[0].input.setAttribute("aria-invalid", "true"); valid = false; }
+        });
+        try { var parsed = new URL(base.input.value.trim()); if (parsed.protocol !== "https:" && parsed.protocol !== "http:") throw new Error(); }
+        catch (_) { base.error.textContent = "Неверный формат URL. Должен начинаться с https:// или http://."; base.input.setAttribute("aria-invalid", "true"); valid = false; }
+        if (!valid) return;
+        save.disabled = true;
+        var payload = { name: name.input.value.trim(), base_url: base.input.value.trim(), api_key: key.input.value.trim(), default_model: model.input.value.trim(), is_default: provider.isDefault };
+        mutation("/api/providers" + (provider.id ? "/" + encodeURIComponent(provider.id) : ""), provider.id ? "PUT" : "POST", payload).then(function () {
+          close(); showToast("Провайдер сохранён.", "success"); state.loadedAt.providers = 0; return loadProviders(true);
+        }).catch(function (error) { showToast(apiErrorMessage(error), "error", true); }).finally(function () { save.disabled = false; });
+      });
+      body.appendChild(form);
+      name.input.focus();
+    });
+  }
+  function confirmDeleteProvider(provider) {
+    openConfirm("Удалить провайдера " + provider.name + "?", "Группы с явным назначением будут переведены на провайдера по умолчанию.", "Удалить", function () {
+      mutation("/api/providers/" + encodeURIComponent(provider.id), "DELETE").then(function () {
+        showToast("Провайдер удалён.", "success"); state.loadedAt.providers = 0; return loadProviders(true);
+      }).catch(function (error) { showToast(apiErrorMessage(error), "error", true); });
+    });
+  }
+  function renderSettings() {
+    var saved = state.data.settings || normalizeSettings({});
+    var view = panel("Настройки", "Общие параметры расписания и модели для групп без собственного переопределения.", null);
+    var form = el("form", "stack");
+    var grid = el("div", "form-grid");
+    var time = field("Время дайджеста", "settings-time", saved.digestTime, "time", { required: true, help: "Формат 24 часа, например 21:00." });
+    var tz = field("Часовой пояс", "settings-timezone", saved.timezone, "text", { required: true, placeholder: "Начните вводить, например Moscow" });
+    var model = field("Модель по умолчанию", "settings-model", saved.model, "text", { required: true, placeholder: "openai/gpt-oss-120b" });
+    var datalist = el("datalist"); datalist.id = "timezone-list";
+    timezoneOptions.forEach(function (zone) { var option = el("option", "", zone); option.value = zone; datalist.appendChild(option); });
+    tz.input.setAttribute("list", datalist.id);
+    grid.appendChild(time.wrap); grid.appendChild(tz.wrap); grid.appendChild(model.wrap); grid.appendChild(datalist); form.appendChild(grid);
+    var actions = el("div", "actions");
+    var save = button("Сохранить настройки", "primary");
+    var cancel = button("Отмена", "secondary", function () { if (settingsChanged(form, saved)) openConfirm("Отменить изменения?", "Введённые значения будут заменены последними сохранёнными.", "Выйти без сохранения", function () { render(); }); else switchTab("channels"); });
+    actions.appendChild(save); actions.appendChild(cancel); form.appendChild(actions);
+    [time.input, tz.input, model.input].forEach(function (input) { input.addEventListener("input", function () { state.settingsDraft = readSettings(form); }); });
+    form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      var values = readSettings(form), valid = true;
+      [time, tz, model].forEach(function (item) { item.error.textContent = ""; item.input.removeAttribute("aria-invalid"); });
+      if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(values.digest_time)) { time.error.textContent = "Формат: ЧЧ:ММ (00:00–23:59)."; time.input.setAttribute("aria-invalid", "true"); valid = false; }
+      if (values.timezone !== "UTC" && (!/^[A-Za-z]+(?:[\\/_-][A-Za-z0-9_+.-]+)+$/.test(values.timezone) || values.timezone.length > 80)) { tz.error.textContent = "Укажите корректный часовой пояс IANA."; tz.input.setAttribute("aria-invalid", "true"); valid = false; }
+      if (!values.default_model) { model.error.textContent = "Обязательное поле."; model.input.setAttribute("aria-invalid", "true"); valid = false; }
+      if (!valid) return;
+      save.disabled = true;
+      mutation("/api/settings", "PUT", { digest_time: values.digest_time, timezone: values.timezone, default_model: values.default_model, version: saved.version }).then(function () {
+        showToast("Настройки сохранены.", "success"); state.loadedAt.settings = 0; state.settingsDraft = null; return loadSettings(true);
+      }).catch(function (error) { showToast(apiErrorMessage(error), "error", true); }).finally(function () { save.disabled = false; });
+    });
+    view.body.appendChild(form); return view.outer;
+  }
+  function readSettings(form) {
+    return {
+      digest_time: form.querySelector("#settings-time").value.trim(),
+      timezone: form.querySelector("#settings-timezone").value.trim(),
+      default_model: form.querySelector("#settings-model").value.trim()
+    };
+  }
+  function settingsChanged(form, saved) {
+    var current = readSettings(form);
+    return current.digest_time !== saved.digestTime || current.timezone !== saved.timezone || current.default_model !== saved.model;
+  }
+  function renderDigest() {
+    var view = panel("Тестовый дайджест", "Запустите ручную проверку для группы. Прогресс обновляется через обычный HTTP polling.", null);
+    var groups = state.data.groups.filter(function (group) { return group.assignments.length > 0; });
+    if (!groups.length) {
+      view.body.appendChild(emptyState("🧪", "Нет групп с назначенными каналами", "Сначала добавьте группу и назначьте ей каналы.", button("Перейти к группам", "primary", function () { switchTab("groups"); })));
+      return view.outer;
+    }
+    var form = el("form", "stack");
+    var choices = groups.map(function (group) { return { value: group.id, label: (group.title || "Без названия") + " (" + group.chatId + ")" }; });
+    var selected = field("Группа", "digest-group", "", "select", { choices: choices, required: true });
+    form.appendChild(selected.wrap);
+    var run = button("Запустить тестовый дайджест", "primary");
+    form.appendChild(el("div", "actions")).lastChild.appendChild(run);
+    var progress = el("div", "progress"); progress.hidden = !state.digestJob;
+    appendDigestProgress(progress, state.digestJob || { stage: "idle" });
+    form.appendChild(progress);
+    form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      var group = groups.find(function (item) { return String(item.id) === String(selected.input.value); }) || groups[0];
+      openConfirm("Запустить дайджест для группы " + (group.title || group.chatId) + "?", "Посты будут собраны, просуммированы и отправлены в группу.", "Запустить", function () {
+        run.disabled = true; progress.hidden = false; state.digestJob = { stage: "parsing", detail: "Подготовка…" }; appendDigestProgress(progress, state.digestJob);
+        mutation("/api/digest/test", "POST", { group_id: String(group.id) }).then(function (result) {
+          var jobId = String(pick(result, ["job_id", "JobID", "id", "ID"], ""));
+          if (!jobId) { state.digestJob = normalizeDigestResult(result); appendDigestProgress(progress, state.digestJob); return; }
+          pollDigest(jobId, progress, run);
+        }).catch(function (error) { state.digestJob = { stage: "error", detail: apiErrorMessage(error) }; appendDigestProgress(progress, state.digestJob); run.disabled = false; showToast(apiErrorMessage(error), "error", true); });
+      });
+    });
+    view.body.appendChild(form); return view.outer;
+  }
+  function normalizeDigestResult(result) {
+    var status = String(pick(result, ["status", "Status", "stage", "Stage"], "completed")).toLowerCase();
+    return { stage: status.indexOf("error") >= 0 || status.indexOf("fail") >= 0 ? "error" : status, detail: String(pick(result, ["message", "Message", "detail", "Detail"], "")), posts: pick(result, ["post_count", "PostCount"], null), channels: pick(result, ["channel_count", "ChannelCount"], null) };
+  }
+  function appendDigestProgress(node, job) {
+    while (node.firstChild) node.removeChild(node.firstChild);
+    var stages = [
+      ["parsing", "Парсинг каналов…"], ["summarizing", "Суммаризация постов…"], ["sending", "Отправка в группу…"], ["completed", "Готово!"]
+    ];
+    var current = job.stage || "idle";
+    stages.forEach(function (stage, index) {
+      var item = el("div", "progress-step");
+      if (current === stage[0]) item.className += " active";
+      if ((current === "completed" && index < 3) || (current === "sending" && index < 2) || (current === "summarizing" && index < 1)) item.className += " done";
+      item.appendChild(el("span", "progress-dot")); item.appendChild(el("span", "", stage[1])); node.appendChild(item);
+    });
+    if (job.stage === "error") node.appendChild(el("div", "error-text", job.detail || "Ошибка выполнения дайджеста."));
+    else if (job.stage === "completed") node.appendChild(el("p", "muted", job.detail || "Дайджест отправлен."));
+    else if (job.detail) node.appendChild(el("p", "muted", job.detail));
+  }
+  function pollDigest(jobId, progress, run) {
+    var attempts = 0;
+    function tick() {
+      attempts += 1;
+      api("/api/digest/status?id=" + encodeURIComponent(jobId)).then(function (result) {
+        state.digestJob = normalizeDigestResult(result); appendDigestProgress(progress, state.digestJob);
+        if (state.digestJob.stage === "completed" || state.digestJob.stage === "error" || attempts > 60) {
+          run.disabled = false;
+          if (state.digestJob.stage === "completed") showToast("Дайджест отправлен.", "success");
+          else if (state.digestJob.stage === "error") showToast(state.digestJob.detail || "Ошибка дайджеста.", "error", true);
+          return;
+        }
+        state.digestTimer = window.setTimeout(tick, 1000);
+      }).catch(function (error) {
+        state.digestJob = { stage: "error", detail: apiErrorMessage(error) }; appendDigestProgress(progress, state.digestJob); run.disabled = false;
+      });
+    }
+    tick();
+  }
+  function renderTab() {
+    if (state.tab === "channels") return dataBody("channels", renderChannels);
+    if (state.tab === "groups") return dataBody("groups", renderGroups);
+    if (state.tab === "providers") return dataBody("providers", renderProviders);
+    if (state.tab === "settings") return dataBody("settings", renderSettings);
+    return dataBody("groups", renderDigest);
+  }
+  function refresh(tab, force) {
+    if (tab === "channels") return loadChannels(force);
+    if (tab === "groups") return loadGroups(force);
+    if (tab === "providers") return loadProviders(force);
+    if (tab === "settings") return loadSettings(force);
+    return Promise.all([loadGroups(force)]);
+  }
+  function switchTab(tab) {
+    if (state.tab === "settings" && state.settingsDraft && state.data.settings && JSON.stringify(state.settingsDraft) !== JSON.stringify({
+      digest_time: state.data.settings.digestTime, timezone: state.data.settings.timezone, default_model: state.data.settings.model
+    })) {
+      openConfirm("У вас есть несохранённые изменения.", "Выйти без сохранения?", "Выйти", function () { state.settingsDraft = null; state.tab = tab; refresh(tab, false); });
+      return;
+    }
+    state.tab = tab; state.settingsDraft = null; refresh(tab, false); configureTelegramButtons(); render();
+  }
+  function render() {
+    if (state.destroyed) return;
+    while (app.firstChild) app.removeChild(app.firstChild);
+    app.appendChild(pageShell());
+    configureTelegramButtons();
+  }
+  function openModal(title, populate) {
+    closeModal();
+    var backdrop = el("div", "modal-backdrop"); attr(backdrop, "role", "dialog"); attr(backdrop, "aria-modal", "true");
+    var modal = el("div", "modal");
+    var header = el("div", "modal-header"); header.appendChild(el("h3", "", title));
+    var close = button("×", "close-button", closeModal); attr(close, "aria-label", "Закрыть"); header.appendChild(close); modal.appendChild(header);
+    var body = el("div", "modal-body"); modal.appendChild(body); backdrop.appendChild(modal); document.body.appendChild(backdrop);
+    state.modal = backdrop;
+    backdrop.addEventListener("click", function (event) { if (event.target === backdrop) closeModal(); });
+    populate(body, closeModal);
+    if (telegram && telegram.BackButton) telegram.BackButton.show();
+  }
+  function openConfirm(title, description, confirmLabel, onConfirm) {
+    openModal("Подтверждение", function (body, close) {
+      body.appendChild(el("h3", "", title)); body.appendChild(el("p", "muted", description));
+      var actions = el("div", "actions");
+      actions.appendChild(button("Отмена", "secondary", close));
+      actions.appendChild(button(confirmLabel, "danger", function () { close(); onConfirm(); }));
+      body.appendChild(actions);
+    });
+  }
+  function closeModal() {
+    if (state.modal && state.modal.parentNode) state.modal.remove();
+    state.modal = null;
+    configureTelegramButtons();
+  }
+  function configureTelegramButtons() {
+    if (!telegram) return;
+    if (state.modal) {
+      telegram.MainButton.hide();
+      telegram.BackButton.show();
+      return;
+    }
+    telegram.BackButton.hide();
+    var labels = { channels: "Добавить канал", groups: "Добавить группу", providers: "Добавить провайдера", settings: "Сохранить настройки", digest: "Запустить дайджест" };
+    if (state.tab === "channels" || state.tab === "groups" || state.tab === "providers") {
+      telegram.MainButton.setText(labels[state.tab]);
+      telegram.MainButton.show();
+      telegram.MainButton.offClick(mainButtonAction);
+      telegram.MainButton.onClick(mainButtonAction);
+    } else telegram.MainButton.hide();
+  }
+  function mainButtonAction() {
+    var target = document.querySelector(state.tab === "channels" ? "#channel-username" : state.tab === "groups" ? "#group-chat-id" : state.tab === "providers" ? "[id='provider-name']" : "");
+    if (target) target.form ? target.form.requestSubmit() : target.focus();
+    else if (state.tab === "providers") openProviderForm();
+  }
+  function setupTelegram() {
+    if (!telegram) return false;
+    telegram.ready();
+    telegram.expand();
+    applyTheme();
+    if (telegram.onEvent) telegram.onEvent("themeChanged", applyTheme);
+    if (telegram.BackButton) telegram.BackButton.onClick(function () { if (state.modal) closeModal(); else telegram.close(); });
+    window.addEventListener("keydown", function (event) { if (event.key === "Escape" && state.modal) closeModal(); });
+    return true;
+  }
+  function applyTheme() {
+    var scheme = telegram && telegram.colorScheme === "dark" ? "dark" : "light";
+    document.documentElement.setAttribute("data-theme", scheme);
+    document.documentElement.style.setProperty("--tg-theme-bg-color", pick(telegram.themeParams, ["bg_color"], scheme === "dark" ? "#17212b" : "#f4f6f8"));
+    document.documentElement.style.setProperty("--tg-theme-secondary-bg-color", pick(telegram.themeParams, ["secondary_bg_color"], scheme === "dark" ? "#202b36" : "#ffffff"));
+    document.documentElement.style.setProperty("--tg-theme-text-color", pick(telegram.themeParams, ["text_color"], scheme === "dark" ? "#f5f7fa" : "#17212b"));
+    document.documentElement.style.setProperty("--tg-theme-hint-color", pick(telegram.themeParams, ["hint_color"], "#708090"));
+    document.documentElement.style.setProperty("--tg-theme-button-color", pick(telegram.themeParams, ["button_color"], "#2aabee"));
+    document.documentElement.style.setProperty("--tg-theme-button-text-color", pick(telegram.themeParams, ["button_text_color"], "#ffffff"));
+  }
+  function outsideTelegram() {
+    while (app.firstChild) app.removeChild(app.firstChild);
+    var wrap = el("div", "not-telegram"), card = el("section", "panel");
+    card.appendChild(el("div", "empty-icon", "✈️"));
+    card.appendChild(el("h1", "", "Откройте приложение в Telegram"));
+    card.appendChild(el("p", "muted", "Это приложение должно быть открыто из Telegram. Откройте бота @tgaidigestbot и нажмите «Настройки»."));
+    wrap.appendChild(card); app.appendChild(wrap);
+  }
+  function start() {
+    if (!setupTelegram()) { outsideTelegram(); return; }
+    render();
+    refresh(state.tab, false);
+  }
+  window.addEventListener("beforeunload", function () {
+    state.destroyed = true;
+    if (state.digestTimer) window.clearTimeout(state.digestTimer);
+    if (telegram && telegram.MainButton) telegram.MainButton.offClick(mainButtonAction);
+  });
+  start();
+}());

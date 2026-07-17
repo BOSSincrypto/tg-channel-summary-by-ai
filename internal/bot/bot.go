@@ -638,6 +638,13 @@ func (s *Service) CreateChannelTopic(ctx context.Context, groupID, channelID int
 		return errors.New("create topic returned an invalid message thread id")
 	}
 	if err := s.groups.UpdateChannelTopic(groupID, channelID, int64(topic.MessageThreadID)); err != nil {
+		cleanupErr := s.api.DeleteForumTopic(ctx, &telego.DeleteForumTopicParams{
+			ChatID:          groupTelegramChatID(group.TelegramChatID),
+			MessageThreadID: int(topic.MessageThreadID),
+		})
+		if cleanupErr != nil {
+			return fmt.Errorf("persist topic for channel %d: %w; rollback topic: %v", channelID, err, cleanupErr)
+		}
 		return fmt.Errorf("persist topic for channel %d: %w", channelID, err)
 	}
 	return nil
@@ -678,14 +685,18 @@ func (s *Service) RemoveChannelTopic(ctx context.Context, groupID, channelID int
 		}
 		return err
 	}
+	if err := s.groups.UnassignChannel(groupID, channelID); err != nil {
+		return fmt.Errorf("remove topic assignment: %w", err)
+	}
 	if err := s.api.CloseForumTopic(ctx, &telego.CloseForumTopicParams{
 		ChatID:          groupTelegramChatID(chatID),
 		MessageThreadID: int(threadID),
 	}); err != nil {
+		rollbackErr := s.groups.AssignChannel(groupID, channelID, &threadID)
+		if rollbackErr != nil {
+			return fmt.Errorf("close topic: %w; rollback topic assignment: %v", err, rollbackErr)
+		}
 		return fmt.Errorf("close topic: %w", err)
-	}
-	if err := s.groups.UnassignChannel(groupID, channelID); err != nil {
-		return fmt.Errorf("remove topic assignment: %w", err)
 	}
 	return nil
 }

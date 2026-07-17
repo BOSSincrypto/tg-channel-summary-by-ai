@@ -3,6 +3,7 @@ package webapp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -107,6 +108,144 @@ func TestGroupsAPIUsesStringChatIDAndRejectsDuplicateAssignments(t *testing.T) {
 	if duplicate.Code != http.StatusConflict {
 		t.Fatalf("duplicate assignment status = %d, body=%s", duplicate.Code, duplicate.Body.String())
 	}
+}
+
+func TestProductionTopicLifecycleIsUsedForAssignmentAndRemoval(t *testing.T) {
+	server, store := newBackendTestServer(t)
+	lifecycle := &fakeTopicLifecycle{store: store}
+	server.SetTopicLifecycle(lifecycle)
+
+	channelID, err := store.Channels.Insert(&model.Channel{Username: "topic_news", Title: "Topic News", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	groupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: -1008,
+		Title:          "Forum",
+		Status:         model.GroupStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+
+	assigned := doJSON(t, server.Handler(), http.MethodPost,
+		"/api/groups/"+jsonNumber(groupID)+"/channels",
+		`{"channel_id":"`+jsonNumber(channelID)+`"}`)
+	if assigned.Code != http.StatusCreated {
+		t.Fatalf("assignment status = %d, body=%s", assigned.Code, assigned.Body.String())
+	}
+	if len(lifecycle.created) != 1 || lifecycle.created[0] != [2]int64{groupID, channelID} {
+		t.Fatalf("created lifecycle calls = %#v", lifecycle.created)
+	}
+	assignments, err := store.Groups.GetChannelAssignments(groupID)
+	if err != nil {
+		t.Fatalf("load assignments: %v", err)
+	}
+	if len(assignments) != 1 || assignments[0].TopicThreadID == nil || *assignments[0].TopicThreadID <= 0 {
+		t.Fatalf("assignment = %#v, want persisted positive topic", assignments)
+	}
+
+	removed := doJSON(t, server.Handler(), http.MethodDelete,
+		"/api/groups/"+jsonNumber(groupID)+"/channels/"+jsonNumber(channelID), "")
+	if removed.Code != http.StatusNoContent {
+		t.Fatalf("removal status = %d, body=%s", removed.Code, removed.Body.String())
+	}
+	if len(lifecycle.removed) != 1 || lifecycle.removed[0] != [2]int64{groupID, channelID} {
+		t.Fatalf("removed lifecycle calls = %#v", lifecycle.removed)
+	}
+	assignments, err = store.Groups.GetChannelAssignments(groupID)
+	if err != nil {
+		t.Fatalf("load assignments after removal: %v", err)
+	}
+	if len(assignments) != 0 {
+		t.Fatalf("assignments after removal = %#v, want none", assignments)
+	}
+}
+
+func TestProductionTopicLifecycleFailureLeavesAssignmentUnchanged(t *testing.T) {
+	server, store := newBackendTestServer(t)
+	lifecycle := &fakeTopicLifecycle{err: errors.New("telegram topic unavailable")}
+	server.SetTopicLifecycle(lifecycle)
+
+	channelID, err := store.Channels.Insert(&model.Channel{Username: "topic_fail", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	groupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: -1009,
+		Title:          "Forum",
+		Status:         model.GroupStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+
+	response := doJSON(t, server.Handler(), http.MethodPost,
+		"/api/groups/"+jsonNumber(groupID)+"/channels",
+		`{"channel_id":"`+jsonNumber(channelID)+`"}`)
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("failure status = %d, body=%s", response.Code, response.Body.String())
+	}
+	assignments, err := store.Groups.GetChannelAssignments(groupID)
+	if err != nil {
+		t.Fatalf("load assignments after failure: %v", err)
+	}
+	if len(assignments) != 0 {
+		t.Fatalf("assignments after failed lifecycle = %#v, want none", assignments)
+	}
+}
+
+func TestNonForumAssignmentDoesNotCallTopicLifecycle(t *testing.T) {
+	server, store := newBackendTestServer(t)
+	lifecycle := &fakeTopicLifecycle{store: store}
+	server.SetTopicLifecycle(lifecycle)
+
+	channelID, err := store.Channels.Insert(&model.Channel{Username: "regular_news", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	groupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: -1010,
+		Title:          "Ineligible",
+		Status:         model.GroupStatusIneligible,
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+
+	response := doJSON(t, server.Handler(), http.MethodPost,
+		"/api/groups/"+jsonNumber(groupID)+"/channels",
+		`{"channel_id":"`+jsonNumber(channelID)+`"}`)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("assignment status = %d, body=%s", response.Code, response.Body.String())
+	}
+	if len(lifecycle.created) != 0 {
+		t.Fatalf("non-forum lifecycle calls = %#v, want none", lifecycle.created)
+	}
+}
+
+type fakeTopicLifecycle struct {
+	store   *db.DB
+	err     error
+	created [][2]int64
+	removed [][2]int64
+}
+
+func (f *fakeTopicLifecycle) CreateChannelTopic(_ context.Context, groupID, channelID int64) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.created = append(f.created, [2]int64{groupID, channelID})
+	threadID := int64(700 + len(f.created))
+	return f.store.Groups.UpdateChannelTopic(groupID, channelID, threadID)
+}
+
+func (f *fakeTopicLifecycle) RemoveChannelTopic(_ context.Context, groupID, channelID int64) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.removed = append(f.removed, [2]int64{groupID, channelID})
+	return f.store.Groups.UnassignChannel(groupID, channelID)
 }
 
 func TestSettingsAPIUsesOptimisticLocking(t *testing.T) {

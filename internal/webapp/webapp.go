@@ -131,6 +131,15 @@ func (s *Server) SetGroupVerifier(verifier GroupVerifier) {
 	}
 }
 
+// SetTopicLifecycle connects group assignment mutations to the production
+// Telegram forum-topic boundary. The WebApp package remains independent of
+// the bot package and only depends on this narrow interface.
+func (s *Server) SetTopicLifecycle(lifecycle TopicLifecycle) {
+	if s.groupService != nil {
+		s.groupService.SetTopicLifecycle(lifecycle)
+	}
+}
+
 // Handler returns the http.Handler for the server, useful for testing
 // with httptest.NewServer.
 func (s *Server) Handler() http.Handler {

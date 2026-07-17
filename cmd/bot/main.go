@@ -4,12 +4,15 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -23,6 +26,7 @@ import (
 	"github.com/boss/tg-channel-summary-by-ai/internal/scheduler"
 	"github.com/boss/tg-channel-summary-by-ai/internal/summarizer"
 	"github.com/boss/tg-channel-summary-by-ai/internal/webapp"
+	"github.com/mymmrac/telego"
 )
 
 func main() {
@@ -67,22 +71,13 @@ func main() {
 	})
 	maintenanceSvc.Start()
 
-	// TODO: Start Telegram bot (long polling)
-	// bot := bot.New(cfg.BotToken, store)
-	// go bot.Start()
-
-	// Start HTTP server (health check + WebApp)
+	// Configure the HTTP server (health check + WebApp) before wiring the
+	// remaining production services.
 	webAppAuth, err := webapp.NewWebAppAuthWithOrigin(cfg.BotToken, cfg.OwnerTelegramID, cfg.WebAppURL)
 	if err != nil {
 		log.Fatalf("failed to configure WebApp authentication: %v", err)
 	}
 	srv := webapp.NewWithProvidersAuthenticated(store, 10*time.Second, http.DefaultClient, webAppAuth)
-	go func() {
-		log.Printf("HTTP server listening on :%s", cfg.Port)
-		if err := srv.Start(cfg.Port); err != nil {
-			log.Printf("HTTP server error: %v", err)
-		}
-	}()
 
 	// Wire the production parser -> post storage -> digest path before the
 	// scheduler starts. Scheduled group runs use this same injected service.
@@ -109,6 +104,16 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to configure Telegram bot: %v", err)
 	}
+	telegramBot.SetSettingsApplier(func(ctx context.Context, _ *telego.Message, settings bot.BotSettings) error {
+		return applyProductionSettings(ctx, store, sched, settings)
+	})
+	srv.SetTopicLifecycle(telegramBot)
+	go func() {
+		log.Printf("HTTP server listening on :%s", cfg.Port)
+		if err := srv.Start(cfg.Port); err != nil {
+			log.Printf("HTTP server error: %v", err)
+		}
+	}()
 	go func() {
 		if err := telegramBot.Start(); err != nil {
 			log.Printf("Telegram bot stopped: %v", err)
@@ -128,6 +133,61 @@ func main() {
 	telegramBot.Stop()
 
 	log.Println("Shutdown complete")
+}
+
+// applyProductionSettings is the production update boundary for Telegram
+// WebApp sendData. It persists the payload and updates every configured group
+// while refreshing the already-running shared scheduler instance.
+func applyProductionSettings(ctx context.Context, store *db.DB, sched *scheduler.Scheduler, settings bot.BotSettings) error {
+	if store == nil || sched == nil {
+		return errors.New("production settings dependencies are not configured")
+	}
+	digestTime := strings.TrimSpace(settings.DigestTime)
+	parsed, err := time.Parse("15:04", digestTime)
+	if err != nil || parsed.Format("15:04") != digestTime {
+		return errors.New("digest_time must be in HH:MM format")
+	}
+	if settings.Channels == nil {
+		return errors.New("channels is required")
+	}
+	encoded, err := json.Marshal(struct {
+		DigestTime string   `json:"digest_time"`
+		Channels   []string `json:"channels"`
+	}{
+		DigestTime: digestTime,
+		Channels:   append([]string(nil), settings.Channels...),
+	})
+	if err != nil {
+		return fmt.Errorf("encode WebApp settings: %w", err)
+	}
+	if err := store.Config.Set("webapp_settings", string(encoded)); err != nil {
+		return fmt.Errorf("persist WebApp settings: %w", err)
+	}
+
+	groups, err := store.Groups.List()
+	if err != nil {
+		return fmt.Errorf("list groups for WebApp settings: %w", err)
+	}
+	for _, group := range groups {
+		groupSettings, err := store.Groups.GetGroupSettings(group.ID)
+		if err != nil {
+			return fmt.Errorf("load settings for group %d: %w", group.ID, err)
+		}
+		groupSettings.DigestTime = digestTime
+		if strings.TrimSpace(groupSettings.Timezone) == "" {
+			groupSettings.Timezone = "Europe/Moscow"
+		}
+		if err := store.Groups.UpdateGroupSettings(groupSettings); err != nil {
+			return fmt.Errorf("persist settings for group %d: %w", group.ID, err)
+		}
+		if group.Status == "" || group.Status == model.GroupStatusActive {
+			if err := sched.RefreshGroup(group.ID); err != nil {
+				return fmt.Errorf("refresh scheduler for group %d: %w", group.ID, err)
+			}
+		}
+	}
+	_ = ctx
+	return nil
 }
 
 func ensureDefaultAIProvider(store *db.DB, apiKey string) error {

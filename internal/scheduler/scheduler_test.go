@@ -203,6 +203,36 @@ func TestSchedulerRestoreGroupReRegistersExactlyOneJob(t *testing.T) {
 	s.Stop()
 }
 
+func TestSchedulerRefreshGroupReplacesScheduleInSharedInstance(t *testing.T) {
+	engine := newFakeCronEngine()
+	runner := &fakeRunner{}
+	source := fakeGroupSource{
+		groups: []model.Group{{ID: 8, Status: model.GroupStatusActive}},
+		settings: map[int64]*model.GroupSettings{
+			8: {GroupID: 8, DigestTime: "21:00", Timezone: "UTC"},
+		},
+	}
+	s := New(runner, WithGroupSource(source), withCronEngine(engine))
+	if err := s.Start(); err != nil {
+		t.Fatalf("start scheduler: %v", err)
+	}
+	defer s.Stop()
+	if got, ok := s.ScheduleForGroup(8); !ok || got != "CRON_TZ=UTC 0 21 * * *" {
+		t.Fatalf("initial schedule = %q, registered=%v", got, ok)
+	}
+
+	source.settings[8].DigestTime = "09:30"
+	if err := s.RefreshGroup(8); err != nil {
+		t.Fatalf("refresh group: %v", err)
+	}
+	if len(engine.entries) != 1 {
+		t.Fatalf("entries after refresh = %d, want one", len(engine.entries))
+	}
+	if got, ok := s.ScheduleForGroup(8); !ok || got != "CRON_TZ=UTC 30 9 * * *" {
+		t.Fatalf("refreshed schedule = %q, registered=%v", got, ok)
+	}
+}
+
 func TestSchedulerSharesWindowIDAcrossGroupsAndChangesItPerWindow(t *testing.T) {
 	engine := newFakeCronEngine()
 	runner := &windowRecordingRunner{}

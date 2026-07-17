@@ -84,10 +84,11 @@ type Scheduler struct {
 	groups GroupSource
 	engine cronEngine
 
-	mu      sync.Mutex
-	started bool
-	jobIDs  map[int64]cron.EntryID
-	windows map[string]*scheduledWindow
+	mu       sync.Mutex
+	started  bool
+	jobIDs   map[int64]cron.EntryID
+	jobSpecs map[int64]string
+	windows  map[string]*scheduledWindow
 }
 
 type scheduledWindow struct {
@@ -98,10 +99,11 @@ type scheduledWindow struct {
 // New creates a scheduler that can register production digest jobs.
 func New(runner DigestRunner, options ...Option) *Scheduler {
 	s := &Scheduler{
-		runner:  runner,
-		engine:  newRealCronEngine(),
-		jobIDs:  make(map[int64]cron.EntryID),
-		windows: make(map[string]*scheduledWindow),
+		runner:   runner,
+		engine:   newRealCronEngine(),
+		jobIDs:   make(map[int64]cron.EntryID),
+		jobSpecs: make(map[int64]string),
+		windows:  make(map[string]*scheduledWindow),
 	}
 	for _, option := range options {
 		option(s)
@@ -170,9 +172,91 @@ func (s *Scheduler) Start() error {
 	}
 
 	s.jobIDs = registered
+	s.jobSpecs = specByGroup
 	s.engine.Start()
 	s.started = true
 	return nil
+}
+
+// RefreshGroup replaces a running group's cron registration after its
+// persisted settings change. It is idempotent and intentionally keeps the
+// scheduler instance shared by Telegram and WebApp callers.
+func (s *Scheduler) RefreshGroup(groupID int64) error {
+	if s == nil {
+		return errors.New("refresh group: scheduler is not configured")
+	}
+	s.mu.Lock()
+	if !s.started {
+		s.mu.Unlock()
+		return nil
+	}
+	source, engine := s.groups, s.engine
+	if source == nil || engine == nil {
+		s.mu.Unlock()
+		return errors.New("refresh group: scheduler dependencies are not configured")
+	}
+	if jobID, ok := s.jobIDs[groupID]; ok {
+		engine.Remove(jobID)
+		delete(s.jobIDs, groupID)
+		delete(s.jobSpecs, groupID)
+	}
+	groups, err := source.List()
+	if err != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("refresh group: list groups: %w", err)
+	}
+	var target *model.Group
+	for index := range groups {
+		if groups[index].ID == groupID {
+			target = &groups[index]
+			break
+		}
+	}
+	if target == nil {
+		s.mu.Unlock()
+		return fmt.Errorf("refresh group %d: group not found", groupID)
+	}
+	if target.Status != "" && target.Status != model.GroupStatusActive {
+		s.mu.Unlock()
+		return nil
+	}
+	settings, err := source.GetGroupSettings(groupID)
+	if err != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("refresh group: load settings for group %d: %w", groupID, err)
+	}
+	spec, err := scheduleSpec(settings)
+	if err != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("refresh group: build schedule for group %d: %w", groupID, err)
+	}
+	entryID, err := engine.AddFunc(spec, func() {
+		windowID := s.nextScheduledWindow(spec, 1)
+		if _, runErr := s.RunGroupWithWindow(groupID, windowID); runErr != nil {
+			log.Printf("scheduler group %d failed: %v", groupID, runErr)
+		}
+	})
+	if err != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("refresh group: register group %d schedule %q: %w", groupID, spec, err)
+	}
+	s.jobIDs[groupID] = entryID
+	s.jobSpecs[groupID] = spec
+	s.mu.Unlock()
+	return nil
+}
+
+// ScheduleForGroup exposes the active cron specification for integration
+// checks and operational inspection without exposing cron implementation
+// details.
+func (s *Scheduler) ScheduleForGroup(groupID int64) (string, bool) {
+	if s == nil {
+		return "", false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	spec, ok := s.jobSpecs[groupID]
+	return spec, ok
 }
 
 // RemoveGroup cancels the scheduled digest job for a group that is no longer
@@ -183,6 +267,7 @@ func (s *Scheduler) RemoveGroup(groupID int64) {
 	jobID, ok := s.jobIDs[groupID]
 	if ok {
 		delete(s.jobIDs, groupID)
+		delete(s.jobSpecs, groupID)
 	}
 	engine := s.engine
 	s.mu.Unlock()
@@ -255,6 +340,7 @@ func (s *Scheduler) RestoreGroup(groupID int64) error {
 		return fmt.Errorf("restore group: register group %d schedule %q: %w", groupID, spec, err)
 	}
 	s.jobIDs[groupID] = entryID
+	s.jobSpecs[groupID] = spec
 	s.mu.Unlock()
 	return nil
 }
@@ -309,6 +395,7 @@ func (s *Scheduler) Stop() {
 
 	jobIDs := s.jobIDs
 	s.jobIDs = make(map[int64]cron.EntryID)
+	s.jobSpecs = make(map[int64]string)
 	s.windows = make(map[string]*scheduledWindow)
 	s.started = false
 	engine := s.engine

@@ -27,6 +27,7 @@ type fakeTelegramClient struct {
 	editedTopics  []*telego.EditForumTopicParams
 	deletedTopics []*telego.DeleteForumTopicParams
 	forumTopic    *telego.ForumTopic
+	closeErr      error
 }
 
 func (f *fakeTelegramClient) GetMe(context.Context) (*telego.User, error) {
@@ -68,7 +69,7 @@ func (f *fakeTelegramClient) CreateForumTopic(_ context.Context, params *telego.
 
 func (f *fakeTelegramClient) CloseForumTopic(_ context.Context, params *telego.CloseForumTopicParams) error {
 	f.closedTopics = append(f.closedTopics, params)
-	return nil
+	return f.closeErr
 }
 
 func (f *fakeTelegramClient) DeleteForumTopic(_ context.Context, params *telego.DeleteForumTopicParams) error {
@@ -601,6 +602,91 @@ func TestServiceTopicLifecyclePersistsThreadAndAvoidsDuplicates(t *testing.T) {
 	}
 	if len(assignments) != 0 {
 		t.Fatalf("assignments after removal = %#v, want none", assignments)
+	}
+}
+
+func TestServiceTopicCreationDeletesTelegramTopicWhenPersistenceFails(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+	groupID, err := store.Groups.Insert(&model.Group{TelegramChatID: -1011, Title: "Forum"})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	channelID, err := store.Channels.Insert(&model.Channel{Username: "rollback_news", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	if err := store.Groups.AssignChannel(groupID, channelID, nil); err != nil {
+		t.Fatalf("assign channel: %v", err)
+	}
+	if _, err := store.Conn().Exec(`
+		CREATE TRIGGER reject_topic_persistence
+		BEFORE UPDATE OF topic_thread_id ON group_channels
+		BEGIN
+			SELECT RAISE(ABORT, 'persist failure');
+		END`); err != nil {
+		t.Fatalf("create persistence trigger: %v", err)
+	}
+	api := &fakeTelegramClient{
+		me:         &telego.User{ID: 123, Username: "DigestBot"},
+		forumTopic: &telego.ForumTopic{MessageThreadID: 88, Name: "rollback_news"},
+	}
+	service := newServiceForTest(api, api)
+	service.groups = store.Groups
+	service.channels = store.Channels
+
+	if err := service.CreateChannelTopic(context.Background(), groupID, channelID); err == nil {
+		t.Fatal("CreateChannelTopic() succeeded despite persistence failure")
+	}
+	if len(api.deletedTopics) != 1 || api.deletedTopics[0].MessageThreadID != 88 {
+		t.Fatalf("delete compensation = %#v, want thread 88", api.deletedTopics)
+	}
+	assignments, err := store.Groups.GetChannelAssignments(groupID)
+	if err != nil {
+		t.Fatalf("load assignments: %v", err)
+	}
+	if len(assignments) != 1 || assignments[0].TopicThreadID != nil {
+		t.Fatalf("assignment after failed persistence = %#v, want unassigned topic", assignments)
+	}
+}
+
+func TestServiceTopicRemovalRestoresAssignmentWhenCloseFails(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+	groupID, err := store.Groups.Insert(&model.Group{TelegramChatID: -1012, Title: "Forum"})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	channelID, err := store.Channels.Insert(&model.Channel{Username: "close_fail_news", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	threadID := int64(89)
+	if err := store.Groups.AssignChannel(groupID, channelID, &threadID); err != nil {
+		t.Fatalf("assign channel: %v", err)
+	}
+	api := &fakeTelegramClient{
+		me:       &telego.User{ID: 123, Username: "DigestBot"},
+		closeErr: errors.New("close failed"),
+	}
+	service := newServiceForTest(api, api)
+	service.groups = store.Groups
+
+	if err := service.RemoveChannelTopic(context.Background(), groupID, channelID); err == nil {
+		t.Fatal("RemoveChannelTopic() succeeded despite close failure")
+	}
+	assignments, err := store.Groups.GetChannelAssignments(groupID)
+	if err != nil {
+		t.Fatalf("load assignments: %v", err)
+	}
+	if len(assignments) != 1 || assignments[0].TopicThreadID == nil || *assignments[0].TopicThreadID != threadID {
+		t.Fatalf("assignment after failed close = %#v, want restored thread 89", assignments)
 	}
 }
 

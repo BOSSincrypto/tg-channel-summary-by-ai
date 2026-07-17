@@ -23,6 +23,14 @@ type GroupVerifier interface {
 	Verify(int64) (string, error)
 }
 
+// TopicLifecycle is the production boundary for forum topic mutations.
+// Implementations own the Telegram API call and the corresponding persisted
+// topic assignment, keeping WebApp mutations independent from bot internals.
+type TopicLifecycle interface {
+	CreateChannelTopic(context.Context, int64, int64) error
+	RemoveChannelTopic(context.Context, int64, int64) error
+}
+
 type permissiveGroupVerifier struct{}
 
 func (permissiveGroupVerifier) Verify(chatID int64) (string, error) {
@@ -67,6 +75,7 @@ type GroupService struct {
 	repository dbGroupRepository
 	channels   dbChannelLookup
 	verifier   GroupVerifier
+	topics     TopicLifecycle
 }
 
 type dbGroupRepository interface {
@@ -86,6 +95,12 @@ type dbChannelLookup interface {
 
 func NewGroupService(repository dbGroupRepository, channels dbChannelLookup) *GroupService {
 	return &GroupService{repository: repository, channels: channels, verifier: permissiveGroupVerifier{}}
+}
+
+func (s *GroupService) SetTopicLifecycle(lifecycle TopicLifecycle) {
+	if s != nil {
+		s.topics = lifecycle
+	}
 }
 
 type groupInput struct {
@@ -254,9 +269,32 @@ func (s *Server) handleGroupChannels(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Некорректный topic_thread_id"})
 		return
 	}
+	if topic != nil && *topic <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "topic_thread_id должен быть положительным"})
+		return
+	}
 	if err := s.groupService.repository.AssignChannel(groupID, channelID, topic); err != nil {
 		writeGroupError(w, err)
 		return
+	}
+	group, err := s.groupService.repository.GetByID(groupID)
+	if err != nil {
+		_ = s.groupService.repository.UnassignChannel(groupID, channelID)
+		writeGroupError(w, err)
+		return
+	}
+	// A forum assignment without a selected topic is completed by the shared
+	// Telegram lifecycle. If creation fails, compensate the provisional row so
+	// the WebApp cannot leave a partial assignment behind.
+	if topic == nil && s.groupService.topics != nil &&
+		(group.Status == "" || group.Status == model.GroupStatusActive) {
+		if err := s.groupService.topics.CreateChannelTopic(r.Context(), groupID, channelID); err != nil {
+			if rollbackErr := s.groupService.repository.UnassignChannel(groupID, channelID); rollbackErr != nil {
+				err = fmt.Errorf("%w; rollback assignment: %v", err, rollbackErr)
+			}
+			writeGroupError(w, err)
+			return
+		}
 	}
 	writeJSON(w, http.StatusCreated, map[string]string{"status": "assigned"})
 }
@@ -277,7 +315,34 @@ func (s *Server) handleGroupChannelByID(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if err := s.groupService.repository.UnassignChannel(groupID, channelID); err != nil {
+	group, err := s.groupService.repository.GetByID(groupID)
+	if err != nil {
+		writeGroupError(w, err)
+		return
+	}
+	assignments, err := s.groupService.repository.GetChannelAssignments(groupID)
+	if err != nil {
+		writeGroupError(w, err)
+		return
+	}
+	var assignment *model.GroupChannel
+	for index := range assignments {
+		if assignments[index].ChannelID == channelID {
+			assignment = &assignments[index]
+			break
+		}
+	}
+	if assignment == nil {
+		writeGroupError(w, db.ErrNotFound)
+		return
+	}
+	if assignment.TopicThreadID != nil && s.groupService.topics != nil &&
+		(group.Status == "" || group.Status == model.GroupStatusActive) {
+		if err := s.groupService.topics.RemoveChannelTopic(r.Context(), groupID, channelID); err != nil {
+			writeGroupError(w, err)
+			return
+		}
+	} else if err := s.groupService.repository.UnassignChannel(groupID, channelID); err != nil {
 		writeGroupError(w, err)
 		return
 	}
@@ -369,6 +434,9 @@ func writeGroupError(w http.ResponseWriter, err error) {
 		status, message = http.StatusBadRequest, "Chat ID должен быть числом (например, -1001234567890)"
 	case strings.Contains(strings.ToLower(err.Error()), "verification"):
 		status, message = http.StatusBadRequest, "Бот не является участником этой группы. Добавьте бота в группу и попробуйте снова."
+	case strings.Contains(strings.ToLower(err.Error()), "topic"),
+		strings.Contains(strings.ToLower(err.Error()), "telegram"):
+		status, message = http.StatusBadGateway, "Не удалось обновить топик группы"
 	}
 	writeJSON(w, status, map[string]string{"error": message})
 }

@@ -187,6 +187,12 @@ func (p *OpenRouterProvider) sanitizeError(err error) error {
 		copy := *providerErr
 		copy.Provider = p.providerName
 		err = &copy
+	} else {
+		err = &ProviderError{
+			Message:  err.Error(),
+			Provider: p.providerName,
+			Cause:    err,
+		}
 	}
 	return p.redactor.Wrap("", err)
 }
@@ -417,11 +423,13 @@ func parseBatchSummaries(content string) ([]batchSummary, error) {
 	return envelope.Summaries, nil
 }
 
-// ProviderError describes an HTTP failure returned by an AI provider.
+// ProviderError describes an HTTP or transport failure returned by an AI
+// provider.
 type ProviderError struct {
 	StatusCode int
 	Message    string
 	Provider   string
+	Cause      error
 }
 
 func (e *ProviderError) Error() string {
@@ -432,10 +440,25 @@ func (e *ProviderError) Error() string {
 	if providerName == "" {
 		providerName = "OpenRouter"
 	}
+	if e.StatusCode <= 0 {
+		if e.Message == "" {
+			return fmt.Sprintf("%s chat completion transport failure", providerName)
+		}
+		return fmt.Sprintf("%s chat completion transport failure: %s", providerName, e.Message)
+	}
 	if e.Message == "" {
 		return fmt.Sprintf("%s chat completion: HTTP %d", providerName, e.StatusCode)
 	}
 	return fmt.Sprintf("%s chat completion: HTTP %d: %s", providerName, e.StatusCode, e.Message)
+}
+
+// Unwrap keeps the underlying transport error available for retry and
+// classification while the provider identity remains attached to the error.
+func (e *ProviderError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
 }
 
 func isTransientProviderError(ctx context.Context, err error) bool {
@@ -444,12 +467,17 @@ func isTransientProviderError(ctx context.Context, err error) bool {
 	}
 	var providerErr *ProviderError
 	if errors.As(err, &providerErr) {
-		return providerErr.StatusCode == http.StatusRequestTimeout ||
+		if providerErr.StatusCode == http.StatusRequestTimeout ||
 			providerErr.StatusCode == http.StatusTooManyRequests ||
-			providerErr.StatusCode >= http.StatusInternalServerError
+			providerErr.StatusCode >= http.StatusInternalServerError {
+			return true
+		}
 	}
 	var networkErr net.Error
 	if errors.As(err, &networkErr) && (networkErr.Timeout() || networkErr.Temporary()) {
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
 	var operationErr *net.OpError

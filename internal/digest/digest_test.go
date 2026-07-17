@@ -480,6 +480,38 @@ func TestGenerateFallbackOpenRouterOutageNotifiesOnlyTerminalFailure(t *testing.
 	}
 }
 
+func TestOpenRouterOutageNotificationIsDeduplicatedAcrossGroups(t *testing.T) {
+	notifier := &recordingDigestNotifier{}
+	service := &Service{notifier: notifier}
+	err := &summarizer.ProviderError{
+		StatusCode: http.StatusBadGateway,
+		Provider:   "OpenRouter",
+	}
+
+	service.notifyAIFailure(101, err)
+	service.notifyAIFailure(202, err)
+
+	if len(notifier.messages) != 1 {
+		t.Fatalf("notifications = %d, want one outage notification across groups: %v", len(notifier.messages), notifier.messages)
+	}
+	for _, want := range []string{"OpenRouter недоступен", "Провайдер: OpenRouter", "Ошибка: HTTP 502 (5xx)"} {
+		if !strings.Contains(notifier.messages[0], want) {
+			t.Fatalf("notification = %q, want outage context %q", notifier.messages[0], want)
+		}
+	}
+}
+
+func TestClassifyOpenRouterTransportFailureAsOutage(t *testing.T) {
+	err := &summarizer.ProviderError{
+		Message:  `OpenRouter request: dial tcp: connection refused`,
+		Provider: "OpenRouter",
+	}
+
+	if got := classifyAIFailure(err); got != aiFailureOpenRouterOutage {
+		t.Fatalf("failure class = %q, want %q", got, aiFailureOpenRouterOutage)
+	}
+}
+
 func newDigestFailureFixture(t *testing.T) (*db.DB, int64, int64) {
 	t.Helper()
 	database, groupID, postIDs := newDigestPostsFixture(t, 1)

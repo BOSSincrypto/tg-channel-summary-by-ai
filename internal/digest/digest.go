@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
@@ -34,9 +35,13 @@ type Service struct {
 	providerHTTPClient *http.Client
 	notifier           OwnerNotifier
 	maxPostsPerChannel int
+
+	notificationMu               sync.Mutex
+	openRouterOutageNotification time.Time
 }
 
 const defaultMaxPostsPerChannel = 50
+const aiFailureNotificationWindow = time.Minute
 
 type aiFailureClass string
 
@@ -275,9 +280,30 @@ func (s *Service) notifyAIFallback(groupID int64) {
 
 func (s *Service) notifyAIFailure(groupID int64, err error) {
 	class := classifyAIFailure(err)
+	if !s.shouldNotifyAIFailure(class) {
+		return
+	}
 	group := s.groupTitle(groupID)
 	message := fmt.Sprintf("❌ %s", formatAIFailure(class, group, err))
 	s.notifyAI(groupID, message)
+}
+
+func (s *Service) shouldNotifyAIFailure(class aiFailureClass) bool {
+	if class != aiFailureOpenRouterOutage {
+		return true
+	}
+	if s == nil || s.notifier == nil {
+		return false
+	}
+
+	window := time.Now().UTC().Truncate(aiFailureNotificationWindow)
+	s.notificationMu.Lock()
+	defer s.notificationMu.Unlock()
+	if s.openRouterOutageNotification.Equal(window) {
+		return false
+	}
+	s.openRouterOutageNotification = window
+	return true
 }
 
 func classifyAIFailure(err error) aiFailureClass {
@@ -296,6 +322,14 @@ func classifyAIFailure(err error) aiFailureClass {
 
 	var providerErr *summarizer.ProviderError
 	if errors.As(err, &providerErr) {
+		if (strings.EqualFold(providerErr.Provider, "OpenRouter") || strings.Contains(lower, "openrouter")) &&
+			(strings.Contains(lower, "timeout") ||
+				strings.Contains(lower, "deadline exceeded") ||
+				strings.Contains(lower, "connection refused") ||
+				strings.Contains(lower, "connection reset") ||
+				strings.Contains(lower, "network is unreachable")) {
+			return aiFailureOpenRouterOutage
+		}
 		switch {
 		case providerErr.StatusCode == http.StatusUnauthorized ||
 			providerErr.StatusCode == http.StatusPaymentRequired ||
@@ -325,7 +359,7 @@ func formatAIFailure(class aiFailureClass, group string, err error) string {
 	case aiFailureParse:
 		return fmt.Sprintf("Не удалось разобрать ответ AI для группы «%s». Ответ провайдера не сохранён; проверьте формат ответа и повторите запуск.", group)
 	case aiFailureOpenRouterOutage:
-		return fmt.Sprintf("OpenRouter недоступен (%s). Дайджест группы «%s» пропущен после исчерпания повторных попыток; проверьте статус OpenRouter и повторите позже.", providerStatusDetail(err), group)
+		return fmt.Sprintf("OpenRouter недоступен. Дайджесты не могут быть созданы. Провайдер: OpenRouter. Ошибка: %s. Дайджест группы «%s» пропущен после исчерпания повторных попыток; проверьте статус OpenRouter и повторите позже.", providerStatusDetail(err), group)
 	case aiFailureTransientExhausted:
 		return fmt.Sprintf("Временная ошибка AI для группы «%s» (%s) не устранена после повторных попыток; дайджест пропущен, повторите запуск позже.", group, providerStatusDetail(err))
 	case aiFailurePermanent:
@@ -353,6 +387,17 @@ func providerStatusDetail(err error) string {
 		case providerErr.StatusCode == http.StatusTooManyRequests:
 			return status + " (ограничение запросов)"
 		}
+	}
+	lower := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(lower, "connection refused"):
+		return "соединение отклонено"
+	case strings.Contains(lower, "connection reset"):
+		return "соединение сброшено"
+	case strings.Contains(lower, "timeout") || strings.Contains(lower, "deadline exceeded"):
+		return "тайм-аут"
+	case strings.Contains(lower, "network is unreachable"):
+		return "сеть недоступна"
 	}
 	return status
 }

@@ -3,7 +3,9 @@ package summarizer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -195,6 +197,74 @@ func TestOpenRouterProviderRedactsKeyFromTransportError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "transport unavailable") {
 		t.Fatalf("transport error lost safe context: %q", err)
+	}
+}
+
+func TestOpenRouterProviderPreservesProviderIdentityForTransportFailure(t *testing.T) {
+	client := &http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+		}),
+	}
+	provider, err := NewOpenRouterWithConfig(OpenRouterConfig{
+		BaseURL:           "https://openrouter.ai/api/v1",
+		APIKey:            "test-key",
+		Model:             "test-model",
+		HTTPClient:        client,
+		RetrySleep:        func(context.Context, time.Duration) error { return nil },
+		AllowPrivateHosts: true,
+	})
+	if err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+
+	_, err = provider.ChatCompletion(context.Background(), []Message{{Role: "user", Content: "test"}})
+	if err == nil {
+		t.Fatal("expected transport error")
+	}
+	var providerErr *ProviderError
+	if !errors.As(err, &providerErr) {
+		t.Fatalf("error = %T %v, want ProviderError", err, err)
+	}
+	if providerErr.Provider != "OpenRouter" {
+		t.Fatalf("provider = %q, want OpenRouter", providerErr.Provider)
+	}
+	if providerErr.StatusCode != 0 {
+		t.Fatalf("status code = %d, want zero for transport failure", providerErr.StatusCode)
+	}
+	if !strings.Contains(err.Error(), "connection refused") {
+		t.Fatalf("error = %q, want safe transport detail", err)
+	}
+}
+
+func TestOpenRouterProviderPreservesProviderIdentityForTimeoutFailure(t *testing.T) {
+	client := &http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, context.DeadlineExceeded
+		}),
+	}
+	provider, err := NewOpenRouterWithConfig(OpenRouterConfig{
+		BaseURL:           "https://openrouter.ai/api/v1",
+		APIKey:            "test-key",
+		Model:             "test-model",
+		HTTPClient:        client,
+		RetrySleep:        func(context.Context, time.Duration) error { return nil },
+		AllowPrivateHosts: true,
+	})
+	if err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+
+	_, err = provider.ChatCompletion(context.Background(), []Message{{Role: "user", Content: "test"}})
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	var providerErr *ProviderError
+	if !errors.As(err, &providerErr) {
+		t.Fatalf("error = %T %v, want ProviderError", err, err)
+	}
+	if providerErr.Provider != "OpenRouter" {
+		t.Fatalf("provider = %q, want OpenRouter", providerErr.Provider)
 	}
 }
 

@@ -149,6 +149,14 @@ func (s *Server) SetTopicLifecycle(lifecycle TopicLifecycle) {
 	}
 }
 
+// SetTopicCatalog connects forum topic discovery to an injected production
+// catalog. Passing nil restores the persisted assignment-backed catalog.
+func (s *Server) SetTopicCatalog(catalog TopicCatalog) {
+	if s.groupService != nil {
+		s.groupService.SetTopicCatalog(catalog)
+	}
+}
+
 // Handler returns the http.Handler for the server, useful for testing
 // with httptest.NewServer.
 func (s *Server) Handler() http.Handler {

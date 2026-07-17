@@ -690,6 +690,51 @@ func TestServiceTopicRemovalRestoresAssignmentWhenCloseFails(t *testing.T) {
 	}
 }
 
+func TestServiceTopicRemovalKeepsSharedTopicOpen(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+	groupID, err := store.Groups.Insert(&model.Group{TelegramChatID: -1018, Title: "Forum"})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	firstChannelID, err := store.Channels.Insert(&model.Channel{Username: "shared_first", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert first channel: %v", err)
+	}
+	secondChannelID, err := store.Channels.Insert(&model.Channel{Username: "shared_second", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert second channel: %v", err)
+	}
+	threadID := int64(91)
+	if err := store.Groups.AssignChannel(groupID, firstChannelID, &threadID); err != nil {
+		t.Fatalf("assign first channel: %v", err)
+	}
+	if err := store.Groups.AssignChannel(groupID, secondChannelID, &threadID); err != nil {
+		t.Fatalf("assign second channel: %v", err)
+	}
+	api := &fakeTelegramClient{me: &telego.User{ID: 123, Username: "DigestBot"}}
+	service := newServiceForTest(api, api)
+	service.groups = store.Groups
+
+	if err := service.RemoveChannelTopic(context.Background(), groupID, firstChannelID); err != nil {
+		t.Fatalf("remove shared topic assignment: %v", err)
+	}
+	if len(api.closedTopics) != 0 {
+		t.Fatalf("closed shared topic = %#v, want no close", api.closedTopics)
+	}
+	assignments, err := store.Groups.GetChannelAssignments(groupID)
+	if err != nil {
+		t.Fatalf("load shared assignments: %v", err)
+	}
+	if len(assignments) != 1 || assignments[0].ChannelID != secondChannelID ||
+		assignments[0].TopicThreadID == nil || *assignments[0].TopicThreadID != threadID {
+		t.Fatalf("shared assignments after removal = %#v", assignments)
+	}
+}
+
 func newServiceForTest(api telegramClient, poller updatePoller) *Service {
 	return &Service{
 		api:    api,

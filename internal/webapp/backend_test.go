@@ -360,11 +360,222 @@ func TestNonForumAssignmentDoesNotCallTopicLifecycle(t *testing.T) {
 	}
 }
 
+func TestForumTopicCatalogReturnsPersistedPositiveTopics(t *testing.T) {
+	server, store := newBackendTestServer(t)
+	channelID, err := store.Channels.Insert(&model.Channel{Username: "catalog_news", Title: "Catalog News", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	groupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: -1013,
+		Title:          "Forum",
+		Status:         model.GroupStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	threadID := int64(901)
+	if err := store.Groups.AssignChannel(groupID, channelID, &threadID); err != nil {
+		t.Fatalf("assign topic: %v", err)
+	}
+
+	response := doJSON(t, server.Handler(), http.MethodGet, "/api/groups/"+jsonNumber(groupID)+"/topics", "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("topics status = %d, body=%s", response.Code, response.Body.String())
+	}
+	var topics []map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &topics); err != nil {
+		t.Fatalf("decode topics: %v", err)
+	}
+	if len(topics) != 1 || topics[0]["message_thread_id"] != float64(threadID) || topics[0]["name"] != "Catalog News" {
+		t.Fatalf("topics = %#v, want persisted positive topic", topics)
+	}
+}
+
+func TestInjectedForumTopicCatalogIsUsedForSelection(t *testing.T) {
+	server, store := newBackendTestServer(t)
+	catalogChannelID, err := store.Channels.Insert(&model.Channel{Username: "injected_catalog", Title: "Injected Channel", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	groupID, err := store.Groups.Insert(&model.Group{TelegramChatID: -1016, Title: "Forum", Status: model.GroupStatusActive})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	server.SetTopicCatalog(staticTopicCatalog{topics: []Topic{{MessageThreadID: 1201, Name: "Announcements"}}})
+
+	topicsResponse := doJSON(t, server.Handler(), http.MethodGet, "/api/groups/"+jsonNumber(groupID)+"/topics", "")
+	if topicsResponse.Code != http.StatusOK || !strings.Contains(topicsResponse.Body.String(), `"message_thread_id":1201`) {
+		t.Fatalf("injected topics = %d %s", topicsResponse.Code, topicsResponse.Body.String())
+	}
+	assignmentResponse := doJSON(t, server.Handler(), http.MethodPost,
+		"/api/groups/"+jsonNumber(groupID)+"/channels",
+		`{"channel_id":"`+jsonNumber(catalogChannelID)+`","topic_thread_id":1201}`)
+	if assignmentResponse.Code != http.StatusCreated {
+		t.Fatalf("injected topic assignment = %d %s", assignmentResponse.Code, assignmentResponse.Body.String())
+	}
+	assignments, err := store.Groups.GetChannelAssignments(groupID)
+	if err != nil {
+		t.Fatalf("load injected assignment: %v", err)
+	}
+	if len(assignments) != 1 || assignments[0].TopicThreadID == nil || *assignments[0].TopicThreadID != 1201 {
+		t.Fatalf("injected assignment = %#v", assignments)
+	}
+}
+
+func TestWebAppGroupCreationPersistsNonForumEligibility(t *testing.T) {
+	server, store := newBackendTestServer(t)
+	server.SetGroupVerifier(fakeForumGroupVerifier{title: "Regular", isForum: false})
+	channelID, err := store.Channels.Insert(&model.Channel{Username: "created_regular", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+
+	created := doJSON(t, server.Handler(), http.MethodPost, "/api/groups", `{"chat_id":"-1017"}`)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create non-forum status = %d, body=%s", created.Code, created.Body.String())
+	}
+	var group map[string]any
+	if err := json.Unmarshal(created.Body.Bytes(), &group); err != nil {
+		t.Fatalf("decode created group: %v", err)
+	}
+	if group["is_forum"] != false || group["status"] != model.GroupStatusIneligible {
+		t.Fatalf("created non-forum group = %#v", group)
+	}
+	groupID := int64(group["id"].(float64))
+	assignment := doJSON(t, server.Handler(), http.MethodPost,
+		"/api/groups/"+jsonNumber(groupID)+"/channels",
+		`{"channel_id":"`+jsonNumber(channelID)+`","topic_thread_id":1202}`)
+	if assignment.Code != http.StatusBadRequest {
+		t.Fatalf("non-forum topic assignment status = %d, body=%s", assignment.Code, assignment.Body.String())
+	}
+	stored, err := store.Groups.GetChannelAssignments(groupID)
+	if err != nil {
+		t.Fatalf("load non-forum assignments: %v", err)
+	}
+	if len(stored) != 0 {
+		t.Fatalf("non-forum invalid assignment persisted = %#v", stored)
+	}
+}
+
+func TestNonForumResponsesOmitTopicFieldsAndRejectTopicPayloads(t *testing.T) {
+	server, store := newBackendTestServer(t)
+	channelID, err := store.Channels.Insert(&model.Channel{Username: "regular_catalog", Title: "Regular", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	unassignedChannelID, err := store.Channels.Insert(&model.Channel{Username: "regular_unassigned", Title: "Regular Unassigned", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert unassigned channel: %v", err)
+	}
+	groupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: -1014,
+		Title:          "Regular",
+		Status:         model.GroupStatusIneligible,
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	threadID := int64(902)
+	if err := store.Groups.AssignChannel(groupID, channelID, &threadID); err != nil {
+		t.Fatalf("assign topic fixture: %v", err)
+	}
+
+	groupResponse := doJSON(t, server.Handler(), http.MethodGet, "/api/groups/"+jsonNumber(groupID), "")
+	if groupResponse.Code != http.StatusOK {
+		t.Fatalf("group status = %d, body=%s", groupResponse.Code, groupResponse.Body.String())
+	}
+	var group map[string]any
+	if err := json.Unmarshal(groupResponse.Body.Bytes(), &group); err != nil {
+		t.Fatalf("decode group: %v", err)
+	}
+	if group["is_forum"] != false {
+		t.Fatalf("is_forum = %#v, want false", group["is_forum"])
+	}
+	assignments := group["assignments"].([]any)
+	if len(assignments) != 1 {
+		t.Fatalf("assignments = %#v, want one assignment", assignments)
+	}
+	if _, exists := assignments[0].(map[string]any)["topic_thread_id"]; exists {
+		t.Fatalf("non-forum assignment leaked topic_thread_id: %#v", assignments[0])
+	}
+
+	topicsResponse := doJSON(t, server.Handler(), http.MethodGet, "/api/groups/"+jsonNumber(groupID)+"/topics", "")
+	if topicsResponse.Code != http.StatusOK || strings.TrimSpace(topicsResponse.Body.String()) != "[]" {
+		t.Fatalf("non-forum topics = %d %s, want empty array", topicsResponse.Code, topicsResponse.Body.String())
+	}
+
+	assignmentResponse := doJSON(t, server.Handler(), http.MethodPost,
+		"/api/groups/"+jsonNumber(groupID)+"/channels",
+		`{"channel_id":"`+jsonNumber(unassignedChannelID)+`","topic_thread_id":"903"}`)
+	if assignmentResponse.Code != http.StatusBadRequest {
+		t.Fatalf("non-forum topic assignment status = %d, body=%s", assignmentResponse.Code, assignmentResponse.Body.String())
+	}
+	stored, err := store.Groups.GetChannelAssignments(groupID)
+	if err != nil {
+		t.Fatalf("load assignments: %v", err)
+	}
+	if len(stored) != 1 || stored[0].TopicThreadID == nil || *stored[0].TopicThreadID != threadID {
+		t.Fatalf("non-forum rejected mutation changed assignments = %#v", stored)
+	}
+}
+
+func TestZeroTopicIDIsRejectedWithoutAssignmentMutation(t *testing.T) {
+	server, store := newBackendTestServer(t)
+	channelID, err := store.Channels.Insert(&model.Channel{Username: "zero_topic", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	groupID, err := store.Groups.Insert(&model.Group{TelegramChatID: -1015, Title: "Forum", Status: model.GroupStatusActive})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+
+	response := doJSON(t, server.Handler(), http.MethodPost,
+		"/api/groups/"+jsonNumber(groupID)+"/channels",
+		`{"channel_id":"`+jsonNumber(channelID)+`","topic_thread_id":0}`)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("zero topic status = %d, body=%s", response.Code, response.Body.String())
+	}
+	assignments, err := store.Groups.GetChannelAssignments(groupID)
+	if err != nil {
+		t.Fatalf("load assignments after zero topic: %v", err)
+	}
+	if len(assignments) != 0 {
+		t.Fatalf("zero topic created assignment = %#v", assignments)
+	}
+}
+
 type fakeTopicLifecycle struct {
 	store   *db.DB
 	err     error
 	created [][2]int64
 	removed [][2]int64
+}
+
+type staticTopicCatalog struct {
+	topics []Topic
+	err    error
+}
+
+func (c staticTopicCatalog) ListTopics(context.Context, int64) ([]Topic, error) {
+	if c.err != nil {
+		return nil, c.err
+	}
+	return append([]Topic(nil), c.topics...), nil
+}
+
+type fakeForumGroupVerifier struct {
+	title   string
+	isForum bool
+}
+
+func (f fakeForumGroupVerifier) Verify(int64) (string, error) {
+	return f.title, nil
+}
+
+func (f fakeForumGroupVerifier) VerifyGroup(int64) (string, bool, error) {
+	return f.title, f.isForum, nil
 }
 
 func (f *fakeTopicLifecycle) CreateChannelTopic(_ context.Context, groupID, channelID int64) error {

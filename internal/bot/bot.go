@@ -685,8 +685,25 @@ func (s *Service) RemoveChannelTopic(ctx context.Context, groupID, channelID int
 		}
 		return err
 	}
+	assignments, err := s.groups.GetChannelAssignments(groupID)
+	if err != nil {
+		return fmt.Errorf("load topic assignments: %w", err)
+	}
+	shared := false
+	for _, assignment := range assignments {
+		if assignment.ChannelID == channelID || assignment.TopicThreadID == nil {
+			continue
+		}
+		if *assignment.TopicThreadID == threadID {
+			shared = true
+			break
+		}
+	}
 	if err := s.groups.UnassignChannel(groupID, channelID); err != nil {
 		return fmt.Errorf("remove topic assignment: %w", err)
+	}
+	if shared {
+		return nil
 	}
 	if err := s.api.CloseForumTopic(ctx, &telego.CloseForumTopicParams{
 		ChatID:          groupTelegramChatID(chatID),

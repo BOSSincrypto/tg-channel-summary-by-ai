@@ -101,11 +101,14 @@
   }
   function normalizeGroup(item) {
     var assignments = pick(item, ["assignments", "channels", "Assignments", "Channels"], []);
+    var status = String(pick(item, ["status", "Status"], "active"));
+    var forumValue = pick(item, ["is_forum", "IsForum"], status !== "ineligible");
     return {
       id: idOf(item),
       chatId: String(pick(item, ["telegram_chat_id", "TelegramChatID", "chat_id", "chatId"], "")),
       title: String(pick(item, ["title", "Title"], "")),
-      status: String(pick(item, ["status", "Status"], "active")),
+      status: status,
+      isForum: forumValue === true || forumValue === 1 || forumValue === "true",
       assignments: asArray(assignments).map(normalizeAssignment),
       botStatus: String(pick(item, ["bot_status", "BotStatus"], ""))
     };
@@ -465,7 +468,7 @@
       group.assignments.forEach(function (assignment) {
         var assignmentNode = el("div", "assignment");
         var line = el("div"); line.appendChild(el("strong", "", "@" + assignment.username)); if (assignment.title) line.appendChild(el("span", "subline", assignment.title));
-        if (assignment.topicId) line.appendChild(el("span", "subline", "Топик: " + assignment.topicId));
+        if (group.isForum && assignment.topicId) line.appendChild(el("span", "subline", "Топик: " + assignment.topicId));
         assignmentNode.appendChild(line);
         assignmentNode.appendChild(button("Отвязать", "ghost small", function () {
           openConfirm("Отвязать канал @" + assignment.username + "?", "Канал останется в списке каналов.", "Отвязать", function () {
@@ -508,7 +511,10 @@
     }).catch(function (error) { showToast(apiErrorMessage(error), "error", true); });
   }
   function openAssignment(group) {
-    Promise.all([loadChannels(false), api("/api/groups/" + encodeURIComponent(group.id) + "/topics").catch(function () { return []; })]).then(function (result) {
+    var topicsRequest = group.isForum
+      ? api("/api/groups/" + encodeURIComponent(group.id) + "/topics").catch(function () { return []; })
+      : Promise.resolve([]);
+    Promise.all([loadChannels(false), topicsRequest]).then(function (result) {
       var assigned = {};
       group.assignments.forEach(function (item) { assigned[item.channelId] = true; });
       var available = state.data.channels.filter(function (channel) { return !assigned[String(channel.id)]; });
@@ -527,11 +533,14 @@
           list.appendChild(choice);
         });
         form.appendChild(list);
-        var topicChoices = [{ value: "", label: "Общий чат" }].concat(topics.map(function (topic) {
-          return { value: String(pick(topic, ["message_thread_id", "MessageThreadID", "id"], "")), label: String(pick(topic, ["name", "Name"], "Топик")) };
-        }));
-        var topic = field("Топик", "assignment-topic", "", "select", { choices: topicChoices, help: "Если список пуст, группа может быть не форумной." });
-        form.appendChild(topic.wrap);
+        var topic = null;
+        if (group.isForum) {
+          var topicChoices = [{ value: "", label: "Создать новый топик" }].concat(topics.map(function (topicItem) {
+            return { value: String(pick(topicItem, ["message_thread_id", "MessageThreadID", "id"], "")), label: String(pick(topicItem, ["name", "Name"], "Топик")) };
+          }));
+          topic = field("Топик", "assignment-topic", "", "select", { choices: topicChoices, help: "Если топик не выбран, для канала будет создан новый." });
+          form.appendChild(topic.wrap);
+        }
         var save = button("Назначить", "primary");
         var assignmentActions = el("div", "actions");
         assignmentActions.appendChild(save);
@@ -542,9 +551,9 @@
           if (!selected.length) { showToast("Выберите хотя бы один канал.", "warning"); return; }
           save.disabled = true;
           Promise.all(selected.map(function (channelId) {
-            return mutation("/api/groups/" + encodeURIComponent(group.id) + "/channels", "POST", {
-              channel_id: channelId, topic_thread_id: topic.input.value || null
-            });
+            var payload = { channel_id: channelId };
+            if (group.isForum && topic && topic.input.value) payload.topic_thread_id = topic.input.value;
+            return mutation("/api/groups/" + encodeURIComponent(group.id) + "/channels", "POST", payload);
           })).then(function () {
             close(); showToast("Каналы назначены.", "success"); state.loadedAt.groups = 0; return loadGroups(true);
           }).catch(function (error) { showToast(apiErrorMessage(error), "error", true); }).finally(function () { save.disabled = false; });

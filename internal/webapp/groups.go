@@ -23,12 +23,31 @@ type GroupVerifier interface {
 	Verify(int64) (string, error)
 }
 
+type forumGroupVerifier interface {
+	VerifyGroup(int64) (string, bool, error)
+}
+
 // TopicLifecycle is the production boundary for forum topic mutations.
 // Implementations own the Telegram API call and the corresponding persisted
 // topic assignment, keeping WebApp mutations independent from bot internals.
 type TopicLifecycle interface {
 	CreateChannelTopic(context.Context, int64, int64) error
 	RemoveChannelTopic(context.Context, int64, int64) error
+}
+
+// Topic describes a selectable forum topic. MessageThreadID is always
+// positive; the WebApp never exposes the general topic as a placeholder ID.
+type Topic struct {
+	MessageThreadID int64  `json:"message_thread_id"`
+	Name            string `json:"name"`
+}
+
+// TopicCatalog provides the existing forum topics for a group. Telegram has
+// no Bot API method for listing topics, so production implementations may use
+// persisted assignments while tests or integrations can inject an
+// authoritative catalog.
+type TopicCatalog interface {
+	ListTopics(context.Context, int64) ([]Topic, error)
 }
 
 type permissiveGroupVerifier struct{}
@@ -43,32 +62,38 @@ type telegramGroupVerifier struct {
 }
 
 func (v telegramGroupVerifier) Verify(chatID int64) (string, error) {
+	title, _, err := v.VerifyGroup(chatID)
+	return title, err
+}
+
+func (v telegramGroupVerifier) VerifyGroup(chatID int64) (string, bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	endpoint := "https://api.telegram.org/bot" + v.token + "/getChat?chat_id=" + url.QueryEscape(strconv.FormatInt(chatID, 10))
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return "", errors.New("telegram group verification failed")
+		return "", false, errors.New("telegram group verification failed")
 	}
 	response, err := v.client.Do(request)
 	if err != nil {
-		return "", errors.New("telegram group verification failed")
+		return "", false, errors.New("telegram group verification failed")
 	}
 	defer response.Body.Close()
 	var payload struct {
 		OK          bool   `json:"ok"`
 		Description string `json:"description"`
 		Result      struct {
-			Title string `json:"title"`
+			Title   string `json:"title"`
+			IsForum bool   `json:"is_forum"`
 		} `json:"result"`
 	}
 	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil || !payload.OK {
-		return "", errors.New("telegram group verification failed")
+		return "", false, errors.New("telegram group verification failed")
 	}
 	if strings.TrimSpace(payload.Result.Title) == "" {
-		return strconv.FormatInt(chatID, 10), nil
+		return strconv.FormatInt(chatID, 10), payload.Result.IsForum, nil
 	}
-	return payload.Result.Title, nil
+	return payload.Result.Title, payload.Result.IsForum, nil
 }
 
 type GroupService struct {
@@ -76,6 +101,7 @@ type GroupService struct {
 	channels   dbChannelLookup
 	verifier   GroupVerifier
 	topics     TopicLifecycle
+	catalog    TopicCatalog
 }
 
 type dbGroupRepository interface {
@@ -94,13 +120,62 @@ type dbChannelLookup interface {
 }
 
 func NewGroupService(repository dbGroupRepository, channels dbChannelLookup) *GroupService {
-	return &GroupService{repository: repository, channels: channels, verifier: permissiveGroupVerifier{}}
+	service := &GroupService{repository: repository, channels: channels, verifier: permissiveGroupVerifier{}}
+	service.catalog = persistedTopicCatalog{repository: repository, channels: channels}
+	return service
 }
 
 func (s *GroupService) SetTopicLifecycle(lifecycle TopicLifecycle) {
 	if s != nil {
 		s.topics = lifecycle
 	}
+}
+
+// SetTopicCatalog replaces the forum topic discovery boundary.
+func (s *GroupService) SetTopicCatalog(catalog TopicCatalog) {
+	if s == nil {
+		return
+	}
+	if catalog == nil {
+		s.catalog = persistedTopicCatalog{repository: s.repository, channels: s.channels}
+		return
+	}
+	s.catalog = catalog
+}
+
+type persistedTopicCatalog struct {
+	repository dbGroupRepository
+	channels   dbChannelLookup
+}
+
+func (c persistedTopicCatalog) ListTopics(_ context.Context, groupID int64) ([]Topic, error) {
+	assignments, err := c.repository.GetChannelAssignments(groupID)
+	if err != nil {
+		return nil, err
+	}
+	topics := make([]Topic, 0, len(assignments))
+	seen := make(map[int64]struct{}, len(assignments))
+	for _, assignment := range assignments {
+		if assignment.TopicThreadID == nil || *assignment.TopicThreadID <= 0 {
+			continue
+		}
+		threadID := *assignment.TopicThreadID
+		if _, ok := seen[threadID]; ok {
+			continue
+		}
+		seen[threadID] = struct{}{}
+		name := fmt.Sprintf("Топик %d", threadID)
+		if channel, lookupErr := c.channels.GetByID(assignment.ChannelID); lookupErr == nil {
+			name = strings.TrimSpace(channel.Title)
+			if name == "" {
+				name = "@" + channel.Username
+			}
+		} else if !errors.Is(lookupErr, db.ErrNotFound) {
+			return nil, lookupErr
+		}
+		topics = append(topics, Topic{MessageThreadID: threadID, Name: name})
+	}
+	return topics, nil
 }
 
 type groupInput struct {
@@ -124,13 +199,22 @@ func (s *GroupService) Create(chatIDValue string) (*model.Group, error) {
 		return nil, err
 	}
 	title := chatIDValue
+	status := model.GroupStatusActive
 	if s.verifier != nil {
-		title, err = s.verifier.Verify(chatID)
+		if verifier, ok := s.verifier.(forumGroupVerifier); ok {
+			var forum bool
+			title, forum, err = verifier.VerifyGroup(chatID)
+			if err == nil && !forum {
+				status = model.GroupStatusIneligible
+			}
+		} else {
+			title, err = s.verifier.Verify(chatID)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("group verification failed: %w", err)
 		}
 	}
-	group := &model.Group{TelegramChatID: chatID, Title: strings.TrimSpace(title), Status: model.GroupStatusActive}
+	group := &model.Group{TelegramChatID: chatID, Title: strings.TrimSpace(title), Status: status}
 	id, err := s.repository.Insert(group)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
@@ -149,8 +233,13 @@ func groupJSON(group model.Group, assignments []map[string]any) map[string]any {
 		"chat_id":          strconv.FormatInt(group.TelegramChatID, 10),
 		"title":            group.Title,
 		"status":           group.Status,
+		"is_forum":         isForumGroup(group),
 		"assignments":      assignments,
 	}
+}
+
+func isForumGroup(group model.Group) bool {
+	return group.Status == "" || group.Status == model.GroupStatusActive
 }
 
 func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
@@ -167,7 +256,7 @@ func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
 		}
 		body := make([]map[string]any, 0, len(groups))
 		for _, group := range groups {
-			assignments, err := s.groupAssignments(group.ID)
+			assignments, err := s.groupAssignments(group.ID, isForumGroup(group))
 			if err != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Не удалось загрузить назначения каналов"})
 				return
@@ -206,7 +295,7 @@ func (s *Server) handleGroupByID(w http.ResponseWriter, r *http.Request) {
 			writeGroupError(w, err)
 			return
 		}
-		assignments, err := s.groupAssignments(id)
+		assignments, err := s.groupAssignments(id, isForumGroup(*group))
 		if err != nil {
 			writeGroupError(w, err)
 			return
@@ -230,7 +319,8 @@ func (s *Server) handleGroupChannels(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Некорректный ID группы"})
 		return
 	}
-	if _, err := s.groupService.repository.GetByID(groupID); err != nil {
+	group, err := s.groupService.repository.GetByID(groupID)
+	if err != nil {
 		writeGroupError(w, err)
 		return
 	}
@@ -269,17 +359,34 @@ func (s *Server) handleGroupChannels(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Некорректный topic_thread_id"})
 		return
 	}
+	forum := isForumGroup(*group)
+	if topic != nil && !forum {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "topic_thread_id доступен только для форумной группы"})
+		return
+	}
 	if topic != nil && *topic <= 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "topic_thread_id должен быть положительным"})
 		return
 	}
-	if err := s.groupService.repository.AssignChannel(groupID, channelID, topic); err != nil {
-		writeGroupError(w, err)
-		return
+	if topic != nil {
+		topics, err := s.groupService.listTopics(r.Context(), groupID)
+		if err != nil {
+			writeGroupError(w, err)
+			return
+		}
+		found := false
+		for _, candidate := range topics {
+			if candidate.MessageThreadID == *topic {
+				found = true
+				break
+			}
+		}
+		if !found {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "topic_thread_id не найден в каталоге группы"})
+			return
+		}
 	}
-	group, err := s.groupService.repository.GetByID(groupID)
-	if err != nil {
-		_ = s.groupService.repository.UnassignChannel(groupID, channelID)
+	if err := s.groupService.repository.AssignChannel(groupID, channelID, topic); err != nil {
 		writeGroupError(w, err)
 		return
 	}
@@ -287,7 +394,7 @@ func (s *Server) handleGroupChannels(w http.ResponseWriter, r *http.Request) {
 	// Telegram lifecycle. If creation fails, compensate the provisional row so
 	// the WebApp cannot leave a partial assignment behind.
 	if topic == nil && s.groupService.topics != nil &&
-		(group.Status == "" || group.Status == model.GroupStatusActive) {
+		forum {
 		if err := s.groupService.topics.CreateChannelTopic(r.Context(), groupID, channelID); err != nil {
 			if rollbackErr := s.groupService.repository.UnassignChannel(groupID, channelID); rollbackErr != nil {
 				err = fmt.Errorf("%w; rollback assignment: %v", err, rollbackErr)
@@ -349,16 +456,16 @@ func (s *Server) handleGroupChannelByID(w http.ResponseWriter, r *http.Request) 
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (s *Server) groupAssignments(groupID int64) ([]map[string]any, error) {
+func (s *Server) groupAssignments(groupID int64, forum bool) ([]map[string]any, error) {
 	assignments, err := s.groupService.repository.GetChannelAssignments(groupID)
 	if err != nil {
 		return nil, err
 	}
 	result := make([]map[string]any, 0, len(assignments))
 	for _, assignment := range assignments {
-		item := map[string]any{
-			"channel_id":      assignment.ChannelID,
-			"topic_thread_id": assignment.TopicThreadID,
+		item := map[string]any{"channel_id": assignment.ChannelID}
+		if forum && assignment.TopicThreadID != nil && *assignment.TopicThreadID > 0 {
+			item["topic_thread_id"] = *assignment.TopicThreadID
 		}
 		if channel, err := s.groupService.channels.GetByID(assignment.ChannelID); err == nil {
 			item["username"] = channel.Username
@@ -377,13 +484,52 @@ func (s *Server) handleGroupTopics(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if _, err := parsePositiveID(chi.URLParam(r, "id")); err != nil {
+	id, err := parsePositiveID(chi.URLParam(r, "id"))
+	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Некорректный ID группы"})
 		return
 	}
-	// Topic discovery is supplied by the Telegram bot update stream. The API
-	// returns a stable empty list until topic metadata is available.
-	writeJSON(w, http.StatusOK, []map[string]any{})
+	group, err := s.groupService.repository.GetByID(id)
+	if err != nil {
+		writeGroupError(w, err)
+		return
+	}
+	if !isForumGroup(*group) {
+		writeJSON(w, http.StatusOK, []Topic{})
+		return
+	}
+	topics, err := s.groupService.listTopics(r.Context(), id)
+	if err != nil {
+		writeGroupError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, topics)
+}
+
+func (s *GroupService) listTopics(ctx context.Context, groupID int64) ([]Topic, error) {
+	if s == nil || s.catalog == nil {
+		return []Topic{}, nil
+	}
+	topics, err := s.catalog.ListTopics(ctx, groupID)
+	if err != nil {
+		return nil, fmt.Errorf("list forum topics: %w", err)
+	}
+	result := make([]Topic, 0, len(topics))
+	seen := make(map[int64]struct{}, len(topics))
+	for _, topic := range topics {
+		if topic.MessageThreadID <= 0 {
+			continue
+		}
+		if _, ok := seen[topic.MessageThreadID]; ok {
+			continue
+		}
+		seen[topic.MessageThreadID] = struct{}{}
+		if strings.TrimSpace(topic.Name) == "" {
+			topic.Name = fmt.Sprintf("Топик %d", topic.MessageThreadID)
+		}
+		result = append(result, topic)
+	}
+	return result, nil
 }
 
 func (s *Server) handleAvailableGroups(w http.ResponseWriter, r *http.Request) {
@@ -416,7 +562,7 @@ func parseNullableInt(raw json.RawMessage) (*int64, error) {
 		value = string(raw)
 	}
 	id, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
-	if err != nil || id < 0 {
+	if err != nil || id <= 0 {
 		return nil, errors.New("invalid integer")
 	}
 	return &id, nil

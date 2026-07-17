@@ -58,7 +58,7 @@
     var input = el(type === "select" ? "select" : "input");
     input.id = name;
     input.name = name;
-    input.type = type === "select" ? undefined : (type || "text");
+    if (type !== "select") input.type = type || "text";
     if (type === "select") {
       (options.choices || []).forEach(function (choice) {
         var option = el("option", "", choice.label || choice);
@@ -92,6 +92,7 @@
   function normalizeChannel(item) {
     return {
       id: idOf(item),
+      version: pick(item, ["version", "Version"], 0),
       username: String(pick(item, ["username", "Username"], "")),
       title: String(pick(item, ["title", "Title"], "")),
       enabled: Boolean(pick(item, ["enabled", "Enabled"], true)),
@@ -120,6 +121,7 @@
   function normalizeProvider(item) {
     return {
       id: idOf(item),
+      version: pick(item, ["version", "Version"], 0),
       name: String(pick(item, ["name", "Name"], "")),
       baseUrl: String(pick(item, ["base_url", "BaseURL"], "")),
       model: String(pick(item, ["default_model", "DefaultModel", "model", "Model"], "")),
@@ -373,12 +375,15 @@
       var toggle = button("", "toggle" + (channel.enabled ? " on" : ""), function () {
         if (state.readonly) return;
         var before = channel.enabled;
+        var beforeVersion = channel.version;
         channel.enabled = !before;
         render();
-        mutation("/api/channels/" + encodeURIComponent(channel.id), "PATCH", { enabled: channel.enabled }).then(function () {
+        mutation("/api/channels/" + encodeURIComponent(channel.id), "PATCH", { enabled: channel.enabled, version: beforeVersion }).then(function (updated) {
+          if (updated) Object.assign(channel, normalizeChannel(updated));
           showToast(channel.enabled ? "Канал включён." : "Канал выключен.", "success");
         }).catch(function (error) {
           channel.enabled = before;
+          channel.version = beforeVersion;
           showToast("Не удалось обновить статус канала: " + apiErrorMessage(error), "error", true);
           render();
         });
@@ -528,7 +533,9 @@
         var topic = field("Топик", "assignment-topic", "", "select", { choices: topicChoices, help: "Если список пуст, группа может быть не форумной." });
         form.appendChild(topic.wrap);
         var save = button("Назначить", "primary");
-        form.appendChild(el("div", "actions")).lastChild.appendChild(save);
+        var assignmentActions = el("div", "actions");
+        assignmentActions.appendChild(save);
+        form.appendChild(assignmentActions);
         form.addEventListener("submit", function (event) {
           event.preventDefault();
           var selected = Array.from(list.querySelectorAll("input:checked")).map(function (item) { return item.value; });
@@ -568,7 +575,7 @@
       if (!provider.isDefault && provider.name !== "OpenRouter") {
         actions.appendChild(button("По умолчанию", "ghost small", function () {
           openConfirm("Сделать " + provider.name + " провайдером по умолчанию?", "Новые группы без собственного провайдера будут использовать его.", "Подтвердить", function () {
-            mutation("/api/providers/" + encodeURIComponent(provider.id), "PATCH", { name: provider.name, base_url: provider.baseUrl, api_key: "********", default_model: provider.model, is_default: true }).then(function () {
+            mutation("/api/providers/" + encodeURIComponent(provider.id), "PATCH", { name: provider.name, base_url: provider.baseUrl, api_key: "********", default_model: provider.model, is_default: true, version: provider.version }).then(function () {
               showToast("Провайдер выбран по умолчанию.", "success"); state.loadedAt.providers = 0; return loadProviders(true);
             }).catch(function (error) { showToast(apiErrorMessage(error), "error", true); });
           });
@@ -673,17 +680,29 @@
       return view.outer;
     }
     var form = el("form", "stack");
-    var choices = groups.map(function (group) { return { value: group.id, label: (group.title || "Без названия") + " (" + group.chatId + ")" }; });
+    var choices = [{ value: "", label: "Выберите группу" }].concat(groups.map(function (group) {
+      return { value: group.id, label: (group.title || "Без названия") + " (" + group.chatId + ")" };
+    }));
     var selected = field("Группа", "digest-group", "", "select", { choices: choices, required: true });
     form.appendChild(selected.wrap);
     var run = button("Запустить тестовый дайджест", "primary");
-    form.appendChild(el("div", "actions")).lastChild.appendChild(run);
+    var digestActions = el("div", "actions");
+    digestActions.appendChild(run);
+    form.appendChild(digestActions);
     var progress = el("div", "progress"); progress.hidden = !state.digestJob;
     appendDigestProgress(progress, state.digestJob || { stage: "idle" });
     form.appendChild(progress);
     form.addEventListener("submit", function (event) {
       event.preventDefault();
-      var group = groups.find(function (item) { return String(item.id) === String(selected.input.value); }) || groups[0];
+      if (!selected.input.value) {
+        setText(selected.error, "Выберите группу.");
+        selected.input.setAttribute("aria-invalid", "true");
+        return;
+      }
+      setText(selected.error, "");
+      selected.input.removeAttribute("aria-invalid");
+      var group = groups.find(function (item) { return String(item.id) === String(selected.input.value); });
+      if (!group) return;
       openConfirm("Запустить дайджест для группы " + (group.title || group.chatId) + "?", "Посты будут собраны, просуммированы и отправлены в группу.", "Запустить", function () {
         run.disabled = true; progress.hidden = false; state.digestJob = { stage: "parsing", detail: "Подготовка…" }; appendDigestProgress(progress, state.digestJob);
         mutation("/api/digest/test", "POST", { group_id: String(group.id) }).then(function (result) {

@@ -695,7 +695,11 @@ func TestOpenRouterOutageNotificationWaitingClaimRetriesAfterFailure(t *testing.
 		started: make(chan struct{}),
 		release: make(chan struct{}),
 	}
-	service := &Service{notifier: notifier}
+	waitObserved := make(chan struct{})
+	service := &Service{
+		notifier:                 notifier,
+		notificationWaitObserved: waitObserved,
+	}
 	err := &summarizer.ProviderError{
 		StatusCode: http.StatusBadGateway,
 		Provider:   "OpenRouter",
@@ -713,6 +717,7 @@ func TestOpenRouterOutageNotificationWaitingClaimRetriesAfterFailure(t *testing.
 		service.notifyAIFailureForWindow("window-waiting-retry", 202, err)
 	}()
 
+	<-waitObserved
 	close(notifier.release)
 	wg.Wait()
 
@@ -755,7 +760,11 @@ func TestOpenRouterOutageNotificationSerializesConcurrentAttempts(t *testing.T) 
 		started: make(chan struct{}),
 		release: make(chan struct{}),
 	}
-	service := &Service{notifier: notifier}
+	waitObserved := make(chan struct{})
+	service := &Service{
+		notifier:                 notifier,
+		notificationWaitObserved: waitObserved,
+	}
 	err := &summarizer.ProviderError{
 		StatusCode: http.StatusBadGateway,
 		Provider:   "OpenRouter",
@@ -772,8 +781,7 @@ func TestOpenRouterOutageNotificationSerializesConcurrentAttempts(t *testing.T) 
 		defer wg.Done()
 		service.notifyAIFailureForWindow("window-concurrent", 202, err)
 	}()
-	// Give the second caller time to observe the in-flight claim and skip.
-	time.Sleep(50 * time.Millisecond)
+	<-waitObserved
 	close(notifier.release)
 	wg.Wait()
 

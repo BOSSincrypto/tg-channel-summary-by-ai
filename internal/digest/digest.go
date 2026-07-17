@@ -41,6 +41,9 @@ type Service struct {
 	notificationMu      sync.Mutex
 	notificationKeys    map[string]notificationKeyState
 	notificationWaiters map[string]chan struct{}
+	// notificationWaitObserved is a deterministic test barrier for callers
+	// that observe an in-flight outage notification claim.
+	notificationWaitObserved chan struct{}
 }
 
 // notificationKeyState tracks delivery-aware outage notification deduplication.
@@ -379,7 +382,11 @@ func (s *Service) claimAIFailureNotification(windowID string, class aiFailureCla
 				waiter = make(chan struct{})
 				s.notificationWaiters[key] = waiter
 			}
+			waitObserved := s.notificationWaitObserved
 			s.notificationMu.Unlock()
+			if waitObserved != nil {
+				waitObserved <- struct{}{}
+			}
 			<-waiter
 		default:
 			s.notificationKeys[key] = notificationKeyClaimed

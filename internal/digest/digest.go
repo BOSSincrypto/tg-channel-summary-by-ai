@@ -39,8 +39,17 @@ type Service struct {
 	maxPostsPerChannel int
 
 	notificationMu   sync.Mutex
-	notificationKeys map[string]struct{}
+	notificationKeys map[string]notificationKeyState
 }
+
+// notificationKeyState tracks delivery-aware outage notification deduplication.
+// Keys are committed only after NotifyOwner succeeds so failed deliveries remain retryable.
+type notificationKeyState int
+
+const (
+	notificationKeyClaimed notificationKeyState = iota + 1
+	notificationKeyDelivered
+)
 
 const defaultMaxPostsPerChannel = 50
 
@@ -302,7 +311,7 @@ func (s *Service) notifyAIFallback(groupID int64) {
 		"⚠️ Провайдер AI для группы «%s» временно недоступен, поэтому использован OpenRouter. Проверьте провайдера и повторите следующий цикл.",
 		group,
 	)
-	s.notifyAI(groupID, message)
+	_ = s.notifyAI(groupID, message)
 }
 
 func (s *Service) notifyAIFailure(groupID int64, err error) {
@@ -311,7 +320,8 @@ func (s *Service) notifyAIFailure(groupID int64, err error) {
 
 func (s *Service) notifyAIFailureForWindow(windowID string, groupID int64, err error) {
 	class := classifyAIFailure(err)
-	if !s.shouldNotifyAIFailure(windowID, class) {
+	key, claimed := s.claimAIFailureNotification(windowID, class)
+	if !claimed {
 		return
 	}
 	group := s.groupTitle(groupID)
@@ -319,15 +329,25 @@ func (s *Service) notifyAIFailureForWindow(windowID string, groupID int64, err e
 	if strings.TrimSpace(windowID) != "" {
 		message = fmt.Sprintf("%s Окно дайджеста: %s.", message, windowID)
 	}
-	s.notifyAI(groupID, message)
+	if deliverErr := s.notifyAI(groupID, message); deliverErr != nil {
+		// Release the transient claim so a later group or retry can attempt delivery.
+		s.releaseAIFailureNotification(key)
+		return
+	}
+	s.commitAIFailureNotification(key)
 }
 
-func (s *Service) shouldNotifyAIFailure(windowID string, class aiFailureClass) bool {
+// claimAIFailureNotification atomically claims delivery for an outage window/category.
+// Non-outage failures are always claimed (no dedup). Concurrent outage attempts for
+// the same key serialize: only one claim is active, and delivered keys stay suppressed.
+func (s *Service) claimAIFailureNotification(windowID string, class aiFailureClass) (string, bool) {
 	if class != aiFailureOpenRouterOutage {
-		return true
+		// Non-outage classes are not window-deduplicated; use a unique key so
+		// commit/release are no-ops for those paths.
+		return "", true
 	}
 	if s == nil || s.notifier == nil {
-		return false
+		return "", false
 	}
 
 	windowID = strings.TrimSpace(windowID)
@@ -338,13 +358,42 @@ func (s *Service) shouldNotifyAIFailure(windowID string, class aiFailureClass) b
 	s.notificationMu.Lock()
 	defer s.notificationMu.Unlock()
 	if s.notificationKeys == nil {
-		s.notificationKeys = make(map[string]struct{})
+		s.notificationKeys = make(map[string]notificationKeyState)
 	}
-	if _, exists := s.notificationKeys[key]; exists {
-		return false
+	switch s.notificationKeys[key] {
+	case notificationKeyDelivered, notificationKeyClaimed:
+		return key, false
+	default:
+		s.notificationKeys[key] = notificationKeyClaimed
+		return key, true
 	}
-	s.notificationKeys[key] = struct{}{}
-	return true
+}
+
+func (s *Service) commitAIFailureNotification(key string) {
+	if s == nil || key == "" {
+		return
+	}
+	s.notificationMu.Lock()
+	defer s.notificationMu.Unlock()
+	if s.notificationKeys == nil {
+		s.notificationKeys = make(map[string]notificationKeyState)
+	}
+	s.notificationKeys[key] = notificationKeyDelivered
+}
+
+func (s *Service) releaseAIFailureNotification(key string) {
+	if s == nil || key == "" {
+		return
+	}
+	s.notificationMu.Lock()
+	defer s.notificationMu.Unlock()
+	if s.notificationKeys == nil {
+		return
+	}
+	// Only release a transient claim; never clear a successfully delivered key.
+	if s.notificationKeys[key] == notificationKeyClaimed {
+		delete(s.notificationKeys, key)
+	}
 }
 
 func firstWindowID(windowIDs []string, fallback string) string {
@@ -475,13 +524,15 @@ func (s *Service) groupTitle(groupID int64) string {
 	return fmt.Sprintf("группа %d", groupID)
 }
 
-func (s *Service) notifyAI(groupID int64, message string) {
+func (s *Service) notifyAI(groupID int64, message string) error {
 	if s == nil || s.notifier == nil {
-		return
+		return nil
 	}
 	if err := s.notifier.NotifyOwner(context.Background(), message); err != nil {
 		// The provider error remains the actionable digest failure; a transport
 		// failure must not replace it or cause a retry to invoke the provider.
 		log.Printf("failed to notify owner about AI digest group %d: %v", groupID, err)
+		return err
 	}
+	return nil
 }

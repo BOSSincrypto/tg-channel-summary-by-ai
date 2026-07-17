@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,11 +20,76 @@ import (
 )
 
 type recordingDigestNotifier struct {
+	mu       sync.Mutex
 	messages []string
 }
 
 func (n *recordingDigestNotifier) NotifyOwner(_ context.Context, text string) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	n.messages = append(n.messages, text)
+	return nil
+}
+
+func (n *recordingDigestNotifier) snapshot() []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	out := make([]string, len(n.messages))
+	copy(out, n.messages)
+	return out
+}
+
+// failingThenSucceedingNotifier fails the first N deliveries, then succeeds.
+type failingThenSucceedingNotifier struct {
+	mu           sync.Mutex
+	failuresLeft int
+	messages     []string
+	attempts     int
+}
+
+func (n *failingThenSucceedingNotifier) NotifyOwner(_ context.Context, text string) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.attempts++
+	if n.failuresLeft > 0 {
+		n.failuresLeft--
+		return errors.New("telegram sendMessage temporarily unavailable")
+	}
+	n.messages = append(n.messages, text)
+	return nil
+}
+
+// concurrentGateNotifier serializes concurrent NotifyOwner calls and records
+// how many deliveries overlapped. The first caller blocks until release is closed.
+type concurrentGateNotifier struct {
+	started  chan struct{}
+	release  chan struct{}
+	mu       sync.Mutex
+	messages []string
+	active   int32
+	maxActive int32
+	calls    int32
+}
+
+func (n *concurrentGateNotifier) NotifyOwner(_ context.Context, text string) error {
+	atomic.AddInt32(&n.calls, 1)
+	current := atomic.AddInt32(&n.active, 1)
+	for {
+		max := atomic.LoadInt32(&n.maxActive)
+		if current <= max || atomic.CompareAndSwapInt32(&n.maxActive, max, current) {
+			break
+		}
+	}
+	select {
+	case <-n.started:
+	default:
+		close(n.started)
+	}
+	<-n.release
+	n.mu.Lock()
+	n.messages = append(n.messages, text)
+	n.mu.Unlock()
+	atomic.AddInt32(&n.active, -1)
 	return nil
 }
 
@@ -517,20 +584,125 @@ func TestOpenRouterOutageNotificationUsesExplicitWindowIDs(t *testing.T) {
 	service.notifyAIFailureForWindow("scheduled-window-a", 202, err)
 	service.notifyAIFailureForWindow("scheduled-window-b", 303, err)
 
-	if len(notifier.messages) != 2 {
-		t.Fatalf("notifications = %d, want one per explicit window: %v", len(notifier.messages), notifier.messages)
+	messages := notifier.snapshot()
+	if len(messages) != 2 {
+		t.Fatalf("notifications = %d, want one per explicit window: %v", len(messages), messages)
 	}
 	for _, want := range []string{"scheduled-window-a", "scheduled-window-b"} {
 		found := false
-		for _, message := range notifier.messages {
+		for _, message := range messages {
 			if strings.Contains(message, want) {
 				found = true
 				break
 			}
 		}
 		if !found {
-			t.Fatalf("notifications = %v, want window ID %q", notifier.messages, want)
+			t.Fatalf("notifications = %v, want window ID %q", messages, want)
 		}
+	}
+}
+
+func TestOpenRouterOutageNotificationRetriesAfterDeliveryFailure(t *testing.T) {
+	notifier := &failingThenSucceedingNotifier{failuresLeft: 1}
+	service := &Service{notifier: notifier}
+	err := &summarizer.ProviderError{
+		StatusCode: http.StatusBadGateway,
+		Provider:   "OpenRouter",
+		Message:    "temporary outage",
+	}
+
+	service.notifyAIFailureForWindow("window-retry", 101, err)
+	if len(notifier.messages) != 0 {
+		t.Fatalf("messages after failed delivery = %v, want none", notifier.messages)
+	}
+	if notifier.attempts != 1 {
+		t.Fatalf("attempts after first failure = %d, want 1", notifier.attempts)
+	}
+
+	// A later affected group must be able to retry the same window/category.
+	service.notifyAIFailureForWindow("window-retry", 202, err)
+	if notifier.attempts != 2 {
+		t.Fatalf("attempts after retry = %d, want 2", notifier.attempts)
+	}
+	if len(notifier.messages) != 1 {
+		t.Fatalf("messages after successful retry = %v, want one delivered alert", notifier.messages)
+	}
+	if !strings.Contains(notifier.messages[0], "window-retry") ||
+		!strings.Contains(notifier.messages[0], "OpenRouter недоступен") {
+		t.Fatalf("delivered message = %q, want sanitized outage diagnostics with window ID", notifier.messages[0])
+	}
+
+	// Successful delivery permanently suppresses later duplicates.
+	service.notifyAIFailureForWindow("window-retry", 303, err)
+	if notifier.attempts != 2 {
+		t.Fatalf("attempts after success suppression = %d, want 2", notifier.attempts)
+	}
+	if len(notifier.messages) != 1 {
+		t.Fatalf("messages after success suppression = %v, want one", notifier.messages)
+	}
+}
+
+func TestOpenRouterOutageNotificationRepeatedFailuresRemainRetryable(t *testing.T) {
+	notifier := &failingThenSucceedingNotifier{failuresLeft: 3}
+	service := &Service{notifier: notifier}
+	err := &summarizer.ProviderError{
+		StatusCode: http.StatusServiceUnavailable,
+		Provider:   "OpenRouter",
+	}
+
+	for groupID := int64(1); groupID <= 3; groupID++ {
+		service.notifyAIFailureForWindow("window-repeat-fail", groupID, err)
+	}
+	if notifier.attempts != 3 {
+		t.Fatalf("attempts = %d, want three failed deliveries", notifier.attempts)
+	}
+	if len(notifier.messages) != 0 {
+		t.Fatalf("messages = %v, want none while deliveries keep failing", notifier.messages)
+	}
+
+	service.notifyAIFailureForWindow("window-repeat-fail", 4, err)
+	if notifier.attempts != 4 || len(notifier.messages) != 1 {
+		t.Fatalf("after recovery: attempts=%d messages=%v, want one success", notifier.attempts, notifier.messages)
+	}
+}
+
+func TestOpenRouterOutageNotificationSerializesConcurrentAttempts(t *testing.T) {
+	notifier := &concurrentGateNotifier{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	service := &Service{notifier: notifier}
+	err := &summarizer.ProviderError{
+		StatusCode: http.StatusBadGateway,
+		Provider:   "OpenRouter",
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		service.notifyAIFailureForWindow("window-concurrent", 101, err)
+	}()
+	<-notifier.started
+	go func() {
+		defer wg.Done()
+		service.notifyAIFailureForWindow("window-concurrent", 202, err)
+	}()
+	// Give the second caller time to observe the in-flight claim and skip.
+	time.Sleep(50 * time.Millisecond)
+	close(notifier.release)
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&notifier.calls); got != 1 {
+		t.Fatalf("NotifyOwner calls = %d, want 1 concurrent delivery", got)
+	}
+	if got := atomic.LoadInt32(&notifier.maxActive); got != 1 {
+		t.Fatalf("max concurrent deliveries = %d, want 1", got)
+	}
+	notifier.mu.Lock()
+	defer notifier.mu.Unlock()
+	if len(notifier.messages) != 1 {
+		t.Fatalf("messages = %v, want exactly one successful alert", notifier.messages)
 	}
 }
 

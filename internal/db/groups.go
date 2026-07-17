@@ -18,9 +18,9 @@ func (r *GroupRepository) Insert(g *model.Group) (int64, error) {
 	conn := r.db.Conn()
 
 	result, err := conn.Exec(
-		`INSERT INTO groups (telegram_chat_id, title)
-		 VALUES (?, ?)`,
-		g.TelegramChatID, g.Title,
+		`INSERT INTO groups (telegram_chat_id, title, status)
+		 VALUES (?, ?, ?)`,
+		g.TelegramChatID, g.Title, normalizedGroupStatus(g.Status),
 	)
 	if err != nil {
 		return 0, fmt.Errorf("insert group: %w", err)
@@ -46,9 +46,9 @@ func (r *GroupRepository) Insert(g *model.Group) (int64, error) {
 func (r *GroupRepository) GetByID(id int64) (*model.Group, error) {
 	g := &model.Group{}
 	err := r.db.Conn().QueryRow(
-		`SELECT id, telegram_chat_id, title, created_at
+		`SELECT id, telegram_chat_id, title, status, created_at
 		 FROM groups WHERE id = ?`, id,
-	).Scan(&g.ID, &g.TelegramChatID, &g.Title, &g.CreatedAt)
+	).Scan(&g.ID, &g.TelegramChatID, &g.Title, &g.Status, &g.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -62,9 +62,9 @@ func (r *GroupRepository) GetByID(id int64) (*model.Group, error) {
 func (r *GroupRepository) GetByChatID(chatID int64) (*model.Group, error) {
 	g := &model.Group{}
 	err := r.db.Conn().QueryRow(
-		`SELECT id, telegram_chat_id, title, created_at
+		`SELECT id, telegram_chat_id, title, status, created_at
 		 FROM groups WHERE telegram_chat_id = ?`, chatID,
-	).Scan(&g.ID, &g.TelegramChatID, &g.Title, &g.CreatedAt)
+	).Scan(&g.ID, &g.TelegramChatID, &g.Title, &g.Status, &g.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -77,7 +77,7 @@ func (r *GroupRepository) GetByChatID(chatID int64) (*model.Group, error) {
 // List returns all groups.
 func (r *GroupRepository) List() ([]model.Group, error) {
 	rows, err := r.db.Conn().Query(
-		`SELECT id, telegram_chat_id, title, created_at
+		`SELECT id, telegram_chat_id, title, status, created_at
 		 FROM groups ORDER BY title ASC`,
 	)
 	if err != nil {
@@ -88,7 +88,7 @@ func (r *GroupRepository) List() ([]model.Group, error) {
 	var groups []model.Group
 	for rows.Next() {
 		var g model.Group
-		if err := rows.Scan(&g.ID, &g.TelegramChatID, &g.Title, &g.CreatedAt); err != nil {
+		if err := rows.Scan(&g.ID, &g.TelegramChatID, &g.Title, &g.Status, &g.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan group: %w", err)
 		}
 		groups = append(groups, g)
@@ -99,11 +99,29 @@ func (r *GroupRepository) List() ([]model.Group, error) {
 // Update modifies an existing group's title.
 func (r *GroupRepository) Update(g *model.Group) error {
 	_, err := r.db.Conn().Exec(
-		`UPDATE groups SET title = ? WHERE id = ?`,
-		g.Title, g.ID,
+		`UPDATE groups SET title = ?, status = ? WHERE id = ?`,
+		g.Title, normalizedGroupStatus(g.Status), g.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("update group: %w", err)
+	}
+	return nil
+}
+
+// SetStatus changes a group's lifecycle status while preserving its settings
+// and channel assignments.
+func (r *GroupRepository) SetStatus(id int64, status string) error {
+	status = normalizedGroupStatus(status)
+	result, err := r.db.Conn().Exec(`UPDATE groups SET status = ? WHERE id = ?`, status, id)
+	if err != nil {
+		return fmt.Errorf("set group status: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("group status rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrNotFound
 	}
 	return nil
 }
@@ -130,6 +148,25 @@ func (r *GroupRepository) AssignChannel(groupID, channelID int64, topicThreadID 
 	)
 	if err != nil {
 		return fmt.Errorf("assign channel: %w", err)
+	}
+	return nil
+}
+
+// UpdateChannelTopic stores the Telegram message thread ID for an assignment.
+func (r *GroupRepository) UpdateChannelTopic(groupID, channelID int64, topicThreadID int64) error {
+	result, err := r.db.Conn().Exec(
+		`UPDATE group_channels SET topic_thread_id = ? WHERE group_id = ? AND channel_id = ?`,
+		topicThreadID, groupID, channelID,
+	)
+	if err != nil {
+		return fmt.Errorf("update channel topic: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("channel topic rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrNotFound
 	}
 	return nil
 }
@@ -318,4 +355,13 @@ func (r *GroupRepository) UpdateGroupSettings(gs *model.GroupSettings) error {
 		return fmt.Errorf("update group settings: %w", err)
 	}
 	return nil
+}
+
+func normalizedGroupStatus(status string) string {
+	switch status {
+	case model.GroupStatusInactive, model.GroupStatusIneligible:
+		return status
+	default:
+		return model.GroupStatusActive
+	}
 }

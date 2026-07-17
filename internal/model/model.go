@@ -21,8 +21,15 @@ type Group struct {
 	ID             int64
 	TelegramChatID int64
 	Title          string
+	Status         string
 	CreatedAt      string
 }
+
+const (
+	GroupStatusActive     = "active"
+	GroupStatusInactive   = "inactive"
+	GroupStatusIneligible = "ineligible"
+)
 
 // GroupChannel links a channel to a group with optional topic assignment.
 type GroupChannel struct {

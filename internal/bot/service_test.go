@@ -1,0 +1,322 @@
+package bot
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/boss/tg-channel-summary-by-ai/internal/db"
+	"github.com/boss/tg-channel-summary-by-ai/internal/model"
+	"github.com/mymmrac/telego"
+)
+
+type fakeTelegramClient struct {
+	me            *telego.User
+	updates       chan telego.Update
+	commands      *telego.SetMyCommandsParams
+	callbacks     []string
+	messages      []*telego.SendMessageParams
+	chats         map[int64]*telego.ChatFullInfo
+	topics        []*telego.CreateForumTopicParams
+	closedTopics  []*telego.CloseForumTopicParams
+	editedTopics  []*telego.EditForumTopicParams
+	deletedTopics []*telego.DeleteForumTopicParams
+	forumTopic    *telego.ForumTopic
+}
+
+func (f *fakeTelegramClient) GetMe(context.Context) (*telego.User, error) {
+	return f.me, nil
+}
+
+func (f *fakeTelegramClient) SetMyCommands(_ context.Context, params *telego.SetMyCommandsParams) error {
+	f.commands = params
+	return nil
+}
+
+func (f *fakeTelegramClient) AnswerCallbackQuery(_ context.Context, params *telego.AnswerCallbackQueryParams) error {
+	f.callbacks = append(f.callbacks, params.CallbackQueryID)
+	return nil
+}
+
+func (f *fakeTelegramClient) SendMessage(_ context.Context, params *telego.SendMessageParams) (*telego.Message, error) {
+	f.messages = append(f.messages, params)
+	return &telego.Message{MessageID: len(f.messages)}, nil
+}
+
+func (f *fakeTelegramClient) GetChat(_ context.Context, params *telego.GetChatParams) (*telego.ChatFullInfo, error) {
+	return f.chats[params.ChatID.ID], nil
+}
+
+func (f *fakeTelegramClient) CreateForumTopic(_ context.Context, params *telego.CreateForumTopicParams) (*telego.ForumTopic, error) {
+	f.topics = append(f.topics, params)
+	if f.forumTopic == nil {
+		f.forumTopic = &telego.ForumTopic{MessageThreadID: 77, Name: params.Name}
+	}
+	return f.forumTopic, nil
+}
+
+func (f *fakeTelegramClient) CloseForumTopic(_ context.Context, params *telego.CloseForumTopicParams) error {
+	f.closedTopics = append(f.closedTopics, params)
+	return nil
+}
+
+func (f *fakeTelegramClient) DeleteForumTopic(_ context.Context, params *telego.DeleteForumTopicParams) error {
+	f.deletedTopics = append(f.deletedTopics, params)
+	return nil
+}
+
+func (f *fakeTelegramClient) EditForumTopic(_ context.Context, params *telego.EditForumTopicParams) error {
+	f.editedTopics = append(f.editedTopics, params)
+	return nil
+}
+
+func (f *fakeTelegramClient) UpdatesViaLongPolling(context.Context, *telego.GetUpdatesParams, ...telego.LongPollingOption) (<-chan telego.Update, error) {
+	return f.updates, nil
+}
+
+type fakeOwnerNotifier struct {
+	messages []string
+}
+
+func (f *fakeOwnerNotifier) NotifyOwner(_ context.Context, message string) error {
+	f.messages = append(f.messages, message)
+	return nil
+}
+
+type fakeGroupLifecycle struct {
+	removed []int64
+}
+
+func (f *fakeGroupLifecycle) RemoveGroup(groupID int64) {
+	f.removed = append(f.removed, groupID)
+}
+
+func TestParseCommandNormalizesCaseAndBotSuffix(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		want string
+	}{
+		{name: "bare", text: "/start", want: "start"},
+		{name: "case", text: "/SeTtInGs", want: "settings"},
+		{name: "suffix", text: "/start@DigestBot parameter", want: "start"},
+		{name: "not command", text: "hello", want: ""},
+		{name: "wrong bot", text: "/start@otherbot", want: ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			command, argument, ok := ParseCommand(test.text, "digestbot")
+			if test.want == "" {
+				if ok {
+					t.Fatalf("ParseCommand(%q) matched command %q", test.text, command)
+				}
+				return
+			}
+			if !ok || command != test.want {
+				t.Fatalf("ParseCommand(%q) = %q, %v, want %q, true", test.text, command, ok, test.want)
+			}
+			if test.name == "suffix" && argument != "parameter" {
+				t.Fatalf("argument = %q, want parameter", argument)
+			}
+		})
+	}
+}
+
+func TestServiceStartVerifiesIdentityRegistersPrivateCommandsAndAnswersCallbacks(t *testing.T) {
+	api := &fakeTelegramClient{
+		me:      &telego.User{ID: 123, Username: "DigestBot"},
+		updates: make(chan telego.Update, 2),
+		chats:   map[int64]*telego.ChatFullInfo{},
+	}
+	api.updates <- telego.Update{CallbackQuery: &telego.CallbackQuery{ID: "callback-1", Data: "unknown"}}
+	close(api.updates)
+
+	service := newServiceForTest(api, api)
+	if err := service.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if api.commands == nil {
+		t.Fatal("expected setMyCommands call")
+	}
+	if api.commands.Scope == nil || api.commands.Scope.ScopeType() != "all_private_chats" {
+		t.Fatalf("command scope = %#v, want all_private_chats", api.commands.Scope)
+	}
+	if len(api.commands.Commands) != 2 {
+		t.Fatalf("registered commands = %#v, want start and settings", api.commands.Commands)
+	}
+	if api.commands.Commands[0].Command != "start" || api.commands.Commands[1].Command != "settings" {
+		t.Fatalf("registered commands = %#v", api.commands.Commands)
+	}
+	if len(api.callbacks) != 1 || api.callbacks[0] != "callback-1" {
+		t.Fatalf("callback answers = %#v, want callback-1", api.callbacks)
+	}
+}
+
+func TestServiceHandlesWebAppDataValidation(t *testing.T) {
+	api := &fakeTelegramClient{
+		me:      &telego.User{ID: 123, Username: "DigestBot"},
+		updates: make(chan telego.Update, 2),
+		chats:   map[int64]*telego.ChatFullInfo{},
+	}
+	api.updates <- telego.Update{Message: &telego.Message{
+		Chat:       telego.Chat{ID: 123},
+		From:       &telego.User{ID: 123},
+		WebAppData: &telego.WebAppData{Data: `{"digest_time":"bad"}`},
+	}}
+	api.updates <- telego.Update{Message: &telego.Message{
+		Chat:       telego.Chat{ID: 123},
+		From:       &telego.User{ID: 123},
+		WebAppData: &telego.WebAppData{Data: `{"digest_time":"21:00","channels":[]}`},
+	}}
+	close(api.updates)
+
+	service := newServiceForTest(api, api)
+	service.ownerID = "123"
+	if err := service.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if len(api.messages) != 2 {
+		t.Fatalf("messages = %d, want validation error and success", len(api.messages))
+	}
+	if !strings.Contains(api.messages[0].Text, "digest_time") {
+		t.Fatalf("validation message = %q", api.messages[0].Text)
+	}
+	if api.messages[1].Text != "Settings updated successfully." {
+		t.Fatalf("success message = %q", api.messages[1].Text)
+	}
+}
+
+func TestServiceHandlesMembershipLifecycleAndForumEligibility(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+
+	groupID, err := store.Groups.Insert(&model.Group{TelegramChatID: -1001, Title: "Forum"})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	api := &fakeTelegramClient{
+		me:      &telego.User{ID: 123, Username: "DigestBot"},
+		updates: make(chan telego.Update, 2),
+		chats: map[int64]*telego.ChatFullInfo{
+			-1002: {ID: -1002, Type: "supergroup", Title: "Regular", IsForum: false},
+		},
+	}
+	api.updates <- telego.Update{MyChatMember: &telego.ChatMemberUpdated{
+		Chat:          telego.Chat{ID: -1002, Title: "Regular", Type: "supergroup"},
+		NewChatMember: &telego.ChatMemberMember{Status: "member", User: telego.User{ID: 123}},
+	}}
+	api.updates <- telego.Update{MyChatMember: &telego.ChatMemberUpdated{
+		Chat:          telego.Chat{ID: -1001, Title: "Forum", Type: "supergroup"},
+		NewChatMember: &telego.ChatMemberLeft{Status: "left", User: telego.User{ID: 123}},
+	}}
+	close(api.updates)
+	notifier := &fakeOwnerNotifier{}
+	lifecycle := &fakeGroupLifecycle{}
+
+	service := newServiceForTest(api, api)
+	service.groups = store.Groups
+	service.notifier = notifier
+	service.lifecycle = lifecycle
+	if err := service.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	ineligible, err := store.Groups.GetByChatID(-1002)
+	if err != nil {
+		t.Fatalf("get ineligible group: %v", err)
+	}
+	if ineligible.Status != model.GroupStatusIneligible {
+		t.Fatalf("ineligible status = %q", ineligible.Status)
+	}
+	removed, err := store.Groups.GetByID(groupID)
+	if err != nil {
+		t.Fatalf("get removed group: %v", err)
+	}
+	if removed.Status != model.GroupStatusInactive {
+		t.Fatalf("removed status = %q", removed.Status)
+	}
+	if len(api.messages) != 1 || !strings.Contains(api.messages[0].Text, "forum") {
+		t.Fatalf("forum warning messages = %#v", api.messages)
+	}
+	if len(notifier.messages) != 1 || !strings.Contains(notifier.messages[0], "-1001") {
+		t.Fatalf("owner notifications = %#v", notifier.messages)
+	}
+	if len(lifecycle.removed) != 2 {
+		t.Fatalf("removed scheduler groups = %#v", lifecycle.removed)
+	}
+}
+
+func TestServiceTopicLifecyclePersistsThreadAndAvoidsDuplicates(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+	groupID, err := store.Groups.Insert(&model.Group{TelegramChatID: -1007, Title: "Forum"})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	channelID, err := store.Channels.Insert(&model.Channel{Username: "news", Title: "News", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	if err := store.Groups.AssignChannel(groupID, channelID, nil); err != nil {
+		t.Fatalf("assign channel: %v", err)
+	}
+	api := &fakeTelegramClient{
+		me:         &telego.User{ID: 123, Username: "DigestBot"},
+		chats:      map[int64]*telego.ChatFullInfo{},
+		forumTopic: &telego.ForumTopic{MessageThreadID: 77, Name: "News"},
+	}
+	service := newServiceForTest(api, api)
+	service.groups = store.Groups
+	service.channels = store.Channels
+
+	if err := service.CreateChannelTopic(context.Background(), groupID, channelID); err != nil {
+		t.Fatalf("create topic: %v", err)
+	}
+	if err := service.CreateChannelTopic(context.Background(), groupID, channelID); err != nil {
+		t.Fatalf("idempotent create topic: %v", err)
+	}
+	if len(api.topics) != 1 {
+		t.Fatalf("topic create calls = %d, want 1", len(api.topics))
+	}
+	assignment, err := store.Groups.GetChannelAssignments(groupID)
+	if err != nil {
+		t.Fatalf("get assignment: %v", err)
+	}
+	if assignment[0].TopicThreadID == nil || *assignment[0].TopicThreadID != 77 {
+		t.Fatalf("stored topic assignment = %#v", assignment)
+	}
+	if err := service.RenameChannelTopic(context.Background(), groupID, channelID, "Breaking News"); err != nil {
+		t.Fatalf("rename topic: %v", err)
+	}
+	if err := service.RemoveChannelTopic(context.Background(), groupID, channelID); err != nil {
+		t.Fatalf("remove topic: %v", err)
+	}
+	if len(api.editedTopics) != 1 || len(api.closedTopics) != 1 {
+		t.Fatalf("topic lifecycle calls: edited=%d closed=%d", len(api.editedTopics), len(api.closedTopics))
+	}
+	assignments, err := store.Groups.GetChannelAssignments(groupID)
+	if err != nil {
+		t.Fatalf("get assignments after removal: %v", err)
+	}
+	if len(assignments) != 0 {
+		t.Fatalf("assignments after removal = %#v, want none", assignments)
+	}
+}
+
+func newServiceForTest(api telegramClient, poller updatePoller) *Service {
+	return &Service{
+		api:    api,
+		poller: poller,
+		logger: testLogger{},
+	}
+}
+
+type testLogger struct{}
+
+func (testLogger) Printf(string, ...any) {}

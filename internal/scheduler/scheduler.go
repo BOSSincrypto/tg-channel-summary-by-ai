@@ -134,6 +134,9 @@ func (s *Scheduler) Start() error {
 	groupsBySpec := make(map[string]int)
 	specByGroup := make(map[int64]string, len(groups))
 	for _, group := range groups {
+		if group.Status != "" && group.Status != model.GroupStatusActive {
+			continue
+		}
 		settings, err := s.groups.GetGroupSettings(group.ID)
 		if err != nil {
 			return fmt.Errorf("start scheduler: load settings for group %d: %w", group.ID, err)
@@ -146,6 +149,9 @@ func (s *Scheduler) Start() error {
 		groupsBySpec[spec]++
 	}
 	for _, group := range groups {
+		if group.Status != "" && group.Status != model.GroupStatusActive {
+			continue
+		}
 		spec := specByGroup[group.ID]
 		groupID := group.ID
 		entryID, err := s.engine.AddFunc(spec, func() {
@@ -167,6 +173,22 @@ func (s *Scheduler) Start() error {
 	s.engine.Start()
 	s.started = true
 	return nil
+}
+
+// RemoveGroup cancels the scheduled digest job for a group that is no longer
+// eligible to receive messages. Its persisted configuration is untouched so a
+// later re-add can restore the previous assignments.
+func (s *Scheduler) RemoveGroup(groupID int64) {
+	s.mu.Lock()
+	jobID, ok := s.jobIDs[groupID]
+	if ok {
+		delete(s.jobIDs, groupID)
+	}
+	engine := s.engine
+	s.mu.Unlock()
+	if ok {
+		engine.Remove(jobID)
+	}
 }
 
 // RunGroup executes one group's production digest path. The digest service

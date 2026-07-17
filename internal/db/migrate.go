@@ -16,6 +16,9 @@ func runMigrations(conn *sql.DB) error {
 	if err := ensureChannelFetchErrorColumns(conn); err != nil {
 		return fmt.Errorf("migrate channel fetch error state: %w", err)
 	}
+	if err := ensureGroupStatusColumn(conn); err != nil {
+		return fmt.Errorf("migrate group status: %w", err)
+	}
 	return nil
 }
 
@@ -58,6 +61,36 @@ func ensureChannelFetchErrorColumns(conn *sql.DB) error {
 	return nil
 }
 
+func ensureGroupStatusColumn(conn *sql.DB) error {
+	rows, err := conn.Query("PRAGMA table_info(groups)")
+	if err != nil {
+		return fmt.Errorf("inspect groups table: %w", err)
+	}
+	defer rows.Close()
+
+	hasStatus := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return fmt.Errorf("scan groups column: %w", err)
+		}
+		if name == "status" {
+			hasStatus = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate groups columns: %w", err)
+	}
+	if !hasStatus {
+		if _, err := conn.Exec(`ALTER TABLE groups ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`); err != nil {
+			return fmt.Errorf("add groups status: %w", err)
+		}
+	}
+	return nil
+}
+
 // migrations is an ordered list of DDL statements that define the database schema.
 // They must be applied in order.
 var migrations = []string{
@@ -83,6 +116,7 @@ var migrations = []string{
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		telegram_chat_id INTEGER NOT NULL UNIQUE,
 		title TEXT DEFAULT '',
+		status TEXT NOT NULL DEFAULT 'active',
 		created_at TEXT DEFAULT (datetime('now'))
 	)`,
 

@@ -96,6 +96,24 @@ func main() {
 		log.Fatalf("failed to start scheduler: %v", err)
 	}
 
+	telegramBot, err := bot.NewWithConfig(
+		cfg.BotToken,
+		cfg.OwnerTelegramID,
+		"",
+		store.Groups,
+		store.Channels,
+		ownerNotifier,
+		sched,
+	)
+	if err != nil {
+		log.Fatalf("failed to configure Telegram bot: %v", err)
+	}
+	go func() {
+		if err := telegramBot.Start(); err != nil {
+			log.Printf("Telegram bot stopped: %v", err)
+		}
+	}()
+
 	// Wait for shutdown signal
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -106,7 +124,7 @@ func main() {
 	srv.Stop()
 	maintenanceSvc.Stop()
 	sched.Stop()
-	// TODO: bot.Stop()
+	telegramBot.Stop()
 
 	log.Println("Shutdown complete")
 }

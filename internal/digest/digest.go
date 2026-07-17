@@ -5,6 +5,7 @@ package digest
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"log"
@@ -23,6 +24,7 @@ import (
 type Digest struct {
 	GroupID   int64
 	PostCount int
+	WindowID  string
 	// TODO: formatted message parts
 }
 
@@ -36,12 +38,11 @@ type Service struct {
 	notifier           OwnerNotifier
 	maxPostsPerChannel int
 
-	notificationMu               sync.Mutex
-	openRouterOutageNotification time.Time
+	notificationMu   sync.Mutex
+	notificationKeys map[string]struct{}
 }
 
 const defaultMaxPostsPerChannel = 50
-const aiFailureNotificationWindow = time.Minute
 
 type aiFailureClass string
 
@@ -158,7 +159,20 @@ func (s *Service) FetchAndStore(groupID int64) (parser.ChannelBatchResult, error
 // configured number of unsummarized posts per channel for this group's digest
 // window. Storage happens before selection so runtime cursor advancement and
 // deduplication are applied, while unselected posts remain eligible later.
+//
+// Production scheduler code uses GenerateWithWindow to pass one explicit ID
+// to all groups in a logical scheduled window. Direct callers receive their
+// own logical window.
 func (s *Service) Generate(groupID int64) (*Digest, error) {
+	return s.generate(groupID, NewWindowID("scheduled"))
+}
+
+// GenerateWithWindow runs a scheduled digest with an explicit correlation ID.
+func (s *Service) GenerateWithWindow(groupID int64, windowID string) (*Digest, error) {
+	return s.generate(groupID, firstWindowID([]string{windowID}, NewWindowID("scheduled")))
+}
+
+func (s *Service) generate(groupID int64, windowID string) (*Digest, error) {
 	if _, err := s.FetchAndStore(groupID); err != nil {
 		return nil, err
 	}
@@ -167,10 +181,10 @@ func (s *Service) Generate(groupID int64) (*Digest, error) {
 		return nil, fmt.Errorf("list digest posts for group %d: %w", groupID, err)
 	}
 	posts = capPostsPerChannel(posts, s.maxPostsPerChannel)
-	if err := s.summarize(groupID, posts); err != nil {
+	if err := s.summarizeWithWindow(groupID, posts, windowID); err != nil {
 		return nil, err
 	}
-	return &Digest{GroupID: groupID, PostCount: len(posts)}, nil
+	return &Digest{GroupID: groupID, PostCount: len(posts), WindowID: windowID}, nil
 }
 
 func capPostsPerChannel(posts []model.Post, limit int) []model.Post {
@@ -191,17 +205,30 @@ func capPostsPerChannel(posts []model.Post, limit int) []model.Post {
 
 // GenerateManual is the manual trigger entry point. It deliberately shares
 // the same provider-resolving path as scheduled Generate calls.
+//
+// A manual invocation always creates a new window. Callers coordinating
+// several affected groups use GenerateManualWithWindow to share one ID.
 func (s *Service) GenerateManual(groupID int64) (*Digest, error) {
-	return s.Generate(groupID)
+	return s.generate(groupID, NewWindowID("manual"))
+}
+
+// GenerateManualWithWindow runs one group as part of an explicit manual
+// digest window shared by all groups in that invocation.
+func (s *Service) GenerateManualWithWindow(groupID int64, windowID string) (*Digest, error) {
+	return s.generate(groupID, firstWindowID([]string{windowID}, NewWindowID("manual")))
 }
 
 func (s *Service) summarize(groupID int64, posts []model.Post) error {
+	return s.summarizeWithWindow(groupID, posts, "")
+}
+
+func (s *Service) summarizeWithWindow(groupID int64, posts []model.Post, windowID string) error {
 	if s.aiConfigSource == nil || len(posts) == 0 {
 		return nil
 	}
 	if s.providerFactory == nil {
 		err := errors.New("provider factory is not configured")
-		s.notifyAIFailure(groupID, err)
+		s.notifyAIFailureForWindow(windowID, groupID, err)
 		return fmt.Errorf("summarize group %d: %w", groupID, err)
 	}
 
@@ -210,7 +237,7 @@ func (s *Service) summarize(groupID int64, posts []model.Post) error {
 		fallbackErr = providerErr
 	})
 	if err != nil {
-		s.notifyAIFailure(groupID, err)
+		s.notifyAIFailureForWindow(windowID, groupID, err)
 		return fmt.Errorf("summarize group %d: create provider: %w", groupID, err)
 	}
 	input := make([]summarizer.Post, 0, len(posts))
@@ -221,11 +248,11 @@ func (s *Service) summarize(groupID int64, posts []model.Post) error {
 	defer cancel()
 	summaries, err := provider.Summarize(summaryContext, input)
 	if err != nil {
-		s.notifyAIFailure(groupID, err)
+		s.notifyAIFailureForWindow(windowID, groupID, err)
 		return fmt.Errorf("summarize group %d: %w", groupID, err)
 	}
 	if err := validateSummaryBatch(posts, summaries); err != nil {
-		s.notifyAIFailure(groupID, err)
+		s.notifyAIFailureForWindow(windowID, groupID, err)
 		return fmt.Errorf("summarize group %d: %w", groupID, err)
 	}
 	if fallbackErr != nil {
@@ -279,16 +306,23 @@ func (s *Service) notifyAIFallback(groupID int64) {
 }
 
 func (s *Service) notifyAIFailure(groupID int64, err error) {
+	s.notifyAIFailureForWindow("", groupID, err)
+}
+
+func (s *Service) notifyAIFailureForWindow(windowID string, groupID int64, err error) {
 	class := classifyAIFailure(err)
-	if !s.shouldNotifyAIFailure(class) {
+	if !s.shouldNotifyAIFailure(windowID, class) {
 		return
 	}
 	group := s.groupTitle(groupID)
 	message := fmt.Sprintf("❌ %s", formatAIFailure(class, group, err))
+	if strings.TrimSpace(windowID) != "" {
+		message = fmt.Sprintf("%s Окно дайджеста: %s.", message, windowID)
+	}
 	s.notifyAI(groupID, message)
 }
 
-func (s *Service) shouldNotifyAIFailure(class aiFailureClass) bool {
+func (s *Service) shouldNotifyAIFailure(windowID string, class aiFailureClass) bool {
 	if class != aiFailureOpenRouterOutage {
 		return true
 	}
@@ -296,14 +330,43 @@ func (s *Service) shouldNotifyAIFailure(class aiFailureClass) bool {
 		return false
 	}
 
-	window := time.Now().UTC().Truncate(aiFailureNotificationWindow)
+	windowID = strings.TrimSpace(windowID)
+	if windowID == "" {
+		windowID = "legacy"
+	}
+	key := windowID + "|" + string(class)
 	s.notificationMu.Lock()
 	defer s.notificationMu.Unlock()
-	if s.openRouterOutageNotification.Equal(window) {
+	if s.notificationKeys == nil {
+		s.notificationKeys = make(map[string]struct{})
+	}
+	if _, exists := s.notificationKeys[key]; exists {
 		return false
 	}
-	s.openRouterOutageNotification = window
+	s.notificationKeys[key] = struct{}{}
 	return true
+}
+
+func firstWindowID(windowIDs []string, fallback string) string {
+	if len(windowIDs) > 0 && strings.TrimSpace(windowIDs[0]) != "" {
+		return strings.TrimSpace(windowIDs[0])
+	}
+	return fallback
+}
+
+// NewWindowID creates a unique correlation ID for one logical digest window.
+// It intentionally does not truncate or otherwise derive the ID from the
+// wall-clock minute, so adjacent windows cannot suppress one another.
+func NewWindowID(kind string) string {
+	kind = strings.TrimSpace(kind)
+	if kind == "" {
+		kind = "digest"
+	}
+	var random [12]byte
+	if _, err := rand.Read(random[:]); err == nil {
+		return fmt.Sprintf("%s-%x", kind, random)
+	}
+	return fmt.Sprintf("%s-%d", kind, time.Now().UTC().UnixNano())
 }
 
 func classifyAIFailure(err error) aiFailureClass {

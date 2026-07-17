@@ -21,6 +21,10 @@ type DigestRunner interface {
 	Generate(groupID int64) (*digest.Digest, error)
 }
 
+type windowedDigestRunner interface {
+	GenerateWithWindow(groupID int64, windowID string) (*digest.Digest, error)
+}
+
 // GroupSource loads groups and their scheduling configuration.
 type GroupSource interface {
 	List() ([]model.Group, error)
@@ -83,14 +87,21 @@ type Scheduler struct {
 	mu      sync.Mutex
 	started bool
 	jobIDs  map[int64]cron.EntryID
+	windows map[string]*scheduledWindow
+}
+
+type scheduledWindow struct {
+	id        string
+	remaining int
 }
 
 // New creates a scheduler that can register production digest jobs.
 func New(runner DigestRunner, options ...Option) *Scheduler {
 	s := &Scheduler{
-		runner: runner,
-		engine: newRealCronEngine(),
-		jobIDs: make(map[int64]cron.EntryID),
+		runner:  runner,
+		engine:  newRealCronEngine(),
+		jobIDs:  make(map[int64]cron.EntryID),
+		windows: make(map[string]*scheduledWindow),
 	}
 	for _, option := range options {
 		option(s)
@@ -120,26 +131,26 @@ func (s *Scheduler) Start() error {
 	}
 
 	registered := make(map[int64]cron.EntryID, len(groups))
+	groupsBySpec := make(map[string]int)
+	specByGroup := make(map[int64]string, len(groups))
 	for _, group := range groups {
 		settings, err := s.groups.GetGroupSettings(group.ID)
 		if err != nil {
-			for _, id := range registered {
-				s.engine.Remove(id)
-			}
 			return fmt.Errorf("start scheduler: load settings for group %d: %w", group.ID, err)
 		}
-
 		spec, err := scheduleSpec(settings)
 		if err != nil {
-			for _, id := range registered {
-				s.engine.Remove(id)
-			}
 			return fmt.Errorf("start scheduler: build schedule for group %d: %w", group.ID, err)
 		}
-
+		specByGroup[group.ID] = spec
+		groupsBySpec[spec]++
+	}
+	for _, group := range groups {
+		spec := specByGroup[group.ID]
 		groupID := group.ID
 		entryID, err := s.engine.AddFunc(spec, func() {
-			if _, runErr := s.RunGroup(groupID); runErr != nil {
+			windowID := s.nextScheduledWindow(spec, groupsBySpec[spec])
+			if _, runErr := s.RunGroupWithWindow(groupID, windowID); runErr != nil {
 				log.Printf("scheduler group %d failed: %v", groupID, runErr)
 			}
 		})
@@ -161,14 +172,41 @@ func (s *Scheduler) Start() error {
 // RunGroup executes one group's production digest path. The digest service
 // fetches and stores parser output before selecting digest candidates.
 func (s *Scheduler) RunGroup(groupID int64) (*digest.Digest, error) {
+	return s.RunGroupWithWindow(groupID, digest.NewWindowID("scheduled"))
+}
+
+// RunGroupWithWindow executes one group's digest path using the caller's
+// explicit logical window ID.
+func (s *Scheduler) RunGroupWithWindow(groupID int64, windowID string) (*digest.Digest, error) {
 	if s == nil || s.runner == nil {
 		return nil, errors.New("run group: digest runner is not configured")
 	}
-	result, err := s.runner.Generate(groupID)
+	var (
+		result *digest.Digest
+		err    error
+	)
+	if runner, ok := s.runner.(windowedDigestRunner); ok {
+		result, err = runner.GenerateWithWindow(groupID, windowID)
+	} else {
+		result, err = s.runner.Generate(groupID)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("run group %d: %w", groupID, err)
 	}
 	return result, nil
+}
+
+func (s *Scheduler) nextScheduledWindow(spec string, groupCount int) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	window := s.windows[spec]
+	if window == nil || window.remaining <= 0 {
+		window = &scheduledWindow{id: digest.NewWindowID("scheduled"), remaining: groupCount}
+		s.windows[spec] = window
+	}
+	windowID := window.id
+	window.remaining--
+	return windowID
 }
 
 // Stop removes all registered jobs and waits for the scheduler to stop.
@@ -181,6 +219,7 @@ func (s *Scheduler) Stop() {
 
 	jobIDs := s.jobIDs
 	s.jobIDs = make(map[int64]cron.EntryID)
+	s.windows = make(map[string]*scheduledWindow)
 	s.started = false
 	engine := s.engine
 	s.mu.Unlock()

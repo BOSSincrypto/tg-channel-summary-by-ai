@@ -434,17 +434,21 @@ func TestGenerateAndManualDigestEachNotifyOnePermanentAIFailure(t *testing.T) {
 	notifier := &recordingDigestNotifier{}
 	service := NewWithProcessorAndAIForTesting(database, processor, database.Groups, providerServer.Client(), notifier)
 
-	if _, err := service.Generate(groupID); err == nil {
+	if _, err := service.GenerateWithWindow(groupID, "scheduled-cycle-window"); err == nil {
 		t.Fatal("scheduled digest should fail cleanly on permanent AI error")
 	}
 	if len(notifier.messages) != 1 {
 		t.Fatalf("scheduled notifications = %d, want one: %v", len(notifier.messages), notifier.messages)
 	}
-	if _, err := service.GenerateManual(groupID); err == nil {
+	if _, err := service.GenerateManualWithWindow(groupID, "manual-cycle-window"); err == nil {
 		t.Fatal("manual digest should fail cleanly on permanent AI error")
 	}
 	if len(notifier.messages) != 2 {
 		t.Fatalf("scheduled and manual notifications = %d, want one per cycle: %v", len(notifier.messages), notifier.messages)
+	}
+	if !strings.Contains(notifier.messages[0], "scheduled-cycle-window") ||
+		!strings.Contains(notifier.messages[1], "manual-cycle-window") {
+		t.Fatalf("cycle notifications = %v, want scheduled and manual window IDs", notifier.messages)
 	}
 	posts, err := database.Posts.ListUnsummarized(groupID, 24)
 	if err != nil {
@@ -498,6 +502,76 @@ func TestOpenRouterOutageNotificationIsDeduplicatedAcrossGroups(t *testing.T) {
 		if !strings.Contains(notifier.messages[0], want) {
 			t.Fatalf("notification = %q, want outage context %q", notifier.messages[0], want)
 		}
+	}
+}
+
+func TestOpenRouterOutageNotificationUsesExplicitWindowIDs(t *testing.T) {
+	notifier := &recordingDigestNotifier{}
+	service := &Service{notifier: notifier}
+	err := &summarizer.ProviderError{
+		StatusCode: http.StatusBadGateway,
+		Provider:   "OpenRouter",
+	}
+
+	service.notifyAIFailureForWindow("scheduled-window-a", 101, err)
+	service.notifyAIFailureForWindow("scheduled-window-a", 202, err)
+	service.notifyAIFailureForWindow("scheduled-window-b", 303, err)
+
+	if len(notifier.messages) != 2 {
+		t.Fatalf("notifications = %d, want one per explicit window: %v", len(notifier.messages), notifier.messages)
+	}
+	for _, want := range []string{"scheduled-window-a", "scheduled-window-b"} {
+		found := false
+		for _, message := range notifier.messages {
+			if strings.Contains(message, want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("notifications = %v, want window ID %q", notifier.messages, want)
+		}
+	}
+}
+
+func TestGeneratePropagatesExplicitWindowIDAndManualCallsCreateDistinctWindows(t *testing.T) {
+	database, groupID, postID := newDigestFailureFixture(t)
+	notifier := &recordingDigestNotifier{}
+	service := NewWithProcessor(database, nil)
+	service.aiConfigSource = database.Groups
+	service.notifier = notifier
+	service.providerFactory = func(summarizer.GroupAIConfigSource, int64, *http.Client, func(error)) (summarizer.Provider, error) {
+		return failingDigestProvider{err: &summarizer.ProviderError{
+			StatusCode: http.StatusBadGateway,
+			Provider:   "OpenRouter",
+		}}, nil
+	}
+
+	err := service.summarizeWithWindow(groupID, []model.Post{{ID: postID}}, "scheduled-window-boundary")
+	if err == nil {
+		t.Fatal("expected scheduled outage")
+	}
+	if len(notifier.messages) != 1 || !strings.Contains(notifier.messages[0], "scheduled-window-boundary") {
+		t.Fatalf("scheduled notifications = %v, want explicit window ID", notifier.messages)
+	}
+
+	// The post remains unsummarized, so a manual retry is still eligible and
+	// receives a new logical window instead of inheriting the scheduled one.
+	if err := service.summarizeWithWindow(groupID, []model.Post{{ID: postID}}, NewWindowID("manual")); err == nil {
+		t.Fatal("expected manual outage")
+	}
+	if len(notifier.messages) != 2 {
+		t.Fatalf("notifications after manual retry = %v, want one per window", notifier.messages)
+	}
+	if strings.Contains(notifier.messages[1], "scheduled-window-boundary") {
+		t.Fatalf("manual notification reused scheduled window ID: %q", notifier.messages[1])
+	}
+	post, err := database.Posts.GetByID(postID)
+	if err != nil {
+		t.Fatalf("get post: %v", err)
+	}
+	if post.Summary != nil {
+		t.Fatalf("post summary = %v, want retry-eligible unsummarized post", post.Summary)
 	}
 }
 

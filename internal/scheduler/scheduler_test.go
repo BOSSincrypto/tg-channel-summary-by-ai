@@ -22,6 +22,25 @@ func (f *fakeRunner) Generate(groupID int64) (*digest.Digest, error) {
 	return &digest.Digest{GroupID: groupID}, nil
 }
 
+type windowRecordingRunner struct {
+	calls []struct {
+		groupID  int64
+		windowID string
+	}
+}
+
+func (r *windowRecordingRunner) Generate(groupID int64) (*digest.Digest, error) {
+	return &digest.Digest{GroupID: groupID}, nil
+}
+
+func (r *windowRecordingRunner) GenerateWithWindow(groupID int64, windowID string) (*digest.Digest, error) {
+	r.calls = append(r.calls, struct {
+		groupID  int64
+		windowID string
+	}{groupID: groupID, windowID: windowID})
+	return &digest.Digest{GroupID: groupID, WindowID: windowID}, nil
+}
+
 type recordingDigestRunner struct {
 	service  *digest.Service
 	groupIDs []int64
@@ -149,6 +168,41 @@ func TestSchedulerStartRegistersGroupJobsAndStopRemovesThem(t *testing.T) {
 	if len(engine.entries) != 0 {
 		t.Fatalf("remaining jobs = %d, want 0", len(engine.entries))
 	}
+}
+
+func TestSchedulerSharesWindowIDAcrossGroupsAndChangesItPerWindow(t *testing.T) {
+	engine := newFakeCronEngine()
+	runner := &windowRecordingRunner{}
+	source := fakeGroupSource{
+		groups: []model.Group{{ID: 1}, {ID: 2}},
+		settings: map[int64]*model.GroupSettings{
+			1: {GroupID: 1, DigestTime: "09:15", Timezone: "UTC"},
+			2: {GroupID: 2, DigestTime: "09:15", Timezone: "UTC"},
+		},
+	}
+
+	s := New(runner, WithGroupSource(source), withCronEngine(engine))
+	if err := s.Start(); err != nil {
+		t.Fatalf("start scheduler: %v", err)
+	}
+	engine.RunAll()
+	engine.RunAll()
+
+	if len(runner.calls) != 4 {
+		t.Fatalf("window calls = %#v, want four group runs", runner.calls)
+	}
+	firstWindow := runner.calls[0].windowID
+	secondWindow := runner.calls[2].windowID
+	if firstWindow == "" || secondWindow == "" || firstWindow == secondWindow {
+		t.Fatalf("window IDs = %q and %q, want distinct non-empty windows", firstWindow, secondWindow)
+	}
+	if runner.calls[1].windowID != firstWindow || runner.calls[3].windowID != secondWindow {
+		t.Fatalf("window IDs = %#v, want shared ID per scheduler cycle", runner.calls)
+	}
+	if runner.calls[0].groupID == runner.calls[1].groupID {
+		t.Fatalf("group calls = %#v, want both groups in each window", runner.calls)
+	}
+	s.Stop()
 }
 
 func TestSchedulerStartInvokesDigestPipelineThroughParserStorage(t *testing.T) {

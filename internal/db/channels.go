@@ -21,8 +21,8 @@ func (r *ChannelRepository) Insert(ch *model.Channel) (int64, error) {
 	}
 	ch.Username = normalizeChannelUsername(ch.Username)
 	result, err := r.db.Conn().Exec(
-		`INSERT INTO channels (username, title, enabled, last_post_id, fetch_error_kind, fetch_error_message, fetch_error_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO channels (username, title, enabled, last_post_id, fetch_error_kind, fetch_error_message, fetch_error_at, version)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
 		ch.Username, ch.Title, boolToInt(ch.Enabled), ch.LastPostID,
 		ch.FetchErrorKind, ch.FetchErrorMessage, nullableString(ch.FetchErrorAt),
 	)
@@ -45,9 +45,9 @@ func (r *ChannelRepository) GetByID(id int64) (*model.Channel, error) {
 	var enabled int
 	var fetchErrorAt sql.NullString
 	err := r.db.Conn().QueryRow(
-		`SELECT id, username, title, enabled, last_post_id, fetch_error_kind, fetch_error_message, fetch_error_at, created_at
+		`SELECT id, version, username, title, enabled, last_post_id, fetch_error_kind, fetch_error_message, fetch_error_at, created_at
 		 FROM channels WHERE id = ?`, id,
-	).Scan(&ch.ID, &ch.Username, &ch.Title, &enabled, &ch.LastPostID, &ch.FetchErrorKind, &ch.FetchErrorMessage, &fetchErrorAt, &ch.CreatedAt)
+	).Scan(&ch.ID, &ch.Version, &ch.Username, &ch.Title, &enabled, &ch.LastPostID, &ch.FetchErrorKind, &ch.FetchErrorMessage, &fetchErrorAt, &ch.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -66,9 +66,9 @@ func (r *ChannelRepository) GetByUsername(username string) (*model.Channel, erro
 	var enabled int
 	var fetchErrorAt sql.NullString
 	err := r.db.Conn().QueryRow(
-		`SELECT id, username, title, enabled, last_post_id, fetch_error_kind, fetch_error_message, fetch_error_at, created_at
+		`SELECT id, version, username, title, enabled, last_post_id, fetch_error_kind, fetch_error_message, fetch_error_at, created_at
 		 FROM channels WHERE username = ?`, username,
-	).Scan(&ch.ID, &ch.Username, &ch.Title, &enabled, &ch.LastPostID, &ch.FetchErrorKind, &ch.FetchErrorMessage, &fetchErrorAt, &ch.CreatedAt)
+	).Scan(&ch.ID, &ch.Version, &ch.Username, &ch.Title, &enabled, &ch.LastPostID, &ch.FetchErrorKind, &ch.FetchErrorMessage, &fetchErrorAt, &ch.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -83,7 +83,7 @@ func (r *ChannelRepository) GetByUsername(username string) (*model.Channel, erro
 // List returns all channels.
 func (r *ChannelRepository) List() ([]model.Channel, error) {
 	rows, err := r.db.Conn().Query(
-		`SELECT id, username, title, enabled, last_post_id, fetch_error_kind, fetch_error_message, fetch_error_at, created_at
+		`SELECT id, version, username, title, enabled, last_post_id, fetch_error_kind, fetch_error_message, fetch_error_at, created_at
 		 FROM channels ORDER BY username ASC`,
 	)
 	if err != nil {
@@ -96,7 +96,7 @@ func (r *ChannelRepository) List() ([]model.Channel, error) {
 		var ch model.Channel
 		var enabled int
 		var fetchErrorAt sql.NullString
-		if err := rows.Scan(&ch.ID, &ch.Username, &ch.Title, &enabled, &ch.LastPostID, &ch.FetchErrorKind, &ch.FetchErrorMessage, &fetchErrorAt, &ch.CreatedAt); err != nil {
+		if err := rows.Scan(&ch.ID, &ch.Version, &ch.Username, &ch.Title, &enabled, &ch.LastPostID, &ch.FetchErrorKind, &ch.FetchErrorMessage, &fetchErrorAt, &ch.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan channel: %w", err)
 		}
 		ch.Enabled = intToBool(enabled)
@@ -109,7 +109,7 @@ func (r *ChannelRepository) List() ([]model.Channel, error) {
 // ListEnabled returns only channels where enabled = 1.
 func (r *ChannelRepository) ListEnabled() ([]model.Channel, error) {
 	rows, err := r.db.Conn().Query(
-		`SELECT id, username, title, enabled, last_post_id, fetch_error_kind, fetch_error_message, fetch_error_at, created_at
+		`SELECT id, version, username, title, enabled, last_post_id, fetch_error_kind, fetch_error_message, fetch_error_at, created_at
 		 FROM channels WHERE enabled = 1 ORDER BY username ASC`,
 	)
 	if err != nil {
@@ -122,7 +122,7 @@ func (r *ChannelRepository) ListEnabled() ([]model.Channel, error) {
 		var ch model.Channel
 		var enabled int
 		var fetchErrorAt sql.NullString
-		if err := rows.Scan(&ch.ID, &ch.Username, &ch.Title, &enabled, &ch.LastPostID, &ch.FetchErrorKind, &ch.FetchErrorMessage, &fetchErrorAt, &ch.CreatedAt); err != nil {
+		if err := rows.Scan(&ch.ID, &ch.Version, &ch.Username, &ch.Title, &enabled, &ch.LastPostID, &ch.FetchErrorKind, &ch.FetchErrorMessage, &fetchErrorAt, &ch.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan channel: %w", err)
 		}
 		ch.Enabled = intToBool(enabled)
@@ -139,7 +139,7 @@ func (r *ChannelRepository) Update(ch *model.Channel) error {
 	}
 	ch.Username = normalizeChannelUsername(ch.Username)
 	result, err := r.db.Conn().Exec(
-		`UPDATE channels SET username = ?, title = ?, enabled = ?, last_post_id = ?
+		`UPDATE channels SET username = ?, title = ?, enabled = ?, last_post_id = ?, version = version + 1
 		 WHERE id = ?`,
 		ch.Username, ch.Title, boolToInt(ch.Enabled), ch.LastPostID, ch.ID,
 	)
@@ -154,6 +154,66 @@ func (r *ChannelRepository) Update(ch *model.Channel) error {
 		return fmt.Errorf("update channel rows affected: %w", err)
 	}
 	if affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateOptimistic updates a channel only when the caller still has the
+// supplied version. A zero version uses the current row for compatibility
+// with non-WebApp runtime callers.
+func (r *ChannelRepository) UpdateOptimistic(ch *model.Channel, version int64) error {
+	if ch == nil {
+		return fmt.Errorf("update channel: channel is required")
+	}
+	ch.Username = normalizeChannelUsername(ch.Username)
+	query := `UPDATE channels SET username = ?, title = ?, enabled = ?, last_post_id = ?, version = version + 1 WHERE id = ?`
+	args := []any{ch.Username, ch.Title, boolToInt(ch.Enabled), ch.LastPostID, ch.ID}
+	if version > 0 {
+		query += ` AND version = ?`
+		args = append(args, version)
+	}
+	result, err := r.db.Conn().Exec(query, args...)
+	if err != nil {
+		if isUniqueViolation(err) {
+			return fmt.Errorf("update channel %q: %w", ch.Username, ErrDuplicate)
+		}
+		return fmt.Errorf("update channel: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("update channel rows affected: %w", err)
+	}
+	if affected == 0 {
+		if version > 0 {
+			return fmt.Errorf("update channel: %w", ErrConflict)
+		}
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateEnabledOptimistic changes the enabled flag only for the expected
+// version and returns ErrConflict for a stale WebApp write.
+func (r *ChannelRepository) UpdateEnabledOptimistic(id int64, enabled bool, version int64) error {
+	query := `UPDATE channels SET enabled = ?, version = version + 1 WHERE id = ?`
+	args := []any{boolToInt(enabled), id}
+	if version > 0 {
+		query += ` AND version = ?`
+		args = append(args, version)
+	}
+	result, err := r.db.Conn().Exec(query, args...)
+	if err != nil {
+		return fmt.Errorf("update channel enabled: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("update channel enabled rows affected: %w", err)
+	}
+	if affected == 0 {
+		if version > 0 {
+			return ErrConflict
+		}
 		return ErrNotFound
 	}
 	return nil

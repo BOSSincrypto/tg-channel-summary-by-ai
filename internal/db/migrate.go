@@ -19,6 +19,9 @@ func runMigrations(conn *sql.DB) error {
 	if err := ensureGroupStatusColumn(conn); err != nil {
 		return fmt.Errorf("migrate group status: %w", err)
 	}
+	if err := ensureVersionColumns(conn); err != nil {
+		return fmt.Errorf("migrate optimistic locking versions: %w", err)
+	}
 	return nil
 }
 
@@ -91,6 +94,40 @@ func ensureGroupStatusColumn(conn *sql.DB) error {
 	return nil
 }
 
+func ensureVersionColumns(conn *sql.DB) error {
+	tables := []string{"channels", "groups", "ai_providers", "config"}
+	for _, table := range tables {
+		rows, err := conn.Query("PRAGMA table_info(" + table + ")")
+		if err != nil {
+			return fmt.Errorf("inspect %s table: %w", table, err)
+		}
+		hasVersion := false
+		for rows.Next() {
+			var cid, notNull, primaryKey int
+			var name, columnType string
+			var defaultValue sql.NullString
+			if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan %s column: %w", table, err)
+			}
+			if name == "version" {
+				hasVersion = true
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("iterate %s columns: %w", table, err)
+		}
+		rows.Close()
+		if !hasVersion {
+			if _, err := conn.Exec("ALTER TABLE " + table + " ADD COLUMN version INTEGER NOT NULL DEFAULT 1"); err != nil {
+				return fmt.Errorf("add %s.version: %w", table, err)
+			}
+		}
+	}
+	return nil
+}
+
 // migrations is an ordered list of DDL statements that define the database schema.
 // They must be applied in order.
 var migrations = []string{
@@ -99,6 +136,7 @@ var migrations = []string{
 	// --------------------------------------------------
 	`CREATE TABLE IF NOT EXISTS channels (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		version INTEGER NOT NULL DEFAULT 1,
 		username TEXT NOT NULL UNIQUE,
 		title TEXT DEFAULT '',
 		enabled INTEGER DEFAULT 1,
@@ -114,6 +152,7 @@ var migrations = []string{
 	// --------------------------------------------------
 	`CREATE TABLE IF NOT EXISTS groups (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		version INTEGER NOT NULL DEFAULT 1,
 		telegram_chat_id INTEGER NOT NULL UNIQUE,
 		title TEXT DEFAULT '',
 		status TEXT NOT NULL DEFAULT 'active',
@@ -135,6 +174,7 @@ var migrations = []string{
 	// --------------------------------------------------
 	`CREATE TABLE IF NOT EXISTS ai_providers (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		version INTEGER NOT NULL DEFAULT 1,
 		name TEXT NOT NULL UNIQUE,
 		base_url TEXT NOT NULL,
 		api_key TEXT NOT NULL,
@@ -196,7 +236,8 @@ var migrations = []string{
 	// --------------------------------------------------
 	`CREATE TABLE IF NOT EXISTS config (
 		key TEXT PRIMARY KEY,
-		value TEXT NOT NULL DEFAULT ''
+		value TEXT NOT NULL DEFAULT '',
+		version INTEGER NOT NULL DEFAULT 1
 	)`,
 
 	// --------------------------------------------------

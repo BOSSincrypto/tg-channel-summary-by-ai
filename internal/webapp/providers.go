@@ -28,6 +28,7 @@ type ProviderInput struct {
 	DefaultModel string `json:"default_model"`
 	Model        string `json:"model"`
 	IsDefault    bool   `json:"is_default"`
+	Version      int64  `json:"version"`
 }
 
 // ProviderService validates custom endpoints before storing providers.
@@ -44,6 +45,10 @@ type providerRepository interface {
 	List() ([]model.AIProvider, error)
 	Update(*model.AIProvider) error
 	Delete(int64) error
+}
+
+type optimisticProviderRepository interface {
+	UpdateOptimistic(*model.AIProvider, int64) error
 }
 
 // NewProviderService creates a provider service using a bounded test request.
@@ -120,7 +125,11 @@ func (s *ProviderService) Update(ctx context.Context, id int64, input ProviderIn
 		ID: id, Name: input.Name, BaseURL: input.BaseURL, APIKey: apiKey,
 		DefaultModel: modelValue, IsDefault: input.IsDefault,
 	}
-	if err := s.repository.Update(provider); err != nil {
+	if optimistic, ok := s.repository.(optimisticProviderRepository); ok {
+		if err := optimistic.UpdateOptimistic(provider, input.Version); err != nil {
+			return nil, fmt.Errorf("update provider: %w", err)
+		}
+	} else if err := s.repository.Update(provider); err != nil {
 		return nil, fmt.Errorf("update provider: %w", err)
 	}
 	return s.getMasked(id)
@@ -173,6 +182,20 @@ func (s *ProviderService) getMasked(id int64) (*model.AIProvider, error) {
 	return provider, nil
 }
 
+func providerJSON(provider model.AIProvider) map[string]any {
+	return map[string]any{
+		"id":            provider.ID,
+		"version":       provider.Version,
+		"name":          provider.Name,
+		"base_url":      provider.BaseURL,
+		"api_key":       maskAPIKey(provider.APIKey),
+		"has_key":       strings.TrimSpace(provider.APIKey) != "",
+		"default_model": provider.DefaultModel,
+		"is_default":    provider.IsDefault,
+		"created_at":    provider.CreatedAt,
+	}
+}
+
 func validateProviderInput(input ProviderInput) error {
 	if strings.TrimSpace(input.Name) == "" {
 		return errors.New("provider name is required")
@@ -221,6 +244,9 @@ func writeProviderError(w http.ResponseWriter, err error) {
 	} else if strings.Contains(lower, "default provider cannot be deleted") {
 		status = http.StatusConflict
 		message = "Нельзя удалить провайдера по умолчанию"
+	} else if errors.Is(err, db.ErrConflict) {
+		status = http.StatusConflict
+		message = "Данные были изменены в другой сессии. Обновите страницу."
 	} else if strings.Contains(lower, "unique constraint") || strings.Contains(lower, "already exists") {
 		status = http.StatusConflict
 	}
@@ -239,7 +265,11 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request) {
 			writeProviderError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, providers)
+		body := make([]map[string]any, 0, len(providers))
+		for _, provider := range providers {
+			body = append(body, providerJSON(provider))
+		}
+		writeJSON(w, http.StatusOK, body)
 	case http.MethodPost:
 		var input ProviderInput
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&input); err != nil {
@@ -251,7 +281,7 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request) {
 			writeProviderError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusCreated, provider)
+		writeJSON(w, http.StatusCreated, providerJSON(*provider))
 	default:
 		w.Header().Set("Allow", "GET, POST")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -275,7 +305,7 @@ func (s *Server) handleProviderByID(w http.ResponseWriter, r *http.Request) {
 			writeProviderError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, provider)
+		writeJSON(w, http.StatusOK, providerJSON(*provider))
 	case http.MethodPut, http.MethodPatch:
 		var input ProviderInput
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&input); err != nil {
@@ -287,7 +317,7 @@ func (s *Server) handleProviderByID(w http.ResponseWriter, r *http.Request) {
 			writeProviderError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, provider)
+		writeJSON(w, http.StatusOK, providerJSON(*provider))
 	case http.MethodDelete:
 		if err := s.providerService.Delete(id); err != nil {
 			writeProviderError(w, err)

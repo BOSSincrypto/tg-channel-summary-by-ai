@@ -12,6 +12,23 @@ type ConfigRepository struct {
 	db *DB
 }
 
+// GetWithVersion returns a config value and the version used for optimistic
+// locking. It is intended for WebApp settings writes.
+func (r *ConfigRepository) GetWithVersion(key string) (string, int64, error) {
+	var value string
+	var version int64
+	err := r.db.Conn().QueryRow(
+		`SELECT value, version FROM config WHERE key = ?`, key,
+	).Scan(&value, &version)
+	if err == sql.ErrNoRows {
+		return "", 0, ErrNotFound
+	}
+	if err != nil {
+		return "", 0, fmt.Errorf("get config with version: %w", err)
+	}
+	return value, version, nil
+}
+
 // Get returns the value for a given key. Returns ErrNotFound if the key does not exist.
 func (r *ConfigRepository) Get(key string) (string, error) {
 	var value string
@@ -31,13 +48,55 @@ func (r *ConfigRepository) Get(key string) (string, error) {
 func (r *ConfigRepository) Set(key, value string) error {
 	_, err := r.db.Conn().Exec(
 		`INSERT INTO config (key, value) VALUES (?, ?)
-		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value, version = config.version + 1`,
 		key, value,
 	)
 	if err != nil {
 		return fmt.Errorf("set config: %w", err)
 	}
 	return nil
+}
+
+// SetOptimistic updates a config key only when expectedVersion matches. A
+// missing key is inserted with version one when expectedVersion is zero.
+func (r *ConfigRepository) SetOptimistic(key, value string, expectedVersion int64) (int64, error) {
+	if expectedVersion <= 0 {
+		result, err := r.db.Conn().Exec(
+			`INSERT INTO config (key, value, version) VALUES (?, ?, 1)
+			 ON CONFLICT(key) DO NOTHING`, key, value,
+		)
+		if err != nil {
+			return 0, fmt.Errorf("insert config optimistically: %w", err)
+		}
+		if affected, err := result.RowsAffected(); err != nil {
+			return 0, fmt.Errorf("insert config rows affected: %w", err)
+		} else if affected > 0 {
+			return 1, nil
+		}
+		_, currentVersion, err := r.GetWithVersion(key)
+		if err != nil {
+			return 0, err
+		}
+		expectedVersion = currentVersion
+	}
+	result, err := r.db.Conn().Exec(
+		`UPDATE config SET value = ?, version = version + 1 WHERE key = ? AND version = ?`,
+		value, key, expectedVersion,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("update config optimistically: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("update config rows affected: %w", err)
+	}
+	if affected == 0 {
+		if _, _, err := r.GetWithVersion(key); err != nil {
+			return 0, err
+		}
+		return 0, ErrConflict
+	}
+	return expectedVersion + 1, nil
 }
 
 // GetAll returns all key-value pairs.

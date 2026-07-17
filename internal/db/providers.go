@@ -32,8 +32,8 @@ func (r *ProviderRepository) Insert(ap *model.AIProvider) (int64, error) {
 	}
 
 	result, err := conn.Exec(
-		`INSERT INTO ai_providers (name, base_url, api_key, default_model, is_default)
-		 VALUES (?, ?, ?, ?, ?)`,
+		`INSERT INTO ai_providers (name, base_url, api_key, default_model, is_default, version)
+		 VALUES (?, ?, ?, ?, ?, 1)`,
 		ap.Name, ap.BaseURL, encryptedKey, ap.DefaultModel, boolToInt(ap.IsDefault),
 	)
 	if err != nil {
@@ -51,9 +51,9 @@ func (r *ProviderRepository) GetByID(id int64) (*model.AIProvider, error) {
 	ap := &model.AIProvider{}
 	var isDefault int
 	err := r.db.Conn().QueryRow(
-		`SELECT id, name, base_url, api_key, default_model, is_default, created_at
+		`SELECT id, version, name, base_url, api_key, default_model, is_default, created_at
 		 FROM ai_providers WHERE id = ?`, id,
-	).Scan(&ap.ID, &ap.Name, &ap.BaseURL, &ap.APIKey, &ap.DefaultModel, &isDefault, &ap.CreatedAt)
+	).Scan(&ap.ID, &ap.Version, &ap.Name, &ap.BaseURL, &ap.APIKey, &ap.DefaultModel, &isDefault, &ap.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -72,9 +72,9 @@ func (r *ProviderRepository) GetByName(name string) (*model.AIProvider, error) {
 	ap := &model.AIProvider{}
 	var isDefault int
 	err := r.db.Conn().QueryRow(
-		`SELECT id, name, base_url, api_key, default_model, is_default, created_at
+		`SELECT id, version, name, base_url, api_key, default_model, is_default, created_at
 		 FROM ai_providers WHERE name = ?`, name,
-	).Scan(&ap.ID, &ap.Name, &ap.BaseURL, &ap.APIKey, &ap.DefaultModel, &isDefault, &ap.CreatedAt)
+	).Scan(&ap.ID, &ap.Version, &ap.Name, &ap.BaseURL, &ap.APIKey, &ap.DefaultModel, &isDefault, &ap.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -93,9 +93,9 @@ func (r *ProviderRepository) GetDefault() (*model.AIProvider, error) {
 	ap := &model.AIProvider{}
 	var isDefault int
 	err := r.db.Conn().QueryRow(
-		`SELECT id, name, base_url, api_key, default_model, is_default, created_at
+		`SELECT id, version, name, base_url, api_key, default_model, is_default, created_at
 		 FROM ai_providers WHERE is_default = 1 LIMIT 1`,
-	).Scan(&ap.ID, &ap.Name, &ap.BaseURL, &ap.APIKey, &ap.DefaultModel, &isDefault, &ap.CreatedAt)
+	).Scan(&ap.ID, &ap.Version, &ap.Name, &ap.BaseURL, &ap.APIKey, &ap.DefaultModel, &isDefault, &ap.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -112,7 +112,7 @@ func (r *ProviderRepository) GetDefault() (*model.AIProvider, error) {
 // List returns all AI providers.
 func (r *ProviderRepository) List() ([]model.AIProvider, error) {
 	rows, err := r.db.Conn().Query(
-		`SELECT id, name, base_url, api_key, default_model, is_default, created_at
+		`SELECT id, version, name, base_url, api_key, default_model, is_default, created_at
 		 FROM ai_providers ORDER BY name ASC`,
 	)
 	if err != nil {
@@ -124,7 +124,7 @@ func (r *ProviderRepository) List() ([]model.AIProvider, error) {
 	for rows.Next() {
 		var ap model.AIProvider
 		var isDefault int
-		if err := rows.Scan(&ap.ID, &ap.Name, &ap.BaseURL, &ap.APIKey, &ap.DefaultModel, &isDefault, &ap.CreatedAt); err != nil {
+		if err := rows.Scan(&ap.ID, &ap.Version, &ap.Name, &ap.BaseURL, &ap.APIKey, &ap.DefaultModel, &isDefault, &ap.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan provider: %w", err)
 		}
 		ap.APIKey, err = r.keyCipher.decrypt(ap.APIKey)
@@ -155,12 +155,61 @@ func (r *ProviderRepository) Update(ap *model.AIProvider) error {
 	}
 
 	_, err = conn.Exec(
-		`UPDATE ai_providers SET name = ?, base_url = ?, api_key = ?, default_model = ?, is_default = ?
+		`UPDATE ai_providers SET name = ?, base_url = ?, api_key = ?, default_model = ?, is_default = ?, version = version + 1
 		 WHERE id = ?`,
 		ap.Name, ap.BaseURL, encryptedKey, ap.DefaultModel, boolToInt(ap.IsDefault), ap.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("update provider: %w", err)
+	}
+	return nil
+}
+
+// UpdateOptimistic updates a provider only when the supplied version is still
+// current. It preserves the repository's encrypted-key and default semantics.
+func (r *ProviderRepository) UpdateOptimistic(ap *model.AIProvider, version int64) error {
+	if ap == nil {
+		return fmt.Errorf("update provider: provider is nil")
+	}
+	encryptedKey, err := r.keyCipher.encrypt(ap.APIKey)
+	if err != nil {
+		return fmt.Errorf("encrypt provider API key: %w", err)
+	}
+	conn := r.db.Conn()
+	if version > 0 {
+		var currentVersion int64
+		if err := conn.QueryRow(`SELECT version FROM ai_providers WHERE id = ?`, ap.ID).Scan(&currentVersion); err == sql.ErrNoRows {
+			return ErrNotFound
+		} else if err != nil {
+			return fmt.Errorf("check provider version: %w", err)
+		} else if currentVersion != version {
+			return ErrConflict
+		}
+	}
+	if ap.IsDefault {
+		if _, err := conn.Exec(`UPDATE ai_providers SET is_default = 0 WHERE id != ?`, ap.ID); err != nil {
+			return fmt.Errorf("clear existing defaults: %w", err)
+		}
+	}
+	query := `UPDATE ai_providers SET name = ?, base_url = ?, api_key = ?, default_model = ?, is_default = ?, version = version + 1 WHERE id = ?`
+	args := []any{ap.Name, ap.BaseURL, encryptedKey, ap.DefaultModel, boolToInt(ap.IsDefault), ap.ID}
+	if version > 0 {
+		query += ` AND version = ?`
+		args = append(args, version)
+	}
+	result, err := conn.Exec(query, args...)
+	if err != nil {
+		return fmt.Errorf("update provider: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("update provider rows affected: %w", err)
+	}
+	if affected == 0 {
+		if version > 0 {
+			return ErrConflict
+		}
+		return ErrNotFound
 	}
 	return nil
 }

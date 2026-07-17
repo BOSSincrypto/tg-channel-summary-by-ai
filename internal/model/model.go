@@ -6,6 +6,7 @@ package model
 // Channel represents a Telegram channel being monitored.
 type Channel struct {
 	ID                int64
+	Version           int64
 	Username          string // lowercase without @
 	Title             string
 	Enabled           bool
@@ -19,6 +20,7 @@ type Channel struct {
 // Group represents a Telegram group where digests are sent.
 type Group struct {
 	ID             int64
+	Version        int64
 	TelegramChatID int64
 	Title          string
 	Status         string
@@ -79,6 +81,7 @@ type DigestPost struct {
 // AIProvider represents an AI summarization provider configuration.
 type AIProvider struct {
 	ID           int64
+	Version      int64
 	Name         string
 	BaseURL      string
 	APIKey       string

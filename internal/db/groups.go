@@ -46,9 +46,9 @@ func (r *GroupRepository) Insert(g *model.Group) (int64, error) {
 func (r *GroupRepository) GetByID(id int64) (*model.Group, error) {
 	g := &model.Group{}
 	err := r.db.Conn().QueryRow(
-		`SELECT id, telegram_chat_id, title, status, created_at
+		`SELECT id, version, telegram_chat_id, title, status, created_at
 		 FROM groups WHERE id = ?`, id,
-	).Scan(&g.ID, &g.TelegramChatID, &g.Title, &g.Status, &g.CreatedAt)
+	).Scan(&g.ID, &g.Version, &g.TelegramChatID, &g.Title, &g.Status, &g.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -62,9 +62,9 @@ func (r *GroupRepository) GetByID(id int64) (*model.Group, error) {
 func (r *GroupRepository) GetByChatID(chatID int64) (*model.Group, error) {
 	g := &model.Group{}
 	err := r.db.Conn().QueryRow(
-		`SELECT id, telegram_chat_id, title, status, created_at
+		`SELECT id, version, telegram_chat_id, title, status, created_at
 		 FROM groups WHERE telegram_chat_id = ?`, chatID,
-	).Scan(&g.ID, &g.TelegramChatID, &g.Title, &g.Status, &g.CreatedAt)
+	).Scan(&g.ID, &g.Version, &g.TelegramChatID, &g.Title, &g.Status, &g.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -77,7 +77,7 @@ func (r *GroupRepository) GetByChatID(chatID int64) (*model.Group, error) {
 // List returns all groups.
 func (r *GroupRepository) List() ([]model.Group, error) {
 	rows, err := r.db.Conn().Query(
-		`SELECT id, telegram_chat_id, title, status, created_at
+		`SELECT id, version, telegram_chat_id, title, status, created_at
 		 FROM groups ORDER BY title ASC`,
 	)
 	if err != nil {
@@ -88,7 +88,7 @@ func (r *GroupRepository) List() ([]model.Group, error) {
 	var groups []model.Group
 	for rows.Next() {
 		var g model.Group
-		if err := rows.Scan(&g.ID, &g.TelegramChatID, &g.Title, &g.Status, &g.CreatedAt); err != nil {
+		if err := rows.Scan(&g.ID, &g.Version, &g.TelegramChatID, &g.Title, &g.Status, &g.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan group: %w", err)
 		}
 		groups = append(groups, g)
@@ -99,7 +99,7 @@ func (r *GroupRepository) List() ([]model.Group, error) {
 // Update modifies an existing group's title.
 func (r *GroupRepository) Update(g *model.Group) error {
 	_, err := r.db.Conn().Exec(
-		`UPDATE groups SET title = ?, status = ? WHERE id = ?`,
+		`UPDATE groups SET title = ?, status = ?, version = version + 1 WHERE id = ?`,
 		g.Title, normalizedGroupStatus(g.Status), g.ID,
 	)
 	if err != nil {
@@ -128,9 +128,16 @@ func (r *GroupRepository) SetStatus(id int64, status string) error {
 
 // Delete removes a group by ID. Cascade removes group_channels, group_settings.
 func (r *GroupRepository) Delete(id int64) error {
-	_, err := r.db.Conn().Exec(`DELETE FROM groups WHERE id = ?`, id)
+	result, err := r.db.Conn().Exec(`DELETE FROM groups WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("delete group: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("delete group rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrNotFound
 	}
 	return nil
 }
@@ -141,13 +148,20 @@ func (r *GroupRepository) AssignChannel(groupID, channelID int64, topicThreadID 
 	if topicThreadID != nil {
 		threadID = *topicThreadID
 	}
-	_, err := r.db.Conn().Exec(
+	result, err := r.db.Conn().Exec(
 		`INSERT OR IGNORE INTO group_channels (group_id, channel_id, topic_thread_id)
 		 VALUES (?, ?, ?)`,
 		groupID, channelID, threadID,
 	)
 	if err != nil {
 		return fmt.Errorf("assign channel: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("assign channel rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrDuplicate
 	}
 	return nil
 }
@@ -173,12 +187,19 @@ func (r *GroupRepository) UpdateChannelTopic(groupID, channelID int64, topicThre
 
 // UnassignChannel removes a channel from a group.
 func (r *GroupRepository) UnassignChannel(groupID, channelID int64) error {
-	_, err := r.db.Conn().Exec(
+	result, err := r.db.Conn().Exec(
 		`DELETE FROM group_channels WHERE group_id = ? AND channel_id = ?`,
 		groupID, channelID,
 	)
 	if err != nil {
 		return fmt.Errorf("unassign channel: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("unassign channel rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrNotFound
 	}
 	return nil
 }
@@ -214,7 +235,7 @@ func (r *GroupRepository) GetChannelAssignments(groupID int64) ([]model.GroupCha
 // GetChannelsForGroup returns full channel objects assigned to a group.
 func (r *GroupRepository) GetChannelsForGroup(groupID int64) ([]model.Channel, error) {
 	rows, err := r.db.Conn().Query(
-		`SELECT c.id, c.username, c.title, c.enabled, c.last_post_id, c.fetch_error_kind, c.fetch_error_message, c.fetch_error_at, c.created_at
+		`SELECT c.id, c.version, c.username, c.title, c.enabled, c.last_post_id, c.fetch_error_kind, c.fetch_error_message, c.fetch_error_at, c.created_at
 		 FROM channels c
 		 INNER JOIN group_channels gc ON c.id = gc.channel_id
 		 WHERE gc.group_id = ? AND c.enabled = 1
@@ -231,7 +252,7 @@ func (r *GroupRepository) GetChannelsForGroup(groupID int64) ([]model.Channel, e
 		var ch model.Channel
 		var enabled int
 		var fetchErrorAt sql.NullString
-		if err := rows.Scan(&ch.ID, &ch.Username, &ch.Title, &enabled, &ch.LastPostID, &ch.FetchErrorKind, &ch.FetchErrorMessage, &fetchErrorAt, &ch.CreatedAt); err != nil {
+		if err := rows.Scan(&ch.ID, &ch.Version, &ch.Username, &ch.Title, &enabled, &ch.LastPostID, &ch.FetchErrorKind, &ch.FetchErrorMessage, &fetchErrorAt, &ch.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan channel: %w", err)
 		}
 		ch.Enabled = intToBool(enabled)

@@ -12,6 +12,9 @@ var (
 
 	// ErrDuplicate is returned when an INSERT violates a UNIQUE constraint.
 	ErrDuplicate = errors.New("duplicate entry")
+
+	// ErrConflict is returned when an optimistic-lock version is stale.
+	ErrConflict = errors.New("optimistic lock conflict")
 )
 
 // boolToInt converts a bool to an integer (0 or 1) for SQLite storage.

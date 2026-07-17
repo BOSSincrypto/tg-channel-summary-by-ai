@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
+	"github.com/boss/tg-channel-summary-by-ai/internal/parser"
 	staticwebapp "github.com/boss/tg-channel-summary-by-ai/webapp"
 	"github.com/go-chi/chi/v5"
 )
@@ -19,6 +20,11 @@ type Server struct {
 	apiRouter       chi.Router
 	srv             *http.Server
 	providerService *ProviderService
+	database        *db.DB
+	channelService  *ChannelService
+	groupService    *GroupService
+	digestRunner    DigestRunner
+	digestJobs      *digestJobStore
 }
 
 // New creates a new HTTP Server with configured routes.
@@ -26,7 +32,8 @@ func New() *Server {
 	r := chi.NewRouter()
 
 	s := &Server{
-		router: r,
+		router:     r,
+		digestJobs: newDigestJobStore(),
 	}
 
 	r.Get("/health", s.handleHealth)
@@ -66,6 +73,7 @@ func NewWithProvidersForTesting(store *db.DB, timeout time.Duration, client *htt
 
 func newWithProviders(store *db.DB, timeout time.Duration, client *http.Client, auth *WebAppAuth, allowPrivateHosts ...bool) *Server {
 	s := New()
+	s.database = store
 	service := NewProviderService(store.Providers, client)
 	if len(allowPrivateHosts) > 0 && allowPrivateHosts[0] {
 		service.allowPrivateHosts = true
@@ -74,6 +82,11 @@ func newWithProviders(store *db.DB, timeout time.Duration, client *http.Client, 
 		service.validationTimeout = timeout
 	}
 	s.providerService = service
+	s.channelService = NewChannelService(store.Channels, parserChannelVerifier{parser: parser.New()})
+	s.groupService = NewGroupService(store.Groups, store.Channels)
+	if auth != nil {
+		s.groupService.verifier = telegramGroupVerifier{token: auth.botToken, client: service.httpClient}
+	}
 	providersHandler := http.Handler(http.HandlerFunc(s.handleProviders))
 	providerByIDHandler := http.Handler(http.HandlerFunc(s.handleProviderByID))
 	s.apiRouter = chi.NewRouter()
@@ -82,8 +95,40 @@ func newWithProviders(store *db.DB, timeout time.Duration, client *http.Client, 
 	}
 	s.apiRouter.Handle("/providers", providersHandler)
 	s.apiRouter.Handle("/providers/{id}", providerByIDHandler)
+	s.apiRouter.HandleFunc("/channels", s.handleChannels)
+	s.apiRouter.HandleFunc("/channels/{id}", s.handleChannelByID)
+	s.apiRouter.HandleFunc("/groups", s.handleGroups)
+	s.apiRouter.HandleFunc("/groups/{id}", s.handleGroupByID)
+	s.apiRouter.HandleFunc("/groups/{id}/channels", s.handleGroupChannels)
+	s.apiRouter.HandleFunc("/groups/{id}/channels/{channelID}", s.handleGroupChannelByID)
+	s.apiRouter.HandleFunc("/groups/{id}/topics", s.handleGroupTopics)
+	s.apiRouter.HandleFunc("/groups/available", s.handleAvailableGroups)
+	s.apiRouter.HandleFunc("/settings", s.handleSettings)
+	s.apiRouter.HandleFunc("/digest/test", s.handleDigestTest)
+	s.apiRouter.HandleFunc("/digest/status", s.handleDigestStatus)
 	s.router.Mount("/api", s.apiRouter)
 	return s
+}
+
+// SetDigestRunner connects the manual WebApp action to the production digest
+// service without making the HTTP package depend on scheduler internals.
+func (s *Server) SetDigestRunner(runner DigestRunner) {
+	s.digestRunner = runner
+}
+
+// SetChannelVerifier replaces the t.me/s verifier, primarily for deterministic
+// integration tests.
+func (s *Server) SetChannelVerifier(verifier ChannelVerifier) {
+	if s.channelService != nil {
+		s.channelService.verifier = verifier
+	}
+}
+
+// SetGroupVerifier replaces the Telegram group membership verifier.
+func (s *Server) SetGroupVerifier(verifier GroupVerifier) {
+	if s.groupService != nil {
+		s.groupService.verifier = verifier
+	}
 }
 
 // Handler returns the http.Handler for the server, useful for testing
@@ -115,4 +160,12 @@ func (s *Server) Stop() {
 	if s.srv != nil {
 		s.srv.Close()
 	}
+}
+
+func decodeJSON(r *http.Request, w http.ResponseWriter, value any) error {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(value); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Некорректный JSON"})
+		return err
+	}
+	return nil
 }

@@ -4,6 +4,7 @@
 package webapp
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"time"
@@ -121,6 +122,14 @@ func (s *Server) SetDigestRunner(runner DigestRunner) {
 func (s *Server) SetChannelVerifier(verifier ChannelVerifier) {
 	if s.channelService != nil {
 		s.channelService.verifier = verifier
+	}
+}
+
+// SetChannelVerificationRetry configures the bounded t.me/s verification
+// retry policy. The sleeper is injectable for deterministic tests.
+func (s *Server) SetChannelVerificationRetry(maxRetries int, sleeper func(context.Context, time.Duration) error) {
+	if s.channelService != nil {
+		s.channelService.SetVerificationRetry(maxRetries, sleeper)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
@@ -22,6 +23,32 @@ func (f fakeChannelVerifier) Verify(context.Context, string) (string, error) {
 		return "", f.err
 	}
 	return "Verified title", nil
+}
+
+type sequenceChannelVerifier struct {
+	results []error
+	calls   int
+}
+
+func (f *sequenceChannelVerifier) Verify(context.Context, string) (string, error) {
+	f.calls++
+	index := f.calls - 1
+	if index >= len(f.results) {
+		index = len(f.results) - 1
+	}
+	if f.results[index] != nil {
+		return "", f.results[index]
+	}
+	return "Recovered title", nil
+}
+
+type recordingRetrySleeper struct {
+	delays []time.Duration
+}
+
+func (s *recordingRetrySleeper) Sleep(_ context.Context, delay time.Duration) error {
+	s.delays = append(s.delays, delay)
+	return nil
 }
 
 func newBackendTestServer(t *testing.T) (*Server, *db.DB) {
@@ -71,6 +98,115 @@ func TestChannelsAPIValidatesNormalizesAndRejectsDuplicates(t *testing.T) {
 	duplicate := doJSON(t, server.Handler(), http.MethodPost, "/api/channels", `{"username":"@DUROV_"}`)
 	if duplicate.Code != http.StatusConflict || !strings.Contains(duplicate.Body.String(), "Канал уже добавлен") {
 		t.Fatalf("duplicate = %d %s", duplicate.Code, duplicate.Body.String())
+	}
+}
+
+func TestChannelCreateRetriesTransientVerificationAndPersistsOnce(t *testing.T) {
+	server, store := newBackendTestServer(t)
+	verifier := &sequenceChannelVerifier{results: []error{
+		errors.New("fetch t.me/s/retry_: temporary transport failure"),
+		errors.New("fetch t.me/s/retry_: HTTP 503 Service Unavailable"),
+		nil,
+	}}
+	sleeper := &recordingRetrySleeper{}
+	server.SetChannelVerifier(verifier)
+	server.SetChannelVerificationRetry(3, sleeper.Sleep)
+
+	response := doJSON(t, server.Handler(), http.MethodPost, "/api/channels", `{"username":"retry_"}`)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("recovered create status = %d, body=%s", response.Code, response.Body.String())
+	}
+	if verifier.calls != 3 || len(sleeper.delays) != 2 {
+		t.Fatalf("verification calls=%d sleeps=%v, want three calls and two sleeps", verifier.calls, sleeper.delays)
+	}
+	var count int
+	if err := store.Conn().QueryRow(`SELECT COUNT(*) FROM channels WHERE username = 'retry_'`).Scan(&count); err != nil {
+		t.Fatalf("count recovered channels: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("recovered channel count = %d, want 1", count)
+	}
+}
+
+func TestChannelCreateExhaustedVerificationRetriesDoesNotPersist(t *testing.T) {
+	server, store := newBackendTestServer(t)
+	verifier := &sequenceChannelVerifier{results: []error{
+		errors.New("fetch t.me/s/exhaust_: temporary transport failure"),
+		errors.New("fetch t.me/s/exhaust_: HTTP 503 Service Unavailable"),
+		errors.New("fetch t.me/s/exhaust_: temporary transport failure"),
+	}}
+	sleeper := &recordingRetrySleeper{}
+	server.SetChannelVerifier(verifier)
+	server.SetChannelVerificationRetry(3, sleeper.Sleep)
+
+	response := doJSON(t, server.Handler(), http.MethodPost, "/api/channels", `{"username":"exhaust_"}`)
+	if response.Code != http.StatusBadGateway && response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("exhausted create status = %d, body=%s", response.Code, response.Body.String())
+	}
+	if verifier.calls != 3 || len(sleeper.delays) != 2 {
+		t.Fatalf("verification calls=%d sleeps=%v, want three calls and two sleeps", verifier.calls, sleeper.delays)
+	}
+	var count int
+	if err := store.Conn().QueryRow(`SELECT COUNT(*) FROM channels WHERE username = 'exhaust_'`).Scan(&count); err != nil {
+		t.Fatalf("count exhausted channels: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("exhausted channel count = %d, want 0", count)
+	}
+}
+
+func TestChannelMutationsRequireCurrentPositiveVersion(t *testing.T) {
+	server, store := newBackendTestServer(t)
+	id, err := store.Channels.Insert(&model.Channel{Username: "locked_", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	before, err := store.Channels.GetByID(id)
+	if err != nil {
+		t.Fatalf("load channel: %v", err)
+	}
+
+	for _, body := range []string{`{"enabled":false}`, `{"enabled":false,"version":0}`} {
+		response := doJSON(t, server.Handler(), http.MethodPatch, "/api/channels/"+jsonNumber(id), body)
+		if response.Code != http.StatusConflict {
+			t.Fatalf("invalid version status = %d, body=%s", response.Code, response.Body.String())
+		}
+	}
+	malformed := doJSON(t, server.Handler(), http.MethodPatch, "/api/channels/"+jsonNumber(id), `{"enabled":false,"version":"1"}`)
+	if malformed.Code != http.StatusBadRequest {
+		t.Fatalf("malformed version status = %d, body=%s", malformed.Code, malformed.Body.String())
+	}
+	stale := doJSON(t, server.Handler(), http.MethodPatch, "/api/channels/"+jsonNumber(id), `{"enabled":false,"version":99}`)
+	if stale.Code != http.StatusConflict {
+		t.Fatalf("stale version status = %d, body=%s", stale.Code, stale.Body.String())
+	}
+	unchanged, err := store.Channels.GetByID(id)
+	if err != nil {
+		t.Fatalf("load unchanged channel: %v", err)
+	}
+	if *unchanged != *before {
+		t.Fatalf("rejected mutation changed channel: before=%#v after=%#v", before, unchanged)
+	}
+
+	current := doJSON(t, server.Handler(), http.MethodPatch, "/api/channels/"+jsonNumber(id), `{"enabled":false,"version":1}`)
+	if current.Code != http.StatusOK {
+		t.Fatalf("current version status = %d, body=%s", current.Code, current.Body.String())
+	}
+	updated, err := store.Channels.GetByID(id)
+	if err != nil {
+		t.Fatalf("load updated channel: %v", err)
+	}
+	if updated.Enabled || updated.Version != 2 {
+		t.Fatalf("updated channel = %#v, want disabled version 2", updated)
+	}
+
+	deleteStale := doJSON(t, server.Handler(), http.MethodDelete, "/api/channels/"+jsonNumber(id), `{"version":1}`)
+	if deleteStale.Code != http.StatusConflict {
+		t.Fatalf("stale delete status = %d, body=%s", deleteStale.Code, deleteStale.Body.String())
+	}
+	deleteCurrent := doJSON(t, server.Handler(), http.MethodDelete, "/api/channels/"+jsonNumber(id), `{"version":2}`)
+	if deleteCurrent.Code != http.StatusNoContent {
+		t.Fatalf("current delete status = %d, body=%s", deleteCurrent.Code, deleteCurrent.Body.String())
 	}
 }
 
@@ -283,7 +419,7 @@ func TestChannelDeleteCascadesAssignments(t *testing.T) {
 	if err := store.Groups.AssignChannel(groupID, channelID, nil); err != nil {
 		t.Fatalf("assign channel: %v", err)
 	}
-	response := doJSON(t, server.Handler(), http.MethodDelete, "/api/channels/"+jsonNumber(channelID), "")
+	response := doJSON(t, server.Handler(), http.MethodDelete, "/api/channels/"+jsonNumber(channelID), `{"version":1}`)
 	if response.Code != http.StatusNoContent {
 		t.Fatalf("delete status = %d", response.Code)
 	}

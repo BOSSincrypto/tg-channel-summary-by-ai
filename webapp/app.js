@@ -402,7 +402,7 @@
   }
   function confirmDeleteChannel(channel) {
     openConfirm("Удалить канал @" + channel.username + "?", "Сводки по этому каналу больше не будут приходить. Если канал используется в группах, он будет отвязан от них.", "Удалить", function () {
-      mutation("/api/channels/" + encodeURIComponent(channel.id), "DELETE").then(function () {
+      mutation("/api/channels/" + encodeURIComponent(channel.id), "DELETE", { version: channel.version }).then(function () {
         showToast("Канал удалён.", "success"); state.loadedAt.channels = 0; return loadChannels(true);
       }).catch(function (error) { showToast(apiErrorMessage(error), "error", true); });
     });
@@ -624,7 +624,7 @@
   }
   function confirmDeleteProvider(provider) {
     openConfirm("Удалить провайдера " + provider.name + "?", "Группы с явным назначением будут переведены на провайдера по умолчанию.", "Удалить", function () {
-      mutation("/api/providers/" + encodeURIComponent(provider.id), "DELETE").then(function () {
+      mutation("/api/providers/" + encodeURIComponent(provider.id), "DELETE", { version: provider.version }).then(function () {
         showToast("Провайдер удалён.", "success"); state.loadedAt.providers = 0; return loadProviders(true);
       }).catch(function (error) { showToast(apiErrorMessage(error), "error", true); });
     });

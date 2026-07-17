@@ -51,6 +51,10 @@ type optimisticProviderRepository interface {
 	UpdateOptimistic(*model.AIProvider, int64) error
 }
 
+type strictProviderRepository interface {
+	DeleteOptimistic(int64, int64) error
+}
+
 // NewProviderService creates a provider service using a bounded test request.
 func NewProviderService(repository providerRepository, client *http.Client) *ProviderService {
 	if client == nil {
@@ -97,12 +101,18 @@ func (s *ProviderService) Create(ctx context.Context, input ProviderInput) (*mod
 }
 
 func (s *ProviderService) Update(ctx context.Context, id int64, input ProviderInput) (*model.AIProvider, error) {
+	if input.Version <= 0 {
+		return nil, fmt.Errorf("provider version: %w", db.ErrConflict)
+	}
 	if err := validateProviderInput(input); err != nil {
 		return nil, err
 	}
 	existing, err := s.repository.GetByID(id)
 	if err != nil {
 		return nil, fmt.Errorf("load provider: %w", err)
+	}
+	if existing.Version != input.Version {
+		return nil, fmt.Errorf("provider version: %w", db.ErrConflict)
 	}
 	apiKey := strings.TrimSpace(input.APIKey)
 	if apiKey == "" || apiKey == maskedAPIKey {
@@ -129,8 +139,8 @@ func (s *ProviderService) Update(ctx context.Context, id int64, input ProviderIn
 		if err := optimistic.UpdateOptimistic(provider, input.Version); err != nil {
 			return nil, fmt.Errorf("update provider: %w", err)
 		}
-	} else if err := s.repository.Update(provider); err != nil {
-		return nil, fmt.Errorf("update provider: %w", err)
+	} else {
+		return nil, fmt.Errorf("update provider: %w", db.ErrConflict)
 	}
 	return s.getMasked(id)
 }
@@ -146,15 +156,25 @@ func (s *ProviderService) List() ([]model.AIProvider, error) {
 	return providers, nil
 }
 
-func (s *ProviderService) Delete(id int64) error {
+func (s *ProviderService) Delete(id, version int64) error {
+	if version <= 0 {
+		return fmt.Errorf("provider version: %w", db.ErrConflict)
+	}
 	provider, err := s.repository.GetByID(id)
 	if err != nil {
 		return fmt.Errorf("load provider: %w", err)
 	}
+	if provider.Version != version {
+		return fmt.Errorf("provider version: %w", db.ErrConflict)
+	}
 	if provider.IsDefault {
 		return errors.New("default provider cannot be deleted")
 	}
-	if err := s.repository.Delete(id); err != nil {
+	strict, ok := s.repository.(strictProviderRepository)
+	if !ok {
+		return fmt.Errorf("delete provider: %w", db.ErrConflict)
+	}
+	if err := strict.DeleteOptimistic(id, version); err != nil {
 		return fmt.Errorf("delete provider: %w", err)
 	}
 	return nil
@@ -318,7 +338,11 @@ func (s *Server) handleProviderByID(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, providerJSON(*provider))
 	case http.MethodDelete:
-		if err := s.providerService.Delete(id); err != nil {
+		var input versionInput
+		if err := decodeJSON(r, w, &input); err != nil {
+			return
+		}
+		if err := s.providerService.Delete(id, input.Version); err != nil {
 			writeProviderError(w, err)
 			return
 		}

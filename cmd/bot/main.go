@@ -78,6 +78,7 @@ func main() {
 		log.Fatalf("failed to configure WebApp authentication: %v", err)
 	}
 	srv := webapp.NewWithProvidersAuthenticated(store, 10*time.Second, http.DefaultClient, webAppAuth)
+	srv.SetChannelVerificationRetry(cfg.MaxRetries, nil)
 
 	// Wire the production parser -> post storage -> digest path before the
 	// scheduler starts. Scheduled group runs use this same injected service.

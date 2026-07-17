@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
@@ -41,6 +42,8 @@ func (v parserChannelVerifier) Verify(_ context.Context, username string) (strin
 type ChannelService struct {
 	repository dbChannelRepository
 	verifier   ChannelVerifier
+	maxRetries int
+	sleep      func(context.Context, time.Duration) error
 }
 
 type dbChannelRepository interface {
@@ -48,17 +51,39 @@ type dbChannelRepository interface {
 	GetByID(int64) (*model.Channel, error)
 	List() ([]model.Channel, error)
 	UpdateEnabledOptimistic(int64, bool, int64) error
-	Delete(int64) error
+	DeleteOptimistic(int64, int64) error
 }
 
 func NewChannelService(repository dbChannelRepository, verifier ChannelVerifier) *ChannelService {
-	return &ChannelService{repository: repository, verifier: verifier}
+	return &ChannelService{
+		repository: repository,
+		verifier:   verifier,
+		maxRetries: 3,
+		sleep:      sleepWithContext,
+	}
+}
+
+// SetVerificationRetry configures the bounded verification attempts and
+// injectable backoff used by channel creation.
+func (s *ChannelService) SetVerificationRetry(maxRetries int, sleep func(context.Context, time.Duration) error) {
+	if maxRetries < 1 {
+		maxRetries = 1
+	}
+	s.maxRetries = maxRetries
+	if sleep == nil {
+		sleep = sleepWithContext
+	}
+	s.sleep = sleep
 }
 
 type channelInput struct {
 	Username string `json:"username"`
 	Enabled  *bool  `json:"enabled"`
 	Version  int64  `json:"version"`
+}
+
+type versionInput struct {
+	Version int64 `json:"version"`
 }
 
 func (s *ChannelService) Create(ctx context.Context, username string) (*model.Channel, error) {
@@ -82,7 +107,7 @@ func (s *ChannelService) Create(ctx context.Context, username string) (*model.Ch
 		}
 	}
 	if s.verifier != nil {
-		title, err := s.verifier.Verify(ctx, username)
+		title, err := s.verifyWithRetry(ctx, username)
 		if err != nil {
 			return nil, classifyChannelVerificationError(err)
 		}
@@ -99,6 +124,86 @@ func (s *ChannelService) Create(ctx context.Context, username string) (*model.Ch
 		return nil, err
 	}
 	return s.repository.GetByID(id)
+}
+
+func (s *ChannelService) verifyWithRetry(ctx context.Context, username string) (string, error) {
+	var lastErr error
+	attempts := s.maxRetries
+	if attempts < 1 {
+		attempts = 1
+	}
+	for attempt := 0; attempt < attempts; attempt++ {
+		title, err := s.verifier.Verify(ctx, username)
+		if err == nil {
+			return title, nil
+		}
+		lastErr = err
+		if !isTransientVerificationError(err) || attempt == attempts-1 {
+			return "", err
+		}
+		delay := verificationBackoff(attempt)
+		if err := s.sleep(ctx, delay); err != nil {
+			return "", fmt.Errorf("channel verification backoff: %w", err)
+		}
+	}
+	return "", lastErr
+}
+
+func isTransientVerificationError(err error) bool {
+	if err == nil || errors.Is(err, parser.ErrChannelNotFound) ||
+		errors.Is(err, parser.ErrChannelPrivate) ||
+		errors.Is(err, parser.ErrChannelUnavailable) {
+		return false
+	}
+	var rateLimitErr *parser.RateLimitError
+	if errors.As(err, &rateLimitErr) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"timeout", "timed out", "deadline", "temporary", "temporarily",
+		"connection", "connection reset", "connection refused", "eof",
+		"status 408", "status 429", "status 500", "status 501", "status 502", "status 503", "status 504",
+		"http 408", "http 429", "http 500", "http 501", "http 502", "http 503", "http 504",
+		" 408 ", " 429 ", " 500 ", " 501 ", " 502 ", " 503 ", " 504 ",
+		"rate limited",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+const maxVerificationBackoff = 2 * time.Second
+
+func verificationBackoff(attempt int) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	delay := 100 * time.Millisecond * time.Duration(1<<min(attempt, 4))
+	if delay > maxVerificationBackoff {
+		return maxVerificationBackoff
+	}
+	return delay
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func min(left, right int) int {
+	if left < right {
+		return left
+	}
+	return right
 }
 
 func classifyChannelVerificationError(err error) error {
@@ -182,10 +287,14 @@ func (s *Server) handleChannelByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, channelJSON(*channel))
-	case http.MethodPatch:
+	case http.MethodPut, http.MethodPatch:
 		var input channelInput
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&input); err != nil || input.Enabled == nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "enabled должен быть boolean"})
+			return
+		}
+		if input.Version <= 0 {
+			writeChannelError(w, db.ErrConflict)
 			return
 		}
 		err := s.channelService.repository.UpdateEnabledOptimistic(id, *input.Enabled, input.Version)
@@ -200,13 +309,21 @@ func (s *Server) handleChannelByID(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, channelJSON(*channel))
 	case http.MethodDelete:
-		if err := s.channelService.repository.Delete(id); err != nil {
+		var input versionInput
+		if err := decodeJSON(r, w, &input); err != nil {
+			return
+		}
+		if input.Version <= 0 {
+			writeChannelError(w, db.ErrConflict)
+			return
+		}
+		if err := s.channelService.repository.DeleteOptimistic(id, input.Version); err != nil {
 			writeChannelError(w, err)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 	default:
-		w.Header().Set("Allow", "GET, PATCH, DELETE")
+		w.Header().Set("Allow", "GET, PUT, PATCH, DELETE")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }

@@ -171,33 +171,24 @@ func (r *ProviderRepository) UpdateOptimistic(ap *model.AIProvider, version int6
 	if ap == nil {
 		return fmt.Errorf("update provider: provider is nil")
 	}
+	if version <= 0 {
+		return ErrConflict
+	}
 	encryptedKey, err := r.keyCipher.encrypt(ap.APIKey)
 	if err != nil {
 		return fmt.Errorf("encrypt provider API key: %w", err)
 	}
-	conn := r.db.Conn()
-	if version > 0 {
-		var currentVersion int64
-		if err := conn.QueryRow(`SELECT version FROM ai_providers WHERE id = ?`, ap.ID).Scan(&currentVersion); err == sql.ErrNoRows {
-			return ErrNotFound
-		} else if err != nil {
-			return fmt.Errorf("check provider version: %w", err)
-		} else if currentVersion != version {
-			return ErrConflict
-		}
+	tx, err := r.db.Conn().Begin()
+	if err != nil {
+		return fmt.Errorf("begin optimistic provider update: %w", err)
 	}
-	if ap.IsDefault {
-		if _, err := conn.Exec(`UPDATE ai_providers SET is_default = 0 WHERE id != ?`, ap.ID); err != nil {
-			return fmt.Errorf("clear existing defaults: %w", err)
-		}
-	}
-	query := `UPDATE ai_providers SET name = ?, base_url = ?, api_key = ?, default_model = ?, is_default = ?, version = version + 1 WHERE id = ?`
-	args := []any{ap.Name, ap.BaseURL, encryptedKey, ap.DefaultModel, boolToInt(ap.IsDefault), ap.ID}
-	if version > 0 {
-		query += ` AND version = ?`
-		args = append(args, version)
-	}
-	result, err := conn.Exec(query, args...)
+	defer tx.Rollback()
+
+	result, err := tx.Exec(
+		`UPDATE ai_providers SET name = ?, base_url = ?, api_key = ?, default_model = ?, is_default = ?, version = version + 1
+		 WHERE id = ? AND version = ?`,
+		ap.Name, ap.BaseURL, encryptedKey, ap.DefaultModel, boolToInt(ap.IsDefault), ap.ID, version,
+	)
 	if err != nil {
 		return fmt.Errorf("update provider: %w", err)
 	}
@@ -206,10 +197,38 @@ func (r *ProviderRepository) UpdateOptimistic(ap *model.AIProvider, version int6
 		return fmt.Errorf("update provider rows affected: %w", err)
 	}
 	if affected == 0 {
-		if version > 0 {
-			return ErrConflict
+		return ErrConflict
+	}
+	if ap.IsDefault {
+		if _, err := tx.Exec(`UPDATE ai_providers SET is_default = 0 WHERE id != ?`, ap.ID); err != nil {
+			return fmt.Errorf("clear existing defaults: %w", err)
 		}
-		return ErrNotFound
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit optimistic provider update: %w", err)
+	}
+	return nil
+}
+
+// DeleteOptimistic removes a provider only when the supplied positive version
+// is still current.
+func (r *ProviderRepository) DeleteOptimistic(id, version int64) error {
+	if version <= 0 {
+		return ErrConflict
+	}
+	result, err := r.db.Conn().Exec(
+		`DELETE FROM ai_providers WHERE id = ? AND version = ?`,
+		id, version,
+	)
+	if err != nil {
+		return fmt.Errorf("delete provider: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("delete provider rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrConflict
 	}
 	return nil
 }

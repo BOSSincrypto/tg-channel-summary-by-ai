@@ -160,19 +160,19 @@ func (r *ChannelRepository) Update(ch *model.Channel) error {
 }
 
 // UpdateOptimistic updates a channel only when the caller still has the
-// supplied version. A zero version uses the current row for compatibility
-// with non-WebApp runtime callers.
+// supplied positive version.
 func (r *ChannelRepository) UpdateOptimistic(ch *model.Channel, version int64) error {
 	if ch == nil {
 		return fmt.Errorf("update channel: channel is required")
 	}
+	if version <= 0 {
+		return fmt.Errorf("update channel: %w", ErrConflict)
+	}
 	ch.Username = normalizeChannelUsername(ch.Username)
 	query := `UPDATE channels SET username = ?, title = ?, enabled = ?, last_post_id = ?, version = version + 1 WHERE id = ?`
 	args := []any{ch.Username, ch.Title, boolToInt(ch.Enabled), ch.LastPostID, ch.ID}
-	if version > 0 {
-		query += ` AND version = ?`
-		args = append(args, version)
-	}
+	query += ` AND version = ?`
+	args = append(args, version)
 	result, err := r.db.Conn().Exec(query, args...)
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -185,10 +185,7 @@ func (r *ChannelRepository) UpdateOptimistic(ch *model.Channel, version int64) e
 		return fmt.Errorf("update channel rows affected: %w", err)
 	}
 	if affected == 0 {
-		if version > 0 {
-			return fmt.Errorf("update channel: %w", ErrConflict)
-		}
-		return ErrNotFound
+		return fmt.Errorf("update channel: %w", ErrConflict)
 	}
 	return nil
 }
@@ -196,12 +193,11 @@ func (r *ChannelRepository) UpdateOptimistic(ch *model.Channel, version int64) e
 // UpdateEnabledOptimistic changes the enabled flag only for the expected
 // version and returns ErrConflict for a stale WebApp write.
 func (r *ChannelRepository) UpdateEnabledOptimistic(id int64, enabled bool, version int64) error {
-	query := `UPDATE channels SET enabled = ?, version = version + 1 WHERE id = ?`
-	args := []any{boolToInt(enabled), id}
-	if version > 0 {
-		query += ` AND version = ?`
-		args = append(args, version)
+	if version <= 0 {
+		return ErrConflict
 	}
+	query := `UPDATE channels SET enabled = ?, version = version + 1 WHERE id = ? AND version = ?`
+	args := []any{boolToInt(enabled), id, version}
 	result, err := r.db.Conn().Exec(query, args...)
 	if err != nil {
 		return fmt.Errorf("update channel enabled: %w", err)
@@ -211,10 +207,30 @@ func (r *ChannelRepository) UpdateEnabledOptimistic(id int64, enabled bool, vers
 		return fmt.Errorf("update channel enabled rows affected: %w", err)
 	}
 	if affected == 0 {
-		if version > 0 {
-			return ErrConflict
-		}
-		return ErrNotFound
+		return ErrConflict
+	}
+	return nil
+}
+
+// DeleteOptimistic removes a channel only when the caller still has the
+// supplied positive version.
+func (r *ChannelRepository) DeleteOptimistic(id, version int64) error {
+	if version <= 0 {
+		return ErrConflict
+	}
+	result, err := r.db.Conn().Exec(
+		`DELETE FROM channels WHERE id = ? AND version = ?`,
+		id, version,
+	)
+	if err != nil {
+		return fmt.Errorf("delete channel: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("delete channel rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrConflict
 	}
 	return nil
 }

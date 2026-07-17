@@ -85,6 +85,7 @@ func TestProviderServiceUpdatePreservesKeyWhenMaskedOrOmitted(t *testing.T) {
 		BaseURL:      server.URL,
 		APIKey:       "********",
 		DefaultModel: "model-b",
+		Version:      created.Version,
 	})
 	if err != nil {
 		t.Fatalf("update provider: %v", err)
@@ -126,6 +127,7 @@ func TestProviderServiceUpdateDoesNotPersistWhenValidationFails(t *testing.T) {
 	defer failing.Close()
 	_, err = service.Update(context.Background(), created.ID, ProviderInput{
 		Name: "Should Not Persist", BaseURL: failing.URL, APIKey: "unit-provider-new", DefaultModel: "model-b",
+		Version: created.Version,
 	})
 	if err == nil {
 		t.Fatal("expected validation error")
@@ -212,5 +214,95 @@ func TestProviderServiceListMasksAPIKeys(t *testing.T) {
 	}
 	if len(providers) != 1 || providers[0].APIKey != "********" {
 		t.Fatalf("providers = %#v, want one masked provider", providers)
+	}
+}
+
+func TestProviderMutationsRequireCurrentPositiveVersion(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+
+	validation := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer validation.Close()
+
+	server := NewWithProvidersForTesting(store, time.Second, validation.Client())
+	create := func(name string, isDefault bool) map[string]any {
+		t.Helper()
+		body := `{"name":"` + name + `","base_url":"` + validation.URL + `","api_key":"unit-provider-secret","default_model":"model","is_default":` + map[bool]string{true: "true", false: "false"}[isDefault] + `}`
+		response := doJSON(t, server.Handler(), http.MethodPost, "/api/providers", body)
+		if response.Code != http.StatusCreated {
+			t.Fatalf("create provider status = %d, body=%s", response.Code, response.Body.String())
+		}
+		var provider map[string]any
+		if err := json.Unmarshal(response.Body.Bytes(), &provider); err != nil {
+			t.Fatalf("decode provider: %v", err)
+		}
+		return provider
+	}
+	first := create("First", true)
+	second := create("Second", false)
+	secondID := int64(second["id"].(float64))
+
+	missing := doJSON(t, server.Handler(), http.MethodPatch, "/api/providers/"+jsonNumber(secondID),
+		`{"name":"Missing","base_url":"`+validation.URL+`","api_key":"********","default_model":"model","is_default":true}`)
+	if missing.Code != http.StatusConflict {
+		t.Fatalf("missing provider version status = %d, body=%s", missing.Code, missing.Body.String())
+	}
+	zero := doJSON(t, server.Handler(), http.MethodPatch, "/api/providers/"+jsonNumber(secondID),
+		`{"name":"Zero","base_url":"`+validation.URL+`","api_key":"********","default_model":"model","is_default":true,"version":0}`)
+	if zero.Code != http.StatusConflict {
+		t.Fatalf("zero provider version status = %d, body=%s", zero.Code, zero.Body.String())
+	}
+
+	current := doJSON(t, server.Handler(), http.MethodPatch, "/api/providers/"+jsonNumber(secondID),
+		`{"name":"Current","base_url":"`+validation.URL+`","api_key":"********","default_model":"model","is_default":true,"version":1}`)
+	if current.Code != http.StatusOK {
+		t.Fatalf("current provider version status = %d, body=%s", current.Code, current.Body.String())
+	}
+	var updated map[string]any
+	if err := json.Unmarshal(current.Body.Bytes(), &updated); err != nil {
+		t.Fatalf("decode updated provider: %v", err)
+	}
+	if updated["version"].(float64) != 2 || !updated["is_default"].(bool) {
+		t.Fatalf("updated provider = %#v, want default version 2", updated)
+	}
+
+	stale := doJSON(t, server.Handler(), http.MethodPatch, "/api/providers/"+jsonNumber(secondID),
+		`{"name":"Stale","base_url":"`+validation.URL+`","api_key":"********","default_model":"model","is_default":false,"version":1}`)
+	if stale.Code != http.StatusConflict {
+		t.Fatalf("stale provider version status = %d, body=%s", stale.Code, stale.Body.String())
+	}
+	raw, err := store.Providers.GetByID(secondID)
+	if err != nil {
+		t.Fatalf("load provider after stale update: %v", err)
+	}
+	if raw.Name != "Current" || !raw.IsDefault || raw.Version != 2 {
+		t.Fatalf("stale update changed provider: %#v", raw)
+	}
+	firstID := int64(first["id"].(float64))
+	firstRaw, err := store.Providers.GetByID(firstID)
+	if err != nil {
+		t.Fatalf("load first provider: %v", err)
+	}
+	if firstRaw.IsDefault {
+		t.Fatalf("successful default update did not clear previous default: %#v", firstRaw)
+	}
+
+	deleteStale := doJSON(t, server.Handler(), http.MethodDelete, "/api/providers/"+jsonNumber(secondID), `{"version":1}`)
+	if deleteStale.Code != http.StatusConflict {
+		t.Fatalf("stale provider delete status = %d, body=%s", deleteStale.Code, deleteStale.Body.String())
+	}
+	clearDefault := doJSON(t, server.Handler(), http.MethodPatch, "/api/providers/"+jsonNumber(secondID),
+		`{"name":"Current","base_url":"`+validation.URL+`","api_key":"********","default_model":"model","is_default":false,"version":2}`)
+	if clearDefault.Code != http.StatusOK {
+		t.Fatalf("clear provider default status = %d, body=%s", clearDefault.Code, clearDefault.Body.String())
+	}
+	deleteCurrent := doJSON(t, server.Handler(), http.MethodDelete, "/api/providers/"+jsonNumber(secondID), `{"version":3}`)
+	if deleteCurrent.Code != http.StatusNoContent {
+		t.Fatalf("current provider delete status = %d, body=%s", deleteCurrent.Code, deleteCurrent.Body.String())
 	}
 }

@@ -14,6 +14,10 @@
     readonly: false,
     settingsDraft: null,
     pendingChannelToggles: {},
+    loadRequests: {},
+    loadGenerations: {},
+    groupCollectionGeneration: 0,
+    groupReloads: {},
     digestJob: null,
     digestTimer: null,
     retryAfter: 0,
@@ -135,6 +139,7 @@
     var forumValue = pick(item, ["is_forum", "IsForum"], status === "" || status === "active");
     return {
       id: idOf(item),
+      version: pick(item, ["version", "Version"], 1),
       chatId: String(pick(item, ["telegram_chat_id", "TelegramChatID", "chat_id", "chatId"], "")),
       title: String(pick(item, ["title", "Title"], "")),
       status: status,
@@ -213,8 +218,9 @@
   }
   function api(path, options) {
     options = options || {};
-    var controller = new AbortController();
-    var timer = window.setTimeout(function () { controller.abort(); }, 30000);
+    var controller = options.controller || new AbortController();
+    var timedOut = false;
+    var timer = window.setTimeout(function () { timedOut = true; controller.abort(); }, 30000);
     var headers = options.headers || authHeaders();
     return fetch(path, {
       method: options.method || "GET",
@@ -257,7 +263,12 @@
       });
     }).catch(function (error) {
       window.clearTimeout(timer);
-      if (error.name === "AbortError") throw new Error("Превышено время ожидания. Проверьте соединение и повторите.");
+      if (error.name === "AbortError") {
+        if (timedOut) throw new Error("Превышено время ожидания. Проверьте соединение и повторите.");
+        var cancelled = new Error("Запрос отменён.");
+        cancelled.cancelled = true;
+        throw cancelled;
+      }
       throw error;
     });
   }
@@ -274,23 +285,108 @@
   }
   function load(tab, path, mapper, force) {
     if (!force && state.loadedAt[tab] && Date.now() - state.loadedAt[tab] < 30000) return Promise.resolve();
+    if (!force && state.loadRequests[tab]) return state.loadRequests[tab].promise;
+    var previous = state.loadRequests[tab];
+    if (previous && previous.controller) previous.controller.abort();
+    var generation = (state.loadGenerations[tab] || 0) + 1;
+    var collectionGeneration = state.groupCollectionGeneration;
+    var controller = new AbortController();
+    var request = { generation: generation, collectionGeneration: collectionGeneration, controller: controller, promise: null };
+    state.loadGenerations[tab] = generation;
+    state.loadRequests[tab] = request;
     state.loading[tab] = true;
     clearError(tab);
     render();
-    return api(path).then(function (result) {
-      state.data[tab] = mapper(result);
+    request.promise = api(path, { controller: controller }).then(function (result) {
+      if (state.loadGenerations[tab] !== generation) return;
+      var mapped = mapper(result);
+      if (tab === "groups" && collectionGeneration !== state.groupCollectionGeneration) return;
+      if (tab === "groups") mapped = mergeGroupList(mapped, collectionGeneration);
+      state.data[tab] = mapped;
       state.loadedAt[tab] = Date.now();
     }).catch(function (error) {
-      setError(tab, apiErrorMessage(error));
+      if (state.loadGenerations[tab] === generation && !error.cancelled) setError(tab, apiErrorMessage(error));
     }).finally(function () {
-      state.loading[tab] = false;
-      render();
+      if (state.loadGenerations[tab] === generation) {
+        state.loading[tab] = false;
+        if (state.loadRequests[tab] === request) state.loadRequests[tab] = null;
+        render();
+      }
     });
+    return request.promise;
   }
   function loadChannels(force) { return load("channels", "/api/channels", function (data) { return asArray(data).map(normalizeChannel); }, force); }
   function loadGroups(force) { return load("groups", "/api/groups?with_channels=true", function (data) { return asArray(data).map(normalizeGroup); }, force); }
   function loadProviders(force) { return load("providers", "/api/providers", function (data) { return asArray(data).map(normalizeProvider); }, force); }
   function loadSettings(force) { return load("settings", "/api/settings", normalizeSettings, force); }
+  function mergeGroupList(groups, collectionGeneration) {
+    var incoming = {};
+    groups.forEach(function (group) { incoming[String(group.id)] = group; });
+    Object.keys(state.groupReloads).forEach(function (key) {
+      var reload = state.groupReloads[key];
+      if (!reload || !reload.value || reload.appliedCollectionGeneration <= collectionGeneration) return;
+      incoming[key] = reload.value;
+    });
+    return Object.keys(incoming).map(function (key) { return incoming[key]; });
+  }
+  function replaceGroup(group) {
+    var groups = state.data.groups || [];
+    var key = String(group.id);
+    var index = groups.findIndex(function (item) { return String(item.id) === key; });
+    if (index < 0) groups.push(group);
+    else groups[index] = group;
+    state.data.groups = groups;
+  }
+  function findChannel(channelID) {
+    var key = String(channelID);
+    return (state.data.channels || []).find(function (item) { return String(item.id) === key; }) || null;
+  }
+  function findGroup(groupID) {
+    var key = String(groupID);
+    return (state.data.groups || []).find(function (item) { return String(item.id) === key; }) || null;
+  }
+  function positiveVersion(value, fallback) {
+    var version = Number(value);
+    if (!isFinite(version) || version <= 0) return fallback || 1;
+    return Math.floor(version);
+  }
+  function reloadGroup(groupID, force) {
+    var key = String(groupID);
+    var previous = state.groupReloads[key];
+    if (!force && previous && previous.promise) return previous.promise;
+    if (previous && previous.controller) previous.controller.abort();
+    var generation = (previous ? previous.generation : 0) + 1;
+    var controller = new AbortController();
+    var request = {
+      generation: generation,
+      controller: controller,
+      value: previous && previous.value ? previous.value : null,
+      appliedCollectionGeneration: previous && previous.appliedCollectionGeneration ? previous.appliedCollectionGeneration : 0,
+      promise: null
+    };
+    state.groupReloads[key] = request;
+    state.groupCollectionGeneration += 1;
+    request.promise = api("/api/groups/" + encodeURIComponent(groupID), { controller: controller }).then(function (result) {
+      var current = state.groupReloads[key];
+      if (!current || current.generation !== generation) return { applied: false };
+      var group = normalizeGroup(result);
+      current.value = group;
+      current.appliedCollectionGeneration = state.groupCollectionGeneration;
+      replaceGroup(group);
+      state.loadedAt.groups = 0;
+      render();
+      return { applied: true, group: group };
+    }).catch(function (error) {
+      var current = state.groupReloads[key];
+      if (!current || current.generation !== generation || error.cancelled) return { applied: false };
+      setError("groups", apiErrorMessage(error));
+      throw error;
+    }).finally(function () {
+      var current = state.groupReloads[key];
+      if (current && current.generation === generation) current.promise = null;
+    });
+    return request.promise;
+  }
 
   function pageShell() {
     var shell = el("div", "shell");
@@ -428,9 +524,18 @@
         render();
         mutation("/api/channels/" + encodeURIComponent(channel.id), "PATCH", { enabled: channel.enabled, version: beforeVersion }).then(function (updated) {
           if (state.pendingChannelToggles[channelKey] !== request) return;
-          if (updated) Object.assign(channel, normalizeChannel(updated));
+          var current = findChannel(channelKey);
+          if (updated && current) Object.assign(current, normalizeChannel(updated));
           delete state.pendingChannelToggles[channelKey];
-          showToast(channel.enabled ? "Канал включён." : "Канал выключен.", "success");
+          if (!current) {
+            state.loadedAt.channels = 0;
+            return loadChannels(true).then(function () {
+              var refreshed = findChannel(channelKey);
+              if (state.errors.channels || !refreshed) throw new Error("Не удалось подтвердить актуальное состояние канала.");
+              showToast(refreshed && refreshed.enabled ? "Канал включён." : "Канал выключен.", "success");
+            });
+          }
+          showToast(current.enabled ? "Канал включён." : "Канал выключен.", "success");
           render();
         }).catch(function (error) {
           if (state.pendingChannelToggles[channelKey] !== request) return;
@@ -441,8 +546,14 @@
             loadChannels(true);
             return;
           }
-          channel.enabled = before;
-          channel.version = beforeVersion;
+          var current = findChannel(channelKey);
+          if (current && current.version === beforeVersion) {
+            current.enabled = before;
+            current.version = beforeVersion;
+          } else {
+            state.loadedAt.channels = 0;
+            loadChannels(true);
+          }
           showToast("Не удалось обновить статус канала: " + apiErrorMessage(error), "error", true);
           render();
         });
@@ -531,7 +642,10 @@
         assignmentNode.appendChild(button("Отвязать", "ghost small", function () {
           openConfirm("Отвязать канал @" + assignment.username + "?", "Канал останется в списке каналов.", "Отвязать", function () {
             mutation("/api/groups/" + encodeURIComponent(group.id) + "/channels/" + encodeURIComponent(assignment.channelId), "DELETE").then(function () {
-              showToast("Канал отвязан.", "success"); state.loadedAt.groups = 0; return loadGroups(true);
+              return reloadGroup(group.id, true).then(function (result) {
+                if (!result.applied) throw new Error("Не удалось подтвердить актуальное состояние группы.");
+                showToast("Канал отвязан.", "success");
+              });
             }).catch(function (error) { showToast(apiErrorMessage(error), "error", true); });
           });
         }));
@@ -566,17 +680,30 @@
         });
         body.appendChild(list);
       });
-    }).catch(function (error) { showToast(apiErrorMessage(error), "error", true); });
+    }).catch(function (error) {
+      if (!error || !error.cancelled) showToast(apiErrorMessage(error), "error", true);
+    });
   }
   function openAssignment(group) {
-    var topicsRequest = group.isForum
-      ? api("/api/groups/" + encodeURIComponent(group.id) + "/topics").catch(function () { return []; })
-      : Promise.resolve([]);
-    Promise.all([loadChannels(false), topicsRequest]).then(function (result) {
+    var groupRequest = reloadGroup(group.id, true).then(function (result) {
+      if (!result.applied) {
+        var superseded = new Error("Запрос состояния группы заменён более новым.");
+        superseded.cancelled = true;
+        throw superseded;
+      }
+      return result.group || findGroup(group.id) || group;
+    });
+    var topicsRequest = groupRequest.then(function (authoritativeGroup) {
+      return authoritativeGroup.isForum
+        ? api("/api/groups/" + encodeURIComponent(authoritativeGroup.id) + "/topics").catch(function () { return []; })
+        : [];
+    });
+    Promise.all([loadChannels(false), groupRequest, topicsRequest]).then(function (result) {
+      var authoritativeGroup = result[1];
       var assigned = {};
-      group.assignments.forEach(function (item) { assigned[item.channelId] = true; });
+      authoritativeGroup.assignments.forEach(function (item) { assigned[item.channelId] = true; });
       var available = state.data.channels.filter(function (channel) { return !assigned[String(channel.id)]; });
-      var topics = asArray(result[1]);
+      var topics = asArray(result[2]);
       openModal("Назначить каналы", function (body, close) {
         if (!available.length) {
           body.appendChild(emptyState("✅", "Все каналы уже назначены этой группе", "Добавьте новый канал или отвяжите существующий."));
@@ -592,7 +719,7 @@
         });
         form.appendChild(list);
         var topic = null;
-        if (group.isForum) {
+        if (authoritativeGroup.isForum) {
           var topicChoices = [{ value: "", label: "Создать новый топик" }].concat(topics.map(function (topicItem) {
             return { value: String(pick(topicItem, ["message_thread_id", "MessageThreadID", "id"], "")), label: String(pick(topicItem, ["name", "Name"], "Топик")) };
           }));
@@ -608,14 +735,16 @@
           var selected = Array.from(list.querySelectorAll("input:checked")).map(function (item) { return item.value; });
           if (!selected.length) { showToast("Выберите хотя бы один канал.", "warning"); return; }
           save.disabled = true;
+          var currentGroup = findGroup(authoritativeGroup.id) || authoritativeGroup;
+          var currentVersion = positiveVersion(currentGroup.version, 1);
           Promise.allSettled(selected.map(function (channelId) {
-            var payload = { channel_id: channelId };
-            if (group.isForum && topic && topic.input.value) payload.topic_thread_id = topic.input.value;
-            return mutation("/api/groups/" + encodeURIComponent(group.id) + "/channels", "POST", payload);
+            var payload = { channel_id: channelId, version: currentVersion };
+            if (currentGroup.isForum && topic && topic.input.value) payload.topic_thread_id = topic.input.value;
+            return mutation("/api/groups/" + encodeURIComponent(currentGroup.id) + "/channels", "POST", payload);
           })).then(function (results) {
             var failed = results.filter(function (result) { return result.status === "rejected"; });
-            state.loadedAt.groups = 0;
-            return loadGroups(true).then(function () {
+            return reloadGroup(currentGroup.id, true).then(function (reloadResult) {
+              if (!reloadResult.applied) throw new Error("Не удалось подтвердить актуальное состояние группы.");
               close();
               if (failed.length) {
                 showToast("Часть каналов не удалось назначить. Состояние обновлено.", "error", true);
@@ -630,7 +759,9 @@
         });
         body.appendChild(form);
       });
-    }).catch(function (error) { showToast(apiErrorMessage(error), "error", true); });
+    }).catch(function (error) {
+      if (!error || !error.cancelled) showToast(apiErrorMessage(error), "error", true);
+    });
   }
   function renderProviders() {
     var view = panel("AI-провайдеры", "OpenRouter используется по умолчанию. Секретные ключи никогда не отображаются в интерфейсе.", button("Добавить провайдера", "primary", function () { openProviderForm(); }));

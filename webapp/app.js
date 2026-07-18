@@ -1307,4 +1307,15 @@
     if (telegram && telegram.MainButton) telegram.MainButton.offClick(mainButtonAction);
   });
   start();
+  if (window.__WEBAPP_TEST_HOOKS__) {
+    Object.assign(window.__WEBAPP_TEST_HOOKS__, {
+      state: state,
+      refresh: refresh,
+      reloadGroup: reloadGroup,
+      openAssignment: openAssignment,
+      findChannel: findChannel,
+      findGroup: findGroup,
+      reconcileChannel: reconcileChannel
+    });
+  }
 }());

@@ -217,6 +217,98 @@ func TestProviderServiceListMasksAPIKeys(t *testing.T) {
 	}
 }
 
+func TestProviderDefaultTransitionInvalidatesPreviousVersionAtHTTPBoundary(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+
+	validation := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer validation.Close()
+
+	server := NewWithProvidersForTesting(store, time.Second, validation.Client())
+	create := func(name string, isDefault bool) map[string]any {
+		t.Helper()
+		body := `{"name":"` + name + `","base_url":"` + validation.URL +
+			`","api_key":"unit-provider-secret","default_model":"model","is_default":` +
+			map[bool]string{true: "true", false: "false"}[isDefault] + `}`
+		response := doJSON(t, server.Handler(), http.MethodPost, "/api/providers", body)
+		if response.Code != http.StatusCreated {
+			t.Fatalf("create provider status = %d, body=%s", response.Code, response.Body.String())
+		}
+		var provider map[string]any
+		if err := json.Unmarshal(response.Body.Bytes(), &provider); err != nil {
+			t.Fatalf("decode provider: %v", err)
+		}
+		return provider
+	}
+
+	previous := create("Previous", true)
+	next := create("Next", false)
+	previousID := int64(previous["id"].(float64))
+	nextID := int64(next["id"].(float64))
+	previousVersion := int64(previous["version"].(float64))
+	nextVersion := int64(next["version"].(float64))
+
+	transition := doJSON(t, server.Handler(), http.MethodPatch, "/api/providers/"+jsonNumber(nextID),
+		`{"name":"Next","base_url":"`+validation.URL+`","api_key":"********","default_model":"model","is_default":true,"version":`+jsonNumber(nextVersion)+`}`)
+	if transition.Code != http.StatusOK {
+		t.Fatalf("default transition status = %d, body=%s", transition.Code, transition.Body.String())
+	}
+
+	previousAfter, err := store.Providers.GetByID(previousID)
+	if err != nil {
+		t.Fatalf("load previous provider after transition: %v", err)
+	}
+	nextAfter, err := store.Providers.GetByID(nextID)
+	if err != nil {
+		t.Fatalf("load next provider after transition: %v", err)
+	}
+	if previousAfter.IsDefault || previousAfter.Version != previousVersion+1 {
+		t.Fatalf("previous provider after transition = %#v, want cleared version %d", previousAfter, previousVersion+1)
+	}
+	if !nextAfter.IsDefault || nextAfter.Version != nextVersion+1 {
+		t.Fatalf("next provider after transition = %#v, want default version %d", nextAfter, nextVersion+1)
+	}
+
+	stale := doJSON(t, server.Handler(), http.MethodPatch, "/api/providers/"+jsonNumber(previousID),
+		`{"name":"Stale mutation","base_url":"`+validation.URL+`","api_key":"********","default_model":"changed","is_default":false,"version":`+jsonNumber(previousVersion)+`}`)
+	if stale.Code != http.StatusConflict {
+		t.Fatalf("stale previous-default status = %d, body=%s", stale.Code, stale.Body.String())
+	}
+	previousAfterStale, err := store.Providers.GetByID(previousID)
+	if err != nil {
+		t.Fatalf("load previous provider after stale mutation: %v", err)
+	}
+	if *previousAfterStale != *previousAfter {
+		t.Fatalf("stale mutation changed previous provider: before=%#v after=%#v", previousAfter, previousAfterStale)
+	}
+
+	refreshed := doJSON(t, server.Handler(), http.MethodPatch, "/api/providers/"+jsonNumber(previousID),
+		`{"name":"Refreshed mutation","base_url":"`+validation.URL+`","api_key":"********","default_model":"changed","is_default":false,"version":`+jsonNumber(previousAfter.Version)+`}`)
+	if refreshed.Code != http.StatusOK {
+		t.Fatalf("refreshed previous-default status = %d, body=%s", refreshed.Code, refreshed.Body.String())
+	}
+	previousFinal, err := store.Providers.GetByID(previousID)
+	if err != nil {
+		t.Fatalf("load previous provider after refreshed mutation: %v", err)
+	}
+	if previousFinal.Name != "Refreshed mutation" || previousFinal.IsDefault || previousFinal.Version != previousAfter.Version+1 {
+		t.Fatalf("previous provider after refreshed mutation = %#v", previousFinal)
+	}
+
+	var defaults int
+	if err := store.Conn().QueryRow(`SELECT COUNT(*) FROM ai_providers WHERE is_default = 1`).Scan(&defaults); err != nil {
+		t.Fatalf("count default providers: %v", err)
+	}
+	if defaults != 1 {
+		t.Fatalf("default provider count = %d, want exactly one", defaults)
+	}
+}
+
 func TestProviderHTTPDuplicateNameIdentifiesNameField(t *testing.T) {
 	store, err := db.Open(":memory:")
 	if err != nil {

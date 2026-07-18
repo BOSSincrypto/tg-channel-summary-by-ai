@@ -209,7 +209,12 @@ func (r *ProviderRepository) UpdateOptimistic(ap *model.AIProvider, version int6
 		return ErrConflict
 	}
 	if ap.IsDefault {
-		if _, err := tx.Exec(`UPDATE ai_providers SET is_default = 0 WHERE id != ?`, ap.ID); err != nil {
+		// Clearing the previous default is part of the same optimistic-lock
+		// transaction. Its version must advance as well, so clients holding
+		// the old default snapshot cannot overwrite the transition.
+		if _, err := tx.Exec(`UPDATE ai_providers
+			SET is_default = 0, version = version + 1
+			WHERE id != ? AND is_default = 1`, ap.ID); err != nil {
 			return fmt.Errorf("clear existing defaults: %w", err)
 		}
 	}

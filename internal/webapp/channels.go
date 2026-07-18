@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -158,10 +160,17 @@ func isTransientVerificationError(err error) bool {
 	if errors.As(err, &rateLimitErr) {
 		return true
 	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		var nestedNetworkErr net.Error
+		return errors.As(urlErr.Err, &nestedNetworkErr)
+	}
+	var networkErr net.Error
+	if errors.As(err, &networkErr) {
+		return true
+	}
 	message := strings.ToLower(err.Error())
 	for _, marker := range []string{
-		"timeout", "timed out", "deadline", "temporary", "temporarily",
-		"connection", "connection reset", "connection refused", "eof",
 		"status 408", "status 429", "status 500", "status 501", "status 502", "status 503", "status 504",
 		"http 408", "http 429", "http 500", "http 501", "http 502", "http 503", "http 504",
 		" 408 ", " 429 ", " 500 ", " 501 ", " 502 ", " 503 ", " 504 ",

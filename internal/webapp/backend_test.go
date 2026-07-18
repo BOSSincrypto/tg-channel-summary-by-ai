@@ -4,14 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
+	"github.com/boss/tg-channel-summary-by-ai/internal/parser"
 )
 
 type fakeChannelVerifier struct {
@@ -49,6 +54,42 @@ type recordingRetrySleeper struct {
 func (s *recordingRetrySleeper) Sleep(_ context.Context, delay time.Duration) error {
 	s.delays = append(s.delays, delay)
 	return nil
+}
+
+type wrappedVerifierNetError struct {
+	message string
+}
+
+func (e *wrappedVerifierNetError) Error() string   { return e.message }
+func (e *wrappedVerifierNetError) Timeout() bool   { return false }
+func (e *wrappedVerifierNetError) Temporary() bool { return false }
+
+var _ net.Error = (*wrappedVerifierNetError)(nil)
+
+type scriptedVerifierTransport struct {
+	base       http.RoundTripper
+	failures   []error
+	calls      int
+	serverHits int
+}
+
+func (t *scriptedVerifierTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	t.calls++
+	if len(t.failures) > 0 {
+		err := t.failures[0]
+		t.failures = t.failures[1:]
+		return nil, err
+	}
+	t.serverHits++
+	return t.base.RoundTrip(request)
+}
+
+func wrappedVerifierTransportError(message string) error {
+	return fmt.Errorf("transport wrapper: %w", &url.Error{
+		Op:  http.MethodGet,
+		URL: "https://t.me/s/retry_",
+		Err: &wrappedVerifierNetError{message: message},
+	})
 }
 
 func newBackendTestServer(t *testing.T) (*Server, *db.DB) {
@@ -104,7 +145,7 @@ func TestChannelsAPIValidatesNormalizesAndRejectsDuplicates(t *testing.T) {
 func TestChannelCreateRetriesTransientVerificationAndPersistsOnce(t *testing.T) {
 	server, store := newBackendTestServer(t)
 	verifier := &sequenceChannelVerifier{results: []error{
-		errors.New("fetch t.me/s/retry_: temporary transport failure"),
+		wrappedVerifierTransportError("network unreachable"),
 		errors.New("fetch t.me/s/retry_: HTTP 503 Service Unavailable"),
 		nil,
 	}}
@@ -131,9 +172,9 @@ func TestChannelCreateRetriesTransientVerificationAndPersistsOnce(t *testing.T) 
 func TestChannelCreateExhaustedVerificationRetriesDoesNotPersist(t *testing.T) {
 	server, store := newBackendTestServer(t)
 	verifier := &sequenceChannelVerifier{results: []error{
-		errors.New("fetch t.me/s/exhaust_: temporary transport failure"),
+		wrappedVerifierTransportError("network unreachable"),
 		errors.New("fetch t.me/s/exhaust_: HTTP 503 Service Unavailable"),
-		errors.New("fetch t.me/s/exhaust_: temporary transport failure"),
+		wrappedVerifierTransportError("broken pipe"),
 	}}
 	sleeper := &recordingRetrySleeper{}
 	server.SetChannelVerifier(verifier)
@@ -152,6 +193,105 @@ func TestChannelCreateExhaustedVerificationRetriesDoesNotPersist(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("exhausted channel count = %d, want 0", count)
+	}
+}
+
+func TestChannelCreateClassifiesWrappedTransportErrorsAtProductionBoundary(t *testing.T) {
+	tests := []struct {
+		name           string
+		failures       []error
+		maxRetries     int
+		wantStatus     int
+		wantCalls      int
+		wantServerHits int
+		wantSleeps     int
+		wantRows       int
+	}{
+		{
+			name: "wrapped network unreachable recovers",
+			failures: []error{
+				wrappedVerifierTransportError("network unreachable"),
+				wrappedVerifierTransportError("timeout"),
+				wrappedVerifierTransportError("broken pipe"),
+			},
+			maxRetries:     4,
+			wantStatus:     http.StatusCreated,
+			wantCalls:      4,
+			wantServerHits: 1,
+			wantSleeps:     3,
+			wantRows:       1,
+		},
+		{
+			name: "wrapped transport exhaustion does not persist",
+			failures: []error{
+				wrappedVerifierTransportError("network unreachable"),
+				wrappedVerifierTransportError("timeout"),
+				wrappedVerifierTransportError("broken pipe"),
+			},
+			maxRetries:     3,
+			wantStatus:     http.StatusBadGateway,
+			wantCalls:      3,
+			wantServerHits: 0,
+			wantSleeps:     2,
+			wantRows:       0,
+		},
+		{
+			name:           "permanent verifier error is not retried",
+			failures:       []error{errors.New("permanent verifier failure")},
+			maxRetries:     4,
+			wantStatus:     http.StatusBadGateway,
+			wantCalls:      1,
+			wantServerHits: 0,
+			wantSleeps:     0,
+			wantRows:       0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store, err := db.Open(":memory:")
+			if err != nil {
+				t.Fatalf("open database: %v", err)
+			}
+			t.Cleanup(func() { _ = store.Close() })
+
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, `<div class="tgme_channel_info"><h1>Recovered title</h1></div>`)
+			}))
+			t.Cleanup(upstream.Close)
+
+			transport := &scriptedVerifierTransport{
+				base:     http.DefaultTransport,
+				failures: append([]error(nil), tt.failures...),
+			}
+			channelParser := parser.NewWithOptions(parser.Options{
+				Client:  &http.Client{Transport: transport},
+				BaseURL: upstream.URL,
+			})
+			server := NewWithProvidersForTesting(store, 0, http.DefaultClient)
+			server.SetChannelVerifier(parserChannelVerifier{parser: channelParser})
+			sleeper := &recordingRetrySleeper{}
+			server.SetChannelVerificationRetry(tt.maxRetries, sleeper.Sleep)
+
+			response := doJSON(t, server.Handler(), http.MethodPost, "/api/channels", `{"username":"transport_"}`)
+			if response.Code != tt.wantStatus {
+				t.Fatalf("create status = %d, body=%s", response.Code, response.Body.String())
+			}
+			if transport.calls != tt.wantCalls || transport.serverHits != tt.wantServerHits {
+				t.Fatalf("transport calls=%d server hits=%d, want calls=%d server hits=%d",
+					transport.calls, transport.serverHits, tt.wantCalls, tt.wantServerHits)
+			}
+			if len(sleeper.delays) != tt.wantSleeps {
+				t.Fatalf("backoff count = %d, want %d", len(sleeper.delays), tt.wantSleeps)
+			}
+			var rows int
+			if err := store.Conn().QueryRow(`SELECT COUNT(*) FROM channels WHERE username = 'transport_'`).Scan(&rows); err != nil {
+				t.Fatalf("count channels: %v", err)
+			}
+			if rows != tt.wantRows {
+				t.Fatalf("channel rows = %d, want %d", rows, tt.wantRows)
+			}
+		})
 	}
 }
 

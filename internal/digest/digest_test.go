@@ -1165,6 +1165,84 @@ func (d outcomeDelivery) Deliver(context.Context, int64, *Digest) (DeliveryRecei
 	return DeliveryReceipt{MessageID: 777, MessageURL: "https://t.me/c/777"}, nil
 }
 
+type countingDigestDelivery struct {
+	calls int
+}
+
+func (d *countingDigestDelivery) Deliver(context.Context, int64, *Digest) (DeliveryReceipt, error) {
+	d.calls++
+	return DeliveryReceipt{MessageID: 888}, nil
+}
+
+func TestGenerateZeroPostsWithFailedChannelRemainsNoPostsAndDoesNotDeliver(t *testing.T) {
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer database.Close()
+
+	groupID, err := database.Groups.Insert(&model.Group{TelegramChatID: -10078, Title: "Zero posts"})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	for _, username := range []string{"empty", "broken"} {
+		channelID, insertErr := database.Channels.Insert(&model.Channel{Username: username, Enabled: true})
+		if insertErr != nil {
+			t.Fatalf("insert channel %s: %v", username, insertErr)
+		}
+		if assignErr := database.Groups.AssignChannel(groupID, channelID, nil); assignErr != nil {
+			t.Fatalf("assign channel %s: %v", username, assignErr)
+		}
+	}
+
+	provider := &recordingDigestProvider{}
+	delivery := &countingDigestDelivery{}
+	processor := parser.NewChannelProcessor(
+		outcomeFetcher{
+			posts: map[string][]parser.ParsedPost{"empty": {}},
+			errs:  map[string]error{"broken": errors.New("channel unavailable")},
+		},
+		parser.NewPostStorage(database.Channels, database.Posts),
+	)
+	service := NewWithProcessor(database, processor)
+	service.aiConfigSource = database.Groups
+	service.providerFactory = func(summarizer.GroupAIConfigSource, int64, *http.Client, func(error)) (summarizer.Provider, error) {
+		return provider, nil
+	}
+	service.delivery = delivery
+
+	result, err := service.GenerateManualResult(groupID)
+	if err != nil {
+		t.Fatalf("GenerateManualResult: %v", err)
+	}
+	if result.Outcome != OutcomeNoPosts {
+		t.Fatalf("outcome = %q, want %q", result.Outcome, OutcomeNoPosts)
+	}
+	if result.Delivered {
+		t.Fatal("zero-post failure result reported delivered")
+	}
+	if result.PostCount != 0 || len(result.FailedChannels) != 1 {
+		t.Fatalf("result counts = posts:%d failures:%v, want zero posts and one failure", result.PostCount, result.FailedChannels)
+	}
+	if len(result.FailureDetails) != 1 || !strings.Contains(result.FailureDetails[0], "@broken") ||
+		!strings.Contains(result.FailureDetails[0], "channel unavailable") {
+		t.Fatalf("failure details = %v, want channel and error", result.FailureDetails)
+	}
+	if len(provider.calls) != 0 {
+		t.Fatalf("AI calls = %d, want none for zero posts", len(provider.calls))
+	}
+	if delivery.calls != 0 {
+		t.Fatalf("delivery calls = %d, want none for zero posts", delivery.calls)
+	}
+	var digestCount int
+	if err := database.Conn().QueryRow(`SELECT COUNT(*) FROM digests WHERE group_id = ?`, groupID).Scan(&digestCount); err != nil {
+		t.Fatalf("count digests: %v", err)
+	}
+	if digestCount != 0 {
+		t.Fatalf("stored digests = %d, want none", digestCount)
+	}
+}
+
 func TestGenerateManualResultExposesAllTerminalOutcomes(t *testing.T) {
 	tests := []struct {
 		name            string

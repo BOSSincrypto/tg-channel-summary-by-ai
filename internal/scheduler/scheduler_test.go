@@ -57,6 +57,15 @@ func (r *recordingDigestRunner) Generate(groupID int64) (*digest.Digest, error) 
 	return result, nil
 }
 
+type schedulerDeliverySpy struct {
+	calls int
+}
+
+func (d *schedulerDeliverySpy) Deliver(context.Context, int64, *digest.Digest) (digest.DeliveryReceipt, error) {
+	d.calls++
+	return digest.DeliveryReceipt{MessageID: 1}, nil
+}
+
 type fakeGroupSource struct {
 	groups   []model.Group
 	settings map[int64]*model.GroupSettings
@@ -364,5 +373,72 @@ func TestSchedulerStartInvokesDigestPipelineThroughParserStorage(t *testing.T) {
 	}
 	if postCount != 2 {
 		t.Fatalf("stored post count = %d, want existing post plus one new post", postCount)
+	}
+}
+
+func TestSchedulerZeroPostsWithFailedChannelPreservesNoPostsAndSkipsDelivery(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/s/broken" {
+			http.Error(w, "channel unavailable", http.StatusBadGateway)
+			return
+		}
+		_, _ = w.Write([]byte(`<html><body><div class="tgme_channel_info"></div></body></html>`))
+	}))
+	defer server.Close()
+
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer database.Close()
+
+	groupID, err := database.Groups.Insert(&model.Group{TelegramChatID: -1003, Title: "Scheduled empty"})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	for _, username := range []string{"empty", "broken"} {
+		channelID, insertErr := database.Channels.Insert(&model.Channel{Username: username, Enabled: true})
+		if insertErr != nil {
+			t.Fatalf("insert channel %s: %v", username, insertErr)
+		}
+		if assignErr := database.Groups.AssignChannel(groupID, channelID, nil); assignErr != nil {
+			t.Fatalf("assign channel %s: %v", username, assignErr)
+		}
+	}
+	if err := database.Groups.UpdateGroupSettings(&model.GroupSettings{
+		GroupID: groupID, DigestTime: "21:00", Timezone: "UTC",
+	}); err != nil {
+		t.Fatalf("update group settings: %v", err)
+	}
+
+	fetcher := parser.NewWithOptions(parser.Options{Client: server.Client(), BaseURL: server.URL})
+	processor := parser.NewChannelProcessor(fetcher, parser.NewPostStorage(database.Channels, database.Posts))
+	digestService := digest.NewWithProcessor(database, processor)
+	delivery := &schedulerDeliverySpy{}
+	digestService.SetDelivery(delivery)
+	runner := &recordingDigestRunner{service: digestService}
+	engine := newFakeCronEngine()
+	scheduler := New(runner, WithGroupSource(database.Groups), withCronEngine(engine))
+	if err := scheduler.Start(); err != nil {
+		t.Fatalf("start scheduler: %v", err)
+	}
+	defer scheduler.Stop()
+
+	engine.RunAll()
+
+	if runner.result == nil {
+		t.Fatal("scheduler did not return a digest result")
+	}
+	if runner.result.Outcome != digest.OutcomeNoPosts || runner.result.Delivered {
+		t.Fatalf("scheduled result = %+v, want no_posts and not delivered", runner.result)
+	}
+	if len(runner.result.FailedChannels) != 1 || runner.result.FailedChannels[0] != "@broken" {
+		t.Fatalf("failed channels = %v, want [@broken]", runner.result.FailedChannels)
+	}
+	if len(runner.result.FailureDetails) != 1 || runner.result.FailureDetails[0] == "" {
+		t.Fatalf("failure details = %v, want channel error metadata", runner.result.FailureDetails)
+	}
+	if delivery.calls != 0 {
+		t.Fatalf("delivery calls = %d, want none", delivery.calls)
 	}
 }

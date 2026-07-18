@@ -2,6 +2,7 @@ package webapp
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/digest"
@@ -116,6 +117,40 @@ func TestDigestJobUsesTypedResultWhenRunnerReturnsTerminalError(t *testing.T) {
 	got := server.digestJobs.get(job.ID)
 	if got.Outcome != digest.OutcomeDeliveryFailed || got.Status != "error" {
 		t.Fatalf("outcome = %q status=%q, want delivery_failed/error", got.Outcome, got.Status)
+	}
+}
+
+func TestDigestJobPreservesNoPostsFailureMetadataWithoutDeliveryClaim(t *testing.T) {
+	server := &Server{
+		digestJobs: newDigestJobStore(),
+		digestRunner: typedDigestRunnerFixture{
+			result: &digest.Digest{
+				Outcome:        digest.OutcomeNoPosts,
+				Message:        "Нет новых постов для дайджеста. Часть каналов недоступна.",
+				FailedChannels: []string{"@broken"},
+				FailureDetails: []string{"@broken: channel unavailable"},
+				Delivered:      false,
+			},
+		},
+	}
+	job := server.digestJobs.create(9)
+	server.runDigestJob(nil, job.ID, 9)
+	got := server.digestJobs.get(job.ID)
+	if got == nil {
+		t.Fatal("job disappeared")
+	}
+	if got.Status != "completed" || got.Outcome != digest.OutcomeNoPosts {
+		t.Fatalf("job = %+v, want completed no_posts", got)
+	}
+	if got.Delivered || got.MessageID != nil {
+		t.Fatalf("delivery state = delivered:%v message_id:%v, want no delivery", got.Delivered, got.MessageID)
+	}
+	if len(got.FailedChannels) != 1 || len(got.FailureDetails) != 1 ||
+		got.FailureDetails[0] != "@broken: channel unavailable" {
+		t.Fatalf("failure metadata = channels:%v details:%v", got.FailedChannels, got.FailureDetails)
+	}
+	if strings.Contains(strings.ToLower(got.Message), "частич") {
+		t.Fatalf("message %q must not claim partial delivery", got.Message)
 	}
 }
 

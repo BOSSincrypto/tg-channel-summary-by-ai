@@ -28,6 +28,7 @@ type digestJob struct {
 	PostCount      int      `json:"post_count"`
 	ChannelCount   int      `json:"channel_count"`
 	FailedChannels []string `json:"failed_channels,omitempty"`
+	FailureDetails []string `json:"failure_details,omitempty"`
 	MessageID      *int64   `json:"message_id,omitempty"`
 	MessageURL     string   `json:"message_url,omitempty"`
 	SummariesSaved bool     `json:"summaries_saved"`
@@ -188,6 +189,7 @@ func applyDigestResult(job *digestJob, result *digest.Digest) {
 	job.PostCount = result.PostCount
 	job.ChannelCount = result.ChannelCount
 	job.FailedChannels = append([]string(nil), result.FailedChannels...)
+	job.FailureDetails = append([]string(nil), result.FailureDetails...)
 	job.MessageID = result.MessageID
 	job.MessageURL = result.MessageURL
 	job.SummariesSaved = result.SummariesSaved

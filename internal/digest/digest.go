@@ -29,6 +29,7 @@ type Digest struct {
 	ChannelCount   int
 	Outcome        string
 	FailedChannels []string
+	FailureDetails []string
 	Message        string
 	Text           string
 	MessageID      *int64
@@ -238,6 +239,7 @@ func (s *Service) generate(groupID int64, windowID string, manual bool) (*Digest
 	result := &Digest{
 		GroupID: groupID, PostCount: len(posts), ChannelCount: len(batch.Results),
 		WindowID: windowID, FailedChannels: failedChannelNames(batch),
+		FailureDetails: failedChannelDetails(batch),
 	}
 	if len(batch.Results) == 0 && len(batch.Failures) > 0 {
 		result.Outcome = OutcomeAllChannelsFailed
@@ -249,8 +251,7 @@ func (s *Service) generate(groupID int64, windowID string, manual bool) (*Digest
 		result.Outcome = OutcomeNoPosts
 		result.Message = "Нет новых постов для дайджеста."
 		if len(batch.Failures) > 0 {
-			result.Outcome = OutcomePartial
-			result.Message = "Новых постов нет, часть каналов недоступна."
+			result.Message = "Нет новых постов для дайджеста. Часть каналов недоступна."
 			s.notifyDigestOutcome(result)
 		}
 		return result, terminalDigestError(result, nil, manual)
@@ -291,7 +292,9 @@ func (s *Service) notifyDigestOutcome(result *Digest) {
 		return
 	}
 	message := result.Message
-	if len(result.FailedChannels) > 0 {
+	if len(result.FailureDetails) > 0 {
+		message += " Не удалось обработать: " + strings.Join(result.FailureDetails, "; ") + "."
+	} else if len(result.FailedChannels) > 0 {
 		message += " Не удалось обработать: " + strings.Join(result.FailedChannels, ", ") + "."
 	}
 	if result.Outcome == OutcomeDeliveryFailed && result.SummariesSaved {
@@ -311,6 +314,24 @@ func failedChannelNames(batch parser.ChannelBatchResult) []string {
 		}
 	}
 	return names
+}
+
+func failedChannelDetails(batch parser.ChannelBatchResult) []string {
+	details := make([]string, 0, len(batch.Failures))
+	for _, failure := range batch.Failures {
+		name := strings.TrimSpace(failure.Channel.Username)
+		if name == "" {
+			name = "неизвестный канал"
+		} else {
+			name = "@" + name
+		}
+		reason := safeDigestMessage(failure.Err)
+		if reason == "" {
+			reason = "причина не указана"
+		}
+		details = append(details, name+": "+reason)
+	}
+	return details
 }
 
 func optionalInt64(value int64) *int64 {

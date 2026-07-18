@@ -1074,6 +1074,7 @@
       posts: pick(result, ["post_count", "PostCount"], null),
       channels: pick(result, ["channel_count", "ChannelCount"], null),
       failedChannels: asArray(pick(result, ["failed_channels", "FailedChannels"], [])),
+      failureDetails: asArray(pick(result, ["failure_details", "FailureDetails"], [])),
       messageId: pick(result, ["message_id", "MessageID"], null),
       messageUrl: String(pick(result, ["message_url", "MessageURL"], "")),
       summariesSaved: Boolean(pick(result, ["summaries_saved", "SummariesSaved"], false)),
@@ -1084,11 +1085,13 @@
     var posts = job.posts === null || job.posts === undefined ? "" : String(job.posts);
     var channels = job.channels === null || job.channels === undefined ? "" : String(job.channels);
     var failed = job.failedChannels && job.failedChannels.length ? job.failedChannels.join(", ") : "неизвестные каналы";
+    var failureDetails = job.failureDetails && job.failureDetails.length ? job.failureDetails.join("; ") : failed;
     switch (job.outcome) {
       case "succeeded":
         return "✅ Дайджест отправлен! " + posts + " постов от " + channels + " каналов.";
       case "no_posts":
-        return "ℹ️ Нет новых постов для дайджеста.";
+        return "ℹ️ Нет новых постов для дайджеста." +
+          (job.failedChannels && job.failedChannels.length ? " Не удалось обработать: " + failureDetails + "." : "");
       case "partial":
         return "⚠️ Дайджест отправлен частично. Не удалось обработать: " + failed + ". " + posts + " постов от " + channels + " каналов.";
       case "all_channels_failed":

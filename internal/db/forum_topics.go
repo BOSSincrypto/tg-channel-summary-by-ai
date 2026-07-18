@@ -45,14 +45,15 @@ func (r *ForumTopicRepository) upsert(groupID, threadID int64, name string, owne
 	}
 	_, err := r.db.Conn().Exec(`
 		INSERT INTO forum_topics
-			(group_id, message_thread_id, name, status, lifecycle_owned, closed, updated_at)
-		VALUES (?, ?, ?, ?, ?, 0, datetime('now'))
+			(group_id, message_thread_id, name, status, lifecycle_owned, closed, close_pending, updated_at)
+		VALUES (?, ?, ?, ?, ?, 0, 0, datetime('now'))
 		ON CONFLICT(group_id, message_thread_id) DO UPDATE SET
 			name = excluded.name,
 			status = CASE WHEN forum_topics.lifecycle_owned = 1 OR excluded.lifecycle_owned = 1
 				THEN 'persisted' ELSE 'observed' END,
 			lifecycle_owned = MAX(forum_topics.lifecycle_owned, excluded.lifecycle_owned),
-			closed = 0,
+			closed = CASE WHEN forum_topics.lifecycle_owned = 1 THEN forum_topics.closed ELSE 0 END,
+			close_pending = CASE WHEN forum_topics.lifecycle_owned = 1 THEN forum_topics.close_pending ELSE 0 END,
 			updated_at = datetime('now')`,
 		groupID, threadID, name, status, boolToInt(owned),
 	)
@@ -68,14 +69,14 @@ func (r *ForumTopicRepository) Get(groupID, threadID int64) (*model.ForumTopic, 
 		return nil, errors.New("forum topic repository is not configured")
 	}
 	topic := &model.ForumTopic{}
-	var owned, closed int
+	var owned, closed, pending int
 	err := r.db.Conn().QueryRow(`
-		SELECT group_id, message_thread_id, name, status, lifecycle_owned, closed, created_at, updated_at
+		SELECT group_id, message_thread_id, name, status, lifecycle_owned, closed, close_pending, created_at, updated_at
 		FROM forum_topics
 		WHERE group_id = ? AND message_thread_id = ?`,
 		groupID, threadID,
 	).Scan(&topic.GroupID, &topic.MessageThreadID, &topic.Name, &topic.Status,
-		&owned, &closed, &topic.CreatedAt, &topic.UpdatedAt)
+		&owned, &closed, &pending, &topic.CreatedAt, &topic.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -84,6 +85,7 @@ func (r *ForumTopicRepository) Get(groupID, threadID int64) (*model.ForumTopic, 
 	}
 	topic.LifecycleOwned = intToBool(owned)
 	topic.Closed = intToBool(closed)
+	topic.ClosePending = intToBool(pending)
 	return topic, nil
 }
 
@@ -95,7 +97,7 @@ func (r *ForumTopicRepository) ListOpen(groupID int64) ([]model.ForumTopic, erro
 	rows, err := r.db.Conn().Query(`
 		SELECT group_id, message_thread_id, name, status, lifecycle_owned, closed, created_at, updated_at
 		FROM forum_topics
-		WHERE group_id = ? AND closed = 0
+		WHERE group_id = ? AND closed = 0 AND close_pending = 0
 		ORDER BY name COLLATE NOCASE, message_thread_id`,
 		groupID,
 	)
@@ -158,12 +160,72 @@ func (r *ForumTopicRepository) MarkReopened(groupID, threadID int64) error {
 	return r.setClosed(groupID, threadID, false)
 }
 
+// BeginClose durably records that an owned topic is being closed before the
+// Telegram side effect. Pending topics are hidden from the WebApp catalog and
+// can be retried after a process restart.
+func (r *ForumTopicRepository) BeginClose(groupID, threadID int64) error {
+	if r == nil || r.db == nil {
+		return errors.New("forum topic repository is not configured")
+	}
+	result, err := r.db.Conn().Exec(`
+		UPDATE forum_topics
+		SET close_pending = 1, updated_at = datetime('now')
+		WHERE group_id = ? AND message_thread_id = ?
+			AND lifecycle_owned = 1 AND closed = 0`,
+		groupID, threadID,
+	)
+	if err != nil {
+		return fmt.Errorf("begin forum topic close: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("begin forum topic close rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ListPending returns owned topic closes that need bounded retry/reconciliation.
+func (r *ForumTopicRepository) ListPending() ([]model.ForumTopic, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("forum topic repository is not configured")
+	}
+	rows, err := r.db.Conn().Query(`
+		SELECT group_id, message_thread_id, name, status, lifecycle_owned, closed, close_pending, created_at, updated_at
+		FROM forum_topics
+		WHERE close_pending = 1 AND closed = 0 AND lifecycle_owned = 1
+		ORDER BY group_id, message_thread_id`)
+	if err != nil {
+		return nil, fmt.Errorf("list pending forum topics: %w", err)
+	}
+	defer rows.Close()
+	var topics []model.ForumTopic
+	for rows.Next() {
+		var topic model.ForumTopic
+		var owned, closed, pending int
+		if err := rows.Scan(&topic.GroupID, &topic.MessageThreadID, &topic.Name, &topic.Status,
+			&owned, &closed, &pending, &topic.CreatedAt, &topic.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan pending forum topic: %w", err)
+		}
+		topic.LifecycleOwned = intToBool(owned)
+		topic.Closed = intToBool(closed)
+		topic.ClosePending = intToBool(pending)
+		topics = append(topics, topic)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate pending forum topics: %w", err)
+	}
+	return topics, nil
+}
+
 func (r *ForumTopicRepository) setClosed(groupID, threadID int64, closed bool) error {
 	if r == nil || r.db == nil {
 		return errors.New("forum topic repository is not configured")
 	}
 	result, err := r.db.Conn().Exec(`
-		UPDATE forum_topics SET closed = ?, updated_at = datetime('now')
+		UPDATE forum_topics SET closed = ?, close_pending = 0, updated_at = datetime('now')
 		WHERE group_id = ? AND message_thread_id = ?`,
 		boolToInt(closed), groupID, threadID,
 	)

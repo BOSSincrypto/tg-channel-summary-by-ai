@@ -58,6 +58,11 @@ type forumTopicRegistry interface {
 	DeleteOwned(int64, int64) error
 }
 
+type forumTopicCloseCoordinator interface {
+	BeginClose(int64, int64) error
+	ListPending() ([]model.ForumTopic, error)
+}
+
 // GroupLifecycle receives scheduler lifecycle events without coupling the bot
 // package to the scheduler package.
 type GroupLifecycle interface {
@@ -842,6 +847,7 @@ func (s *Service) RemoveChannelTopic(ctx context.Context, groupID, channelID int
 		}
 		return err
 	}
+	var registeredTopic *model.ForumTopic
 	if s.topicRegistry != nil {
 		topic, registryErr := s.topicRegistry.Get(groupID, threadID)
 		if errors.Is(registryErr, db.ErrNotFound) {
@@ -853,6 +859,7 @@ func (s *Service) RemoveChannelTopic(ctx context.Context, groupID, channelID int
 		if !topic.LifecycleOwned {
 			return s.groups.UnassignChannel(groupID, channelID)
 		}
+		registeredTopic = topic
 	}
 	assignments, err := s.groups.GetChannelAssignments(groupID)
 	if err != nil {
@@ -868,6 +875,18 @@ func (s *Service) RemoveChannelTopic(ctx context.Context, groupID, channelID int
 			break
 		}
 	}
+	closeCoordinator, coordinated := s.topicRegistry.(forumTopicCloseCoordinator)
+	if registeredTopic != nil && registeredTopic.Closed {
+		return s.groups.UnassignChannel(groupID, channelID)
+	}
+	if coordinated {
+		if err := closeCoordinator.BeginClose(groupID, threadID); err != nil {
+			if errors.Is(err, db.ErrNotFound) {
+				return s.groups.UnassignChannel(groupID, channelID)
+			}
+			return fmt.Errorf("record topic close intent: %w", err)
+		}
+	}
 	if err := s.groups.UnassignChannel(groupID, channelID); err != nil {
 		return fmt.Errorf("remove topic assignment: %w", err)
 	}
@@ -878,6 +897,9 @@ func (s *Service) RemoveChannelTopic(ctx context.Context, groupID, channelID int
 		ChatID:          groupTelegramChatID(chatID),
 		MessageThreadID: int(threadID),
 	}); err != nil {
+		if coordinated {
+			return fmt.Errorf("close topic: %w; durable close intent remains pending", s.classifyTelegramError(err))
+		}
 		rollbackErr := s.groups.AssignChannel(groupID, channelID, &threadID)
 		if rollbackErr != nil {
 			return fmt.Errorf("close topic: %w; rollback topic assignment: %v", s.classifyTelegramError(err), rollbackErr)
@@ -887,6 +909,9 @@ func (s *Service) RemoveChannelTopic(ctx context.Context, groupID, channelID int
 	if s.topicRegistry != nil {
 		if err := s.topicRegistry.MarkClosed(groupID, threadID); err != nil &&
 			!errors.Is(err, db.ErrNotFound) {
+			if coordinated {
+				return fmt.Errorf("persist closed topic state: %w; durable close intent remains pending", err)
+			}
 			rollbackErr := s.groups.AssignChannel(groupID, channelID, &threadID)
 			if rollbackErr != nil {
 				return fmt.Errorf("persist closed topic state: %w; rollback topic assignment: %v", err, rollbackErr)
@@ -895,6 +920,46 @@ func (s *Service) RemoveChannelTopic(ctx context.Context, groupID, channelID int
 		}
 	}
 	return nil
+}
+
+// ReconcilePendingTopicClosures retries durable close intents once during
+// startup. Pending topics stay hidden from the catalog until Telegram close
+// and registry finalization both succeed.
+func (s *Service) ReconcilePendingTopicClosures(ctx context.Context) error {
+	if s == nil || s.api == nil || s.groups == nil || s.topicRegistry == nil {
+		return nil
+	}
+	coordinator, ok := s.topicRegistry.(forumTopicCloseCoordinator)
+	if !ok {
+		return nil
+	}
+	pending, err := coordinator.ListPending()
+	if err != nil {
+		return fmt.Errorf("list pending topic closes: %w", err)
+	}
+	var reconcileErr error
+	for _, topic := range pending {
+		if !topic.LifecycleOwned {
+			continue
+		}
+		group, err := s.groups.GetByID(topic.GroupID)
+		if err != nil {
+			reconcileErr = errors.Join(reconcileErr, fmt.Errorf("load pending topic group %d: %w", topic.GroupID, err))
+			continue
+		}
+		if err := s.api.CloseForumTopic(ctx, &telego.CloseForumTopicParams{
+			ChatID:          groupTelegramChatID(group.TelegramChatID),
+			MessageThreadID: int(topic.MessageThreadID),
+		}); err != nil {
+			reconcileErr = errors.Join(reconcileErr, fmt.Errorf("reconcile close topic %d: %w", topic.MessageThreadID, s.classifyTelegramError(err)))
+			continue
+		}
+		if err := s.topicRegistry.MarkClosed(topic.GroupID, topic.MessageThreadID); err != nil &&
+			!errors.Is(err, db.ErrNotFound) {
+			reconcileErr = errors.Join(reconcileErr, fmt.Errorf("reconcile registry topic %d: %w", topic.MessageThreadID, err))
+		}
+	}
+	return reconcileErr
 }
 
 func (s *Service) topicAssignment(groupID, channelID int64) (threadID, chatID int64, err error) {

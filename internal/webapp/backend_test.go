@@ -471,6 +471,90 @@ func TestProductionTopicLifecycleFailureLeavesAssignmentUnchanged(t *testing.T) 
 	}
 }
 
+func TestProductionWebAppTopicCloseFailureLeavesDurablePendingState(t *testing.T) {
+	server, store := newBackendTestServer(t)
+	lifecycle := &failureRecoverableTopicLifecycle{store: store, failMarkClosed: true}
+	server.SetTopicLifecycle(lifecycle)
+
+	channelID, err := store.Channels.Insert(&model.Channel{Username: "webapp_pending_close", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	groupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: -1011,
+		Title:          "Forum",
+		Status:         model.GroupStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+
+	assigned := doJSON(t, server.Handler(), http.MethodPost,
+		"/api/groups/"+jsonNumber(groupID)+"/channels",
+		`{"channel_id":"`+jsonNumber(channelID)+`"}`)
+	if assigned.Code != http.StatusCreated {
+		t.Fatalf("assignment status = %d, body=%s", assigned.Code, assigned.Body.String())
+	}
+	if err := store.ForumTopics.BeginClose(groupID, lifecycle.threadID); err != nil {
+		t.Fatalf("record simulated pending close: %v", err)
+	}
+	pendingView := doJSON(t, server.Handler(), http.MethodGet,
+		"/api/groups/"+jsonNumber(groupID), "")
+	if pendingView.Code != http.StatusOK {
+		t.Fatalf("pending group status = %d, body=%s", pendingView.Code, pendingView.Body.String())
+	}
+	var pendingGroup map[string]any
+	if err := json.Unmarshal(pendingView.Body.Bytes(), &pendingGroup); err != nil {
+		t.Fatalf("decode pending group: %v", err)
+	}
+	if assignments, ok := pendingGroup["assignments"].([]any); !ok || len(assignments) != 0 {
+		t.Fatalf("pending assignments view = %#v, want hidden", pendingGroup["assignments"])
+	}
+	if err := store.ForumTopics.MarkReopened(groupID, lifecycle.threadID); err != nil {
+		t.Fatalf("clear simulated pending close: %v", err)
+	}
+	removed := doJSON(t, server.Handler(), http.MethodDelete,
+		"/api/groups/"+jsonNumber(groupID)+"/channels/"+jsonNumber(channelID), "")
+	if removed.Code != http.StatusInternalServerError {
+		t.Fatalf("removal status = %d, body=%s", removed.Code, removed.Body.String())
+	}
+	if len(lifecycle.closeForumTopicCalls) != 1 {
+		t.Fatalf("CloseForumTopic calls = %d, want one successful external close", len(lifecycle.closeForumTopicCalls))
+	}
+	assignments, err := store.Groups.GetChannelAssignments(groupID)
+	if err != nil {
+		t.Fatalf("load assignments after failed mark: %v", err)
+	}
+	if len(assignments) != 0 {
+		t.Fatalf("assignments after failed mark = %#v, want removed", assignments)
+	}
+	topic, err := store.ForumTopics.Get(groupID, lifecycle.threadID)
+	if err != nil {
+		t.Fatalf("load pending topic: %v", err)
+	}
+	if !topic.ClosePending || topic.Closed {
+		t.Fatalf("topic after failed mark = %#v, want pending recovery", topic)
+	}
+
+	lifecycle.failMarkClosed = false
+	if err := lifecycle.Reconcile(); err != nil {
+		t.Fatalf("reconcile pending topic: %v", err)
+	}
+	topic, err = store.ForumTopics.Get(groupID, lifecycle.threadID)
+	if err != nil {
+		t.Fatalf("load reconciled topic: %v", err)
+	}
+	if !topic.Closed || topic.ClosePending {
+		t.Fatalf("topic after reconciliation = %#v, want closed", topic)
+	}
+	if err := lifecycle.Reconcile(); err != nil {
+		t.Fatalf("repeat reconcile: %v", err)
+	}
+	if len(lifecycle.closeForumTopicCalls) != 2 {
+		t.Fatalf("repeat CloseForumTopic calls = %d, want idempotent recovery", len(lifecycle.closeForumTopicCalls))
+	}
+}
+
 func TestNonForumAssignmentDoesNotCallTopicLifecycle(t *testing.T) {
 	server, store := newBackendTestServer(t)
 	lifecycle := &fakeTopicLifecycle{store: store}
@@ -761,6 +845,59 @@ type fakeTopicLifecycle struct {
 	err     error
 	created [][2]int64
 	removed [][2]int64
+}
+
+type failureRecoverableTopicLifecycle struct {
+	store                *db.DB
+	threadID             int64
+	failMarkClosed       bool
+	closeForumTopicCalls [][2]int64
+}
+
+func (f *failureRecoverableTopicLifecycle) CreateChannelTopic(_ context.Context, groupID, channelID int64) error {
+	f.threadID = 2100
+	if err := f.store.Groups.UpdateChannelTopic(groupID, channelID, f.threadID); err != nil {
+		return err
+	}
+	return f.store.ForumTopics.PersistOwned(groupID, f.threadID, "WebApp pending")
+}
+
+func (f *failureRecoverableTopicLifecycle) RemoveChannelTopic(_ context.Context, groupID, channelID int64) error {
+	assignments, err := f.store.Groups.GetChannelAssignments(groupID)
+	if err != nil {
+		return err
+	}
+	if len(assignments) != 1 || assignments[0].TopicThreadID == nil {
+		return db.ErrNotFound
+	}
+	if err := f.store.ForumTopics.BeginClose(groupID, *assignments[0].TopicThreadID); err != nil {
+		return err
+	}
+	if err := f.store.Groups.UnassignChannel(groupID, channelID); err != nil {
+		return err
+	}
+	f.closeForumTopicCalls = append(f.closeForumTopicCalls, [2]int64{groupID, *assignments[0].TopicThreadID})
+	if f.failMarkClosed {
+		return errors.New("injected MarkClosed failure")
+	}
+	return f.store.ForumTopics.MarkClosed(groupID, *assignments[0].TopicThreadID)
+}
+
+func (f *failureRecoverableTopicLifecycle) Reconcile() error {
+	pending, err := f.store.ForumTopics.ListPending()
+	if err != nil {
+		return err
+	}
+	for _, topic := range pending {
+		f.closeForumTopicCalls = append(f.closeForumTopicCalls, [2]int64{topic.GroupID, topic.MessageThreadID})
+		if f.failMarkClosed {
+			return errors.New("injected MarkClosed failure")
+		}
+		if err := f.store.ForumTopics.MarkClosed(topic.GroupID, topic.MessageThreadID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type staticTopicCatalog struct {

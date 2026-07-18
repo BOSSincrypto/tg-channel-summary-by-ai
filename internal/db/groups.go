@@ -242,6 +242,15 @@ func (r *GroupRepository) ListForumTopics(groupID int64) ([]model.ForumTopic, er
 	return r.db.ForumTopics.ListOpen(groupID)
 }
 
+// GetForumTopic returns the durable registry state, including pending and
+// closed topics, for consistency checks at presentation boundaries.
+func (r *GroupRepository) GetForumTopic(groupID, threadID int64) (*model.ForumTopic, error) {
+	if r == nil || r.db == nil || r.db.ForumTopics == nil {
+		return nil, errors.New("forum topic repository is not configured")
+	}
+	return r.db.ForumTopics.Get(groupID, threadID)
+}
+
 // GetChannelsForGroup returns full channel objects assigned to a group.
 func (r *GroupRepository) GetChannelsForGroup(groupID int64) ([]model.Channel, error) {
 	rows, err := r.db.Conn().Query(

@@ -133,6 +133,10 @@ type dbGroupRepository interface {
 	UnassignChannel(int64, int64) error
 }
 
+type forumTopicStateLookup interface {
+	GetForumTopic(int64, int64) (*model.ForumTopic, error)
+}
+
 type dbChannelLookup interface {
 	GetByID(int64) (*model.Channel, error)
 }
@@ -468,6 +472,17 @@ func (s *Server) groupAssignments(groupID int64, forum bool) ([]map[string]any, 
 	}
 	result := make([]map[string]any, 0, len(assignments))
 	for _, assignment := range assignments {
+		if forum && assignment.TopicThreadID != nil {
+			if lookup, ok := s.groupService.repository.(forumTopicStateLookup); ok {
+				topic, topicErr := lookup.GetForumTopic(groupID, *assignment.TopicThreadID)
+				if topicErr == nil && (topic.Closed || topic.ClosePending) {
+					continue
+				}
+				if topicErr != nil && !errors.Is(topicErr, db.ErrNotFound) {
+					return nil, topicErr
+				}
+			}
+		}
 		item := map[string]any{"channel_id": assignment.ChannelID}
 		if forum && assignment.TopicThreadID != nil && *assignment.TopicThreadID > 0 {
 			item["topic_thread_id"] = *assignment.TopicThreadID

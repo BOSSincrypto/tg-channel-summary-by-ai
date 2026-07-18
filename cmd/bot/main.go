@@ -111,6 +111,11 @@ func main() {
 		log.Fatalf("failed to configure Telegram bot: %v", err)
 	}
 	telegramBot.SetTokenRevocationHandler(revocationHandler)
+	srv.SetTopicLifecycle(telegramBot)
+	telegramBot.SetForumTopicRegistry(store.ForumTopics)
+	if err := telegramBot.ReconcilePendingTopicClosures(context.Background()); err != nil {
+		log.Printf("pending forum topic reconciliation incomplete: %v", err)
+	}
 	appLifecycle.Add(srv)
 	appLifecycle.Add(maintenanceSvc)
 	appLifecycle.Add(sched)
@@ -131,8 +136,6 @@ func main() {
 	telegramBot.SetSettingsApplier(func(ctx context.Context, _ *telego.Message, settings bot.BotSettings) error {
 		return applyProductionSettings(ctx, store, sched, settings)
 	})
-	srv.SetTopicLifecycle(telegramBot)
-	telegramBot.SetForumTopicRegistry(store.ForumTopics)
 	go func() {
 		log.Printf("HTTP server listening on :%s", cfg.Port)
 		if err := srv.Start(cfg.Port); err != nil {

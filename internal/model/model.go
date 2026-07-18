@@ -49,6 +49,7 @@ type ForumTopic struct {
 	Status          string
 	LifecycleOwned  bool
 	Closed          bool
+	ClosePending    bool
 	CreatedAt       string
 	UpdatedAt       string
 }

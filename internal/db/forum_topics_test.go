@@ -95,3 +95,47 @@ func TestForumTopicRegistryDeletesOnlyLifecycleOwnedTopics(t *testing.T) {
 		t.Fatalf("owned topic after delete = %v, want ErrNotFound", err)
 	}
 }
+
+func TestForumTopicRegistryPersistsPendingCloseAndHidesItFromCatalog(t *testing.T) {
+	store, cleanup := newTestDB(t)
+	defer cleanup()
+	groupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: -100205,
+		Status:         model.GroupStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	if err := store.ForumTopics.PersistOwned(groupID, 905, "Pending"); err != nil {
+		t.Fatalf("persist owned topic: %v", err)
+	}
+
+	if err := store.ForumTopics.BeginClose(groupID, 905); err != nil {
+		t.Fatalf("begin close: %v", err)
+	}
+	topic, err := store.ForumTopics.Get(groupID, 905)
+	if err != nil {
+		t.Fatalf("get pending topic: %v", err)
+	}
+	if !topic.ClosePending || topic.Closed {
+		t.Fatalf("pending topic = %#v, want pending and open", topic)
+	}
+	topics, err := store.ForumTopics.ListOpen(groupID)
+	if err != nil {
+		t.Fatalf("list open topics: %v", err)
+	}
+	if len(topics) != 0 {
+		t.Fatalf("open topics = %#v, want pending topic hidden", topics)
+	}
+
+	if err := store.ForumTopics.MarkClosed(groupID, 905); err != nil {
+		t.Fatalf("mark closed: %v", err)
+	}
+	topic, err = store.ForumTopics.Get(groupID, 905)
+	if err != nil {
+		t.Fatalf("get closed topic: %v", err)
+	}
+	if !topic.Closed || topic.ClosePending {
+		t.Fatalf("closed topic = %#v, want finalized", topic)
+	}
+}

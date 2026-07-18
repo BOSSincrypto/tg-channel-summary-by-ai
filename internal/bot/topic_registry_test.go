@@ -2,12 +2,25 @@ package bot
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
 	"github.com/mymmrac/telego"
 )
+
+type markClosedFailureRegistry struct {
+	*db.ForumTopicRepository
+	failMarkClosed bool
+}
+
+func (r *markClosedFailureRegistry) MarkClosed(groupID, threadID int64) error {
+	if r.failMarkClosed {
+		return errors.New("injected MarkClosed failure")
+	}
+	return r.ForumTopicRepository.MarkClosed(groupID, threadID)
+}
 
 func TestProductionTelegramTopicUpdatePersistsUnassignedObservedTopic(t *testing.T) {
 	store, err := db.Open(":memory:")
@@ -152,5 +165,90 @@ func TestCreateChannelTopicPersistsLifecycleOwnership(t *testing.T) {
 	}
 	if !topic.LifecycleOwned || topic.Status != model.ForumTopicStatusPersisted {
 		t.Fatalf("persisted topic = %#v", topic)
+	}
+}
+
+func TestProductionTopicCloseFailureLeavesDurablePendingRecovery(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+	groupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: -100304,
+		Title:          "Forum",
+		Status:         model.GroupStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	channelID, err := store.Channels.Insert(&model.Channel{Username: "pending_close"})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	threadID := int64(1902)
+	if err := store.Groups.AssignChannel(groupID, channelID, &threadID); err != nil {
+		t.Fatalf("assign channel: %v", err)
+	}
+	if err := store.ForumTopics.PersistOwned(groupID, threadID, "Pending close"); err != nil {
+		t.Fatalf("persist topic: %v", err)
+	}
+
+	api := &fakeTelegramClient{}
+	registry := &markClosedFailureRegistry{
+		ForumTopicRepository: store.ForumTopics,
+		failMarkClosed:       true,
+	}
+	service := newServiceForTest(api, nil)
+	service.groups = store.Groups
+	service.SetForumTopicRegistry(registry)
+
+	if err := service.RemoveChannelTopic(context.Background(), groupID, channelID); err == nil {
+		t.Fatal("remove topic succeeded despite injected MarkClosed failure")
+	}
+	if len(api.closedTopics) != 1 || api.closedTopics[0].MessageThreadID != int(threadID) {
+		t.Fatalf("close calls = %#v, want one successful close", api.closedTopics)
+	}
+	assignments, err := store.Groups.GetChannelAssignments(groupID)
+	if err != nil {
+		t.Fatalf("load assignments after close: %v", err)
+	}
+	if len(assignments) != 0 {
+		t.Fatalf("assignments after close failure = %#v, want removed", assignments)
+	}
+	topic, err := store.ForumTopics.Get(groupID, threadID)
+	if err != nil {
+		t.Fatalf("load pending topic: %v", err)
+	}
+	if !topic.ClosePending || topic.Closed {
+		t.Fatalf("topic after MarkClosed failure = %#v, want durable pending state", topic)
+	}
+	openTopics, err := store.ForumTopics.ListOpen(groupID)
+	if err != nil {
+		t.Fatalf("list open topics: %v", err)
+	}
+	if len(openTopics) != 0 {
+		t.Fatalf("open topics after MarkClosed failure = %#v, want none", openTopics)
+	}
+
+	registry.failMarkClosed = false
+	if err := service.ReconcilePendingTopicClosures(context.Background()); err != nil {
+		t.Fatalf("reconcile pending close: %v", err)
+	}
+	if len(api.closedTopics) != 2 {
+		t.Fatalf("reconciliation close calls = %d, want idempotent retry", len(api.closedTopics))
+	}
+	topic, err = store.ForumTopics.Get(groupID, threadID)
+	if err != nil {
+		t.Fatalf("load reconciled topic: %v", err)
+	}
+	if !topic.Closed || topic.ClosePending {
+		t.Fatalf("topic after reconciliation = %#v, want closed and finalized", topic)
+	}
+	if err := service.ReconcilePendingTopicClosures(context.Background()); err != nil {
+		t.Fatalf("repeat reconciliation: %v", err)
+	}
+	if len(api.closedTopics) != 2 {
+		t.Fatalf("repeat reconciliation close calls = %d, want idempotent no-op", len(api.closedTopics))
 	}
 }

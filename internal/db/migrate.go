@@ -25,6 +25,9 @@ func runMigrations(conn *sql.DB) error {
 	if err := ensureProviderNameUniqueness(conn); err != nil {
 		return fmt.Errorf("migrate provider name uniqueness: %w", err)
 	}
+	if err := ensureForumTopicClosePendingColumn(conn); err != nil {
+		return fmt.Errorf("migrate forum topic recovery state: %w", err)
+	}
 	return nil
 }
 
@@ -138,6 +141,36 @@ func ensureProviderNameUniqueness(conn *sql.DB) error {
 	return nil
 }
 
+func ensureForumTopicClosePendingColumn(conn *sql.DB) error {
+	rows, err := conn.Query("PRAGMA table_info(forum_topics)")
+	if err != nil {
+		return fmt.Errorf("inspect forum_topics table: %w", err)
+	}
+	defer rows.Close()
+
+	hasClosePending := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return fmt.Errorf("scan forum_topics column: %w", err)
+		}
+		if name == "close_pending" {
+			hasClosePending = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate forum_topics columns: %w", err)
+	}
+	if !hasClosePending {
+		if _, err := conn.Exec(`ALTER TABLE forum_topics ADD COLUMN close_pending INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("add forum_topics.close_pending: %w", err)
+		}
+	}
+	return nil
+}
+
 // migrations is an ordered list of DDL statements that define the database schema.
 // They must be applied in order.
 var migrations = []string{
@@ -189,6 +222,7 @@ var migrations = []string{
 		status TEXT NOT NULL DEFAULT 'observed',
 		lifecycle_owned INTEGER NOT NULL DEFAULT 0,
 		closed INTEGER NOT NULL DEFAULT 0,
+		close_pending INTEGER NOT NULL DEFAULT 0,
 		created_at TEXT DEFAULT (datetime('now')),
 		updated_at TEXT DEFAULT (datetime('now')),
 		PRIMARY KEY (group_id, message_thread_id)

@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -230,6 +231,15 @@ func (r *GroupRepository) GetChannelAssignments(groupID int64) ([]model.GroupCha
 		assignments = append(assignments, gc)
 	}
 	return assignments, rows.Err()
+}
+
+// ListForumTopics returns durable, open topics observed for a group. The
+// registry is deliberately separate from channel assignments.
+func (r *GroupRepository) ListForumTopics(groupID int64) ([]model.ForumTopic, error) {
+	if r == nil || r.db == nil || r.db.ForumTopics == nil {
+		return nil, errors.New("forum topic repository is not configured")
+	}
+	return r.db.ForumTopics.ListOpen(groupID)
 }
 
 // GetChannelsForGroup returns full channel objects assigned to a group.

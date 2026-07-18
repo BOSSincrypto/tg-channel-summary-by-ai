@@ -22,6 +22,7 @@ type DB struct {
 	Digests           *DigestRepository
 	Providers         *ProviderRepository
 	Config            *ConfigRepository
+	ForumTopics       *ForumTopicRepository
 	providerKeyCipher *secretCipher
 }
 
@@ -108,6 +109,7 @@ func OpenWithEncryptionKey(path, keyMaterial string) (*DB, error) {
 	db.Digests = &DigestRepository{db: db}
 	db.Providers = &ProviderRepository{db: db, keyCipher: keyCipher}
 	db.Config = &ConfigRepository{db: db}
+	db.ForumTopics = &ForumTopicRepository{db: db}
 
 	return db, nil
 }

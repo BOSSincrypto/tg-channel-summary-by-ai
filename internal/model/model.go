@@ -40,6 +40,24 @@ type GroupChannel struct {
 	TopicThreadID *int64 // nil if no specific topic
 }
 
+// ForumTopic is a durable record of a topic observed in a Telegram forum.
+// LifecycleOwned is true only for topics created by this bot.
+type ForumTopic struct {
+	GroupID         int64
+	MessageThreadID int64
+	Name            string
+	Status          string
+	LifecycleOwned  bool
+	Closed          bool
+	CreatedAt       string
+	UpdatedAt       string
+}
+
+const (
+	ForumTopicStatusObserved  = "observed"
+	ForumTopicStatusPersisted = "persisted"
+)
+
 // GroupSettings holds per-group AI and scheduling configuration.
 type GroupSettings struct {
 	GroupID    int64

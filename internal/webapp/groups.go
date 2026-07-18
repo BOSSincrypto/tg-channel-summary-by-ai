@@ -42,10 +42,9 @@ type Topic struct {
 	Name            string `json:"name"`
 }
 
-// TopicCatalog provides the existing forum topics for a group. Telegram has
-// no Bot API method for listing topics, so production implementations may use
-// persisted assignments while tests or integrations can inject an
-// authoritative catalog.
+// TopicCatalog provides forum topics observed through the Telegram lifecycle
+// boundary. Telegram has no Bot API method for listing historical topics, so
+// production implementations must read the durable observed registry.
 type TopicCatalog interface {
 	ListTopics(context.Context, int64) ([]Topic, error)
 }
@@ -111,6 +110,7 @@ type dbGroupRepository interface {
 	List() ([]model.Group, error)
 	Delete(int64) error
 	GetChannelAssignments(int64) ([]model.GroupChannel, error)
+	ListForumTopics(int64) ([]model.ForumTopic, error)
 	AssignChannel(int64, int64, *int64) error
 	UnassignChannel(int64, int64) error
 }
@@ -121,7 +121,7 @@ type dbChannelLookup interface {
 
 func NewGroupService(repository dbGroupRepository, channels dbChannelLookup) *GroupService {
 	service := &GroupService{repository: repository, channels: channels, verifier: permissiveGroupVerifier{}}
-	service.catalog = persistedTopicCatalog{repository: repository, channels: channels}
+	service.catalog = persistedTopicCatalog{repository: repository}
 	return service
 }
 
@@ -137,7 +137,7 @@ func (s *GroupService) SetTopicCatalog(catalog TopicCatalog) {
 		return
 	}
 	if catalog == nil {
-		s.catalog = persistedTopicCatalog{repository: s.repository, channels: s.channels}
+		s.catalog = persistedTopicCatalog{repository: s.repository}
 		return
 	}
 	s.catalog = catalog
@@ -145,35 +145,22 @@ func (s *GroupService) SetTopicCatalog(catalog TopicCatalog) {
 
 type persistedTopicCatalog struct {
 	repository dbGroupRepository
-	channels   dbChannelLookup
 }
 
 func (c persistedTopicCatalog) ListTopics(_ context.Context, groupID int64) ([]Topic, error) {
-	assignments, err := c.repository.GetChannelAssignments(groupID)
+	registry, err := c.repository.ListForumTopics(groupID)
 	if err != nil {
 		return nil, err
 	}
-	topics := make([]Topic, 0, len(assignments))
-	seen := make(map[int64]struct{}, len(assignments))
-	for _, assignment := range assignments {
-		if assignment.TopicThreadID == nil || *assignment.TopicThreadID <= 0 {
+	topics := make([]Topic, 0, len(registry))
+	for _, topic := range registry {
+		if topic.MessageThreadID <= 0 || strings.TrimSpace(topic.Name) == "" {
 			continue
 		}
-		threadID := *assignment.TopicThreadID
-		if _, ok := seen[threadID]; ok {
-			continue
-		}
-		seen[threadID] = struct{}{}
-		name := fmt.Sprintf("Топик %d", threadID)
-		if channel, lookupErr := c.channels.GetByID(assignment.ChannelID); lookupErr == nil {
-			name = strings.TrimSpace(channel.Title)
-			if name == "" {
-				name = "@" + channel.Username
-			}
-		} else if !errors.Is(lookupErr, db.ErrNotFound) {
-			return nil, lookupErr
-		}
-		topics = append(topics, Topic{MessageThreadID: threadID, Name: name})
+		topics = append(topics, Topic{
+			MessageThreadID: topic.MessageThreadID,
+			Name:            strings.TrimSpace(topic.Name),
+		})
 	}
 	return topics, nil
 }
@@ -525,7 +512,7 @@ func (s *GroupService) listTopics(ctx context.Context, groupID int64) ([]Topic, 
 		}
 		seen[topic.MessageThreadID] = struct{}{}
 		if strings.TrimSpace(topic.Name) == "" {
-			topic.Name = fmt.Sprintf("Топик %d", topic.MessageThreadID)
+			continue
 		}
 		result = append(result, topic)
 	}

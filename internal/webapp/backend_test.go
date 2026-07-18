@@ -518,6 +518,9 @@ func TestForumTopicCatalogReturnsPersistedPositiveTopics(t *testing.T) {
 	if err := store.Groups.AssignChannel(groupID, channelID, &threadID); err != nil {
 		t.Fatalf("assign topic: %v", err)
 	}
+	if err := store.ForumTopics.Observe(groupID, threadID, "Catalog News"); err != nil {
+		t.Fatalf("observe assigned topic: %v", err)
+	}
 
 	response := doJSON(t, server.Handler(), http.MethodGet, "/api/groups/"+jsonNumber(groupID)+"/topics", "")
 	if response.Code != http.StatusOK {
@@ -529,6 +532,73 @@ func TestForumTopicCatalogReturnsPersistedPositiveTopics(t *testing.T) {
 	}
 	if len(topics) != 1 || topics[0]["message_thread_id"] != float64(threadID) || topics[0]["name"] != "Catalog News" {
 		t.Fatalf("topics = %#v, want persisted positive topic", topics)
+	}
+}
+
+func TestProductionForumTopicCatalogReturnsUnassignedObservedTopic(t *testing.T) {
+	server, store := newBackendTestServer(t)
+	groupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: -1018,
+		Title:          "Observed Forum",
+		Status:         model.GroupStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	if err := store.ForumTopics.Observe(groupID, 1501, "Existing unassigned topic"); err != nil {
+		t.Fatalf("observe topic: %v", err)
+	}
+
+	response := doJSON(t, server.Handler(), http.MethodGet,
+		"/api/groups/"+jsonNumber(groupID)+"/topics", "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("topics status = %d, body=%s", response.Code, response.Body.String())
+	}
+	var topics []Topic
+	if err := json.Unmarshal(response.Body.Bytes(), &topics); err != nil {
+		t.Fatalf("decode topics: %v", err)
+	}
+	if len(topics) != 1 || topics[0].MessageThreadID != 1501 ||
+		topics[0].Name != "Existing unassigned topic" {
+		t.Fatalf("topics = %#v, want the real unassigned topic", topics)
+	}
+	if assignments, err := store.Groups.GetChannelAssignments(groupID); err != nil {
+		t.Fatalf("load assignments: %v", err)
+	} else if len(assignments) != 0 {
+		t.Fatalf("topic discovery created assignments = %#v", assignments)
+	}
+}
+
+func TestProductionForumTopicSelectionReusesObservedTopic(t *testing.T) {
+	server, store := newBackendTestServer(t)
+	groupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: -1019,
+		Title:          "Observed Forum",
+		Status:         model.GroupStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	channelID, err := store.Channels.Insert(&model.Channel{Username: "observed_selection", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	if err := store.ForumTopics.Observe(groupID, 1502, "Reusable topic"); err != nil {
+		t.Fatalf("observe topic: %v", err)
+	}
+	response := doJSON(t, server.Handler(), http.MethodPost,
+		"/api/groups/"+jsonNumber(groupID)+"/channels",
+		`{"channel_id":"`+jsonNumber(channelID)+`","topic_thread_id":1502}`)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("selection status = %d, body=%s", response.Code, response.Body.String())
+	}
+	assignments, err := store.Groups.GetChannelAssignments(groupID)
+	if err != nil {
+		t.Fatalf("load selected assignment: %v", err)
+	}
+	if len(assignments) != 1 || assignments[0].TopicThreadID == nil ||
+		*assignments[0].TopicThreadID != 1502 {
+		t.Fatalf("selected assignment = %#v", assignments)
 	}
 }
 

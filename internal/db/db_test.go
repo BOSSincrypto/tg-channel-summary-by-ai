@@ -260,7 +260,7 @@ func TestSchemaExists(t *testing.T) {
 	defer cleanup()
 
 	expectedTables := []string{
-		"channels", "groups", "group_channels", "ai_providers",
+		"channels", "groups", "group_channels", "forum_topics", "ai_providers",
 		"group_settings", "posts", "digests", "digest_posts", "config",
 	}
 
@@ -300,6 +300,7 @@ func TestSchemaColumns(t *testing.T) {
 		{"channels", []string{"id", "username", "title", "enabled", "last_post_id", "fetch_error_kind", "fetch_error_message", "fetch_error_at", "created_at"}},
 		{"groups", []string{"id", "telegram_chat_id", "title", "created_at"}},
 		{"group_channels", []string{"group_id", "channel_id", "topic_thread_id"}},
+		{"forum_topics", []string{"group_id", "message_thread_id", "name", "status", "lifecycle_owned", "closed", "created_at", "updated_at"}},
 		{"ai_providers", []string{"id", "name", "base_url", "api_key", "default_model", "is_default", "created_at"}},
 		{"group_settings", []string{"group_id", "provider_id", "model", "digest_time", "timezone"}},
 		{"posts", []string{"id", "channel_id", "message_id", "text", "summary", "posted_at", "url", "content_hash", "link_urls_hash", "created_at"}},

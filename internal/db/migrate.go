@@ -180,6 +180,21 @@ var migrations = []string{
 	)`,
 
 	// --------------------------------------------------
+	// 4. forum_topics (durable observed Telegram topic registry)
+	// --------------------------------------------------
+	`CREATE TABLE IF NOT EXISTS forum_topics (
+		group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+		message_thread_id INTEGER NOT NULL CHECK (message_thread_id > 0),
+		name TEXT NOT NULL,
+		status TEXT NOT NULL DEFAULT 'observed',
+		lifecycle_owned INTEGER NOT NULL DEFAULT 0,
+		closed INTEGER NOT NULL DEFAULT 0,
+		created_at TEXT DEFAULT (datetime('now')),
+		updated_at TEXT DEFAULT (datetime('now')),
+		PRIMARY KEY (group_id, message_thread_id)
+	)`,
+
+	// --------------------------------------------------
 	// 4. ai_providers
 	// --------------------------------------------------
 	`CREATE TABLE IF NOT EXISTS ai_providers (
@@ -261,4 +276,5 @@ var migrations = []string{
 	`CREATE INDEX IF NOT EXISTS idx_digests_group_id ON digests(group_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_group_channels_group ON group_channels(group_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_group_channels_channel ON group_channels(channel_id)`,
+	`CREATE INDEX IF NOT EXISTS idx_forum_topics_group_open ON forum_topics(group_id, closed, message_thread_id)`,
 }

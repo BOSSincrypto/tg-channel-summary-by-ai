@@ -131,6 +131,7 @@ func main() {
 		return applyProductionSettings(ctx, store, sched, settings)
 	})
 	srv.SetTopicLifecycle(telegramBot)
+	telegramBot.SetForumTopicRegistry(store.ForumTopics)
 	go func() {
 		log.Printf("HTTP server listening on :%s", cfg.Port)
 		if err := srv.Start(cfg.Port); err != nil {

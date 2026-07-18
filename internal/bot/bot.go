@@ -48,6 +48,16 @@ type ownerNotifier interface {
 	NotifyOwner(context.Context, string) error
 }
 
+type forumTopicRegistry interface {
+	Observe(int64, int64, string) error
+	PersistOwned(int64, int64, string) error
+	Get(int64, int64) (*model.ForumTopic, error)
+	MarkEdited(int64, int64, string) error
+	MarkClosed(int64, int64) error
+	MarkReopened(int64, int64) error
+	DeleteOwned(int64, int64) error
+}
+
 // GroupLifecycle receives scheduler lifecycle events without coupling the bot
 // package to the scheduler package.
 type GroupLifecycle interface {
@@ -73,6 +83,7 @@ type Service struct {
 	ownerID        string
 	botName        string
 	webAppURL      string
+	topicRegistry  forumTopicRegistry
 	commands       map[string]CommandHandler
 	applyData      func(context.Context, *telego.Message, BotSettings) error
 	onTokenRevoked func(error)
@@ -163,6 +174,14 @@ func (s *Service) SetSettingsApplier(applier func(context.Context, *telego.Messa
 func (s *Service) SetTokenRevocationHandler(handler func(error)) {
 	if s != nil {
 		s.onTokenRevoked = handler
+	}
+}
+
+// SetForumTopicRegistry connects Telegram lifecycle/discovery updates to the
+// durable registry used by the WebApp catalog.
+func (s *Service) SetForumTopicRegistry(registry forumTopicRegistry) {
+	if s != nil {
+		s.topicRegistry = registry
 	}
 }
 
@@ -318,6 +337,9 @@ func (s *Service) handleMessage(ctx context.Context, message *telego.Message) er
 	if message == nil {
 		return nil
 	}
+	if err := s.observeForumTopicMessage(message); err != nil {
+		return err
+	}
 	if message.WebAppData != nil {
 		return s.handleWebAppData(ctx, message)
 	}
@@ -331,6 +353,54 @@ func (s *Service) handleMessage(ctx context.Context, message *telego.Message) er
 		return nil
 	}
 	return handler(ctx, message, argument)
+}
+
+func (s *Service) observeForumTopicMessage(message *telego.Message) error {
+	if s == nil || s.topicRegistry == nil || s.groups == nil || message == nil ||
+		message.Chat.Type != telego.ChatTypeSupergroup {
+		return nil
+	}
+	threadID := int64(message.MessageThreadID)
+	if threadID <= 0 {
+		return nil
+	}
+	group, err := s.groups.GetByChatID(message.Chat.ID)
+	if errors.Is(err, db.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("find forum topic group %d: %w", message.Chat.ID, err)
+	}
+	if group.Status != "" && group.Status != model.GroupStatusActive {
+		return nil
+	}
+	switch {
+	case message.ForumTopicCreated != nil:
+		name := strings.TrimSpace(message.ForumTopicCreated.Name)
+		if name == "" {
+			return nil
+		}
+		return s.topicRegistry.Observe(group.ID, threadID, name)
+	case message.ForumTopicEdited != nil:
+		if strings.TrimSpace(message.ForumTopicEdited.Name) == "" {
+			return nil
+		}
+		if err := s.topicRegistry.MarkEdited(group.ID, threadID, message.ForumTopicEdited.Name); err != nil &&
+			!errors.Is(err, db.ErrNotFound) {
+			return err
+		}
+	case message.ForumTopicClosed != nil:
+		if err := s.topicRegistry.MarkClosed(group.ID, threadID); err != nil &&
+			!errors.Is(err, db.ErrNotFound) {
+			return err
+		}
+	case message.ForumTopicReopened != nil:
+		if err := s.topicRegistry.MarkReopened(group.ID, threadID); err != nil &&
+			!errors.Is(err, db.ErrNotFound) {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Service) configureAdminCommands() {
@@ -711,6 +781,22 @@ func (s *Service) CreateChannelTopic(ctx context.Context, groupID, channelID int
 		}
 		return fmt.Errorf("persist topic for channel %d: %w", channelID, err)
 	}
+	if s.topicRegistry != nil {
+		if err := s.topicRegistry.PersistOwned(groupID, int64(topic.MessageThreadID), name); err != nil {
+			rollbackErr := s.groups.UnassignChannel(groupID, channelID)
+			cleanupErr := s.api.DeleteForumTopic(ctx, &telego.DeleteForumTopicParams{
+				ChatID:          groupTelegramChatID(group.TelegramChatID),
+				MessageThreadID: int(topic.MessageThreadID),
+			})
+			if rollbackErr != nil {
+				return fmt.Errorf("persist topic registry for channel %d: %w; rollback assignment: %v", channelID, err, rollbackErr)
+			}
+			if cleanupErr != nil {
+				return fmt.Errorf("persist topic registry for channel %d: %w; rollback topic: %v", channelID, err, s.classifyTelegramError(cleanupErr))
+			}
+			return fmt.Errorf("persist topic registry for channel %d: %w", channelID, err)
+		}
+	}
 	return nil
 }
 
@@ -740,7 +826,8 @@ func (s *Service) RenameChannelTopic(ctx context.Context, groupID, channelID int
 	return nil
 }
 
-// RemoveChannelTopic closes the topic before removing its persisted assignment.
+// RemoveChannelTopic removes an assignment and closes the Telegram topic only
+// when the durable registry proves that this bot created it.
 func (s *Service) RemoveChannelTopic(ctx context.Context, groupID, channelID int64) error {
 	if s == nil || s.api == nil {
 		return errors.New("bot service is not configured")
@@ -754,6 +841,18 @@ func (s *Service) RemoveChannelTopic(ctx context.Context, groupID, channelID int
 			return s.groups.UnassignChannel(groupID, channelID)
 		}
 		return err
+	}
+	if s.topicRegistry != nil {
+		topic, registryErr := s.topicRegistry.Get(groupID, threadID)
+		if errors.Is(registryErr, db.ErrNotFound) {
+			return s.groups.UnassignChannel(groupID, channelID)
+		}
+		if registryErr != nil {
+			return fmt.Errorf("load forum topic ownership: %w", registryErr)
+		}
+		if !topic.LifecycleOwned {
+			return s.groups.UnassignChannel(groupID, channelID)
+		}
 	}
 	assignments, err := s.groups.GetChannelAssignments(groupID)
 	if err != nil {
@@ -784,6 +883,16 @@ func (s *Service) RemoveChannelTopic(ctx context.Context, groupID, channelID int
 			return fmt.Errorf("close topic: %w; rollback topic assignment: %v", s.classifyTelegramError(err), rollbackErr)
 		}
 		return fmt.Errorf("close topic: %w", s.classifyTelegramError(err))
+	}
+	if s.topicRegistry != nil {
+		if err := s.topicRegistry.MarkClosed(groupID, threadID); err != nil &&
+			!errors.Is(err, db.ErrNotFound) {
+			rollbackErr := s.groups.AssignChannel(groupID, channelID, &threadID)
+			if rollbackErr != nil {
+				return fmt.Errorf("persist closed topic state: %w; rollback topic assignment: %v", err, rollbackErr)
+			}
+			return fmt.Errorf("persist closed topic state: %w", err)
+		}
 	}
 	return nil
 }

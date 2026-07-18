@@ -30,6 +30,11 @@ type Server struct {
 	digestJobs      *digestJobStore
 	terminalMu      sync.RWMutex
 	terminalReason  error
+	onTokenRevoked  func(error)
+}
+
+type tokenRevocationConfigurer interface {
+	SetTokenRevocationHandler(func(error))
 }
 
 // New creates a new HTTP Server with configured routes.
@@ -94,7 +99,7 @@ func newWithProviders(store *db.DB, timeout time.Duration, client *http.Client, 
 	s.channelService = NewChannelService(store.Channels, parserChannelVerifier{parser: parser.New()})
 	s.groupService = NewGroupService(store.Groups, store.Channels)
 	if auth != nil {
-		s.groupService.verifier = telegramGroupVerifier{token: auth.botToken, client: service.httpClient}
+		s.groupService.verifier = &telegramGroupVerifier{token: auth.botToken, client: service.httpClient}
 	}
 	providersHandler := http.Handler(http.HandlerFunc(s.handleProviders))
 	providerByIDHandler := http.Handler(http.HandlerFunc(s.handleProviderByID))
@@ -143,8 +148,27 @@ func (s *Server) SetChannelVerificationRetry(maxRetries int, sleeper func(contex
 
 // SetGroupVerifier replaces the Telegram group membership verifier.
 func (s *Server) SetGroupVerifier(verifier GroupVerifier) {
-	if s.groupService != nil {
-		s.groupService.verifier = verifier
+	if s == nil || s.groupService == nil {
+		return
+	}
+	s.groupService.verifier = verifier
+	if configurer, ok := verifier.(tokenRevocationConfigurer); ok {
+		configurer.SetTokenRevocationHandler(s.onTokenRevoked)
+	}
+}
+
+// SetTokenRevocationHandler connects the production Telegram getChat boundary
+// to the shared application lifecycle supervisor.
+func (s *Server) SetTokenRevocationHandler(handler func(error)) {
+	if s == nil {
+		return
+	}
+	s.onTokenRevoked = handler
+	if s.groupService == nil || s.groupService.verifier == nil {
+		return
+	}
+	if verifier, ok := s.groupService.verifier.(tokenRevocationConfigurer); ok {
+		verifier.SetTokenRevocationHandler(handler)
 	}
 }
 

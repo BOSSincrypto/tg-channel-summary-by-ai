@@ -13,6 +13,7 @@ import (
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
+	"github.com/boss/tg-channel-summary-by-ai/internal/telegram"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -56,8 +57,15 @@ func (permissiveGroupVerifier) Verify(chatID int64) (string, error) {
 }
 
 type telegramGroupVerifier struct {
-	token  string
-	client *http.Client
+	token          string
+	client         *http.Client
+	onTokenRevoked func(error)
+}
+
+func (v *telegramGroupVerifier) SetTokenRevocationHandler(handler func(error)) {
+	if v != nil {
+		v.onTokenRevoked = handler
+	}
 }
 
 func (v telegramGroupVerifier) Verify(chatID int64) (string, error) {
@@ -78,6 +86,16 @@ func (v telegramGroupVerifier) VerifyGroup(chatID int64) (string, bool, error) {
 		return "", false, errors.New("telegram group verification failed")
 	}
 	defer response.Body.Close()
+	if response.StatusCode == http.StatusUnauthorized {
+		revoked := fmt.Errorf("%w: Telegram getChat returned %s", telegram.ErrTokenRevoked, response.Status)
+		if v.onTokenRevoked != nil {
+			v.onTokenRevoked(revoked)
+		}
+		return "", false, revoked
+	}
+	if response.StatusCode != http.StatusOK {
+		return "", false, fmt.Errorf("telegram group verification failed: getChat returned %s", response.Status)
+	}
 	var payload struct {
 		OK          bool   `json:"ok"`
 		Description string `json:"description"`

@@ -84,6 +84,7 @@ func main() {
 		srv.EnterTerminal(err)
 		appLifecycle.TokenRevoked(err)
 	}
+	srv.SetTokenRevocationHandler(revocationHandler)
 	ownerNotifier.SetTokenRevocationHandler(revocationHandler)
 	srv.SetChannelVerificationRetry(cfg.MaxRetries, nil)
 

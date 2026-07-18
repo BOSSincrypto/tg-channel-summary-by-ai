@@ -2,8 +2,10 @@ package webapp
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -57,6 +59,26 @@ func TestHealthEndpointMethodNotAllowed(t *testing.T) {
 
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("expected status 405, got %d", resp.StatusCode)
+	}
+}
+
+func TestTerminalStateBoundsHealthAndStopsNormalHTTPWork(t *testing.T) {
+	srv := New()
+	srv.EnterTerminal(errors.New("bot token revoked"))
+
+	health := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(health, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if health.Code != http.StatusServiceUnavailable {
+		t.Fatalf("terminal health status = %d, want %d", health.Code, http.StatusServiceUnavailable)
+	}
+	if !strings.Contains(health.Body.String(), `"status":"terminal"`) {
+		t.Fatalf("terminal health body = %s, want terminal status", health.Body.String())
+	}
+
+	api := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(api, httptest.NewRequest(http.MethodGet, "/api/does-not-matter", nil))
+	if api.Code != http.StatusServiceUnavailable {
+		t.Fatalf("terminal API status = %d, want %d", api.Code, http.StatusServiceUnavailable)
 	}
 }
 

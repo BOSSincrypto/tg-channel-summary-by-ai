@@ -18,10 +18,11 @@ import (
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
 	"github.com/boss/tg-channel-summary-by-ai/internal/digest"
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
+	"github.com/boss/tg-channel-summary-by-ai/internal/telegram"
 	"github.com/mymmrac/telego"
 )
 
-var ErrTokenRevoked = errors.New("bot token revoked")
+var ErrTokenRevoked = telegram.ErrTokenRevoked
 
 type logger interface {
 	Printf(format string, args ...any)
@@ -62,18 +63,19 @@ type CommandHandler func(context.Context, *telego.Message, string) error
 
 // Service represents the Telegram bot service.
 type Service struct {
-	api       telegramClient
-	poller    updatePoller
-	groups    *db.GroupRepository
-	channels  *db.ChannelRepository
-	notifier  ownerNotifier
-	lifecycle GroupLifecycle
-	logger    logger
-	ownerID   string
-	botName   string
-	webAppURL string
-	commands  map[string]CommandHandler
-	applyData func(context.Context, *telego.Message, BotSettings) error
+	api            telegramClient
+	poller         updatePoller
+	groups         *db.GroupRepository
+	channels       *db.ChannelRepository
+	notifier       ownerNotifier
+	lifecycle      GroupLifecycle
+	logger         logger
+	ownerID        string
+	botName        string
+	webAppURL      string
+	commands       map[string]CommandHandler
+	applyData      func(context.Context, *telego.Message, BotSettings) error
+	onTokenRevoked func(error)
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -156,6 +158,14 @@ func (s *Service) SetSettingsApplier(applier func(context.Context, *telego.Messa
 	}
 }
 
+// SetTokenRevocationHandler connects every Telegram 401 boundary to the
+// application lifecycle supervisor.
+func (s *Service) SetTokenRevocationHandler(handler func(error)) {
+	if s != nil {
+		s.onTokenRevoked = handler
+	}
+}
+
 // Start begins long polling for updates.
 func (s *Service) Start() error {
 	if s == nil || s.api == nil || s.poller == nil {
@@ -170,9 +180,8 @@ func (s *Service) Start() error {
 
 	me, err := s.api.GetMe(ctx)
 	if err != nil {
-		if isUnauthorizedError(err) {
-			s.logf("FATAL: Bot token has been revoked. Shutting down.")
-			return fmt.Errorf("%w: getMe: %v", ErrTokenRevoked, err)
+		if classified := s.classifyTelegramError(err); classified != nil {
+			return fmt.Errorf("getMe: %w", classified)
 		}
 		return fmt.Errorf("verify bot identity with getMe: %w", err)
 	}
@@ -182,10 +191,6 @@ func (s *Service) Start() error {
 	s.botName = strings.TrimPrefix(strings.ToLower(me.Username), "@")
 	s.logf("Bot identity verified: @%s (ID: %d)", me.Username, me.ID)
 	if err := s.registerCommands(ctx); err != nil {
-		if isUnauthorizedError(err) {
-			s.logf("FATAL: Bot token has been revoked (401 Unauthorized). Shutting down.")
-			return fmt.Errorf("%w: register commands: %v", ErrTokenRevoked, err)
-		}
 		return fmt.Errorf("register bot commands: %w", err)
 	}
 
@@ -195,9 +200,8 @@ func (s *Service) Start() error {
 		AllowedUpdates: []string{"message", "callback_query", "my_chat_member"},
 	}, telego.WithLongPollingRetryTimeout(0))
 	if err != nil {
-		if isUnauthorizedError(err) {
-			s.logf("FATAL: Bot token has been revoked. Shutting down.")
-			return fmt.Errorf("%w: start long polling: %v", ErrTokenRevoked, err)
+		if classified := s.classifyTelegramError(err); classified != nil {
+			return fmt.Errorf("start long polling: %w", classified)
 		}
 		return fmt.Errorf("start long polling: %w", err)
 	}
@@ -214,18 +218,16 @@ func (s *Service) Start() error {
 				// including after an API error. Probe the token once so a
 				// post-start 401 is not mistaken for a clean shutdown.
 				if _, probeErr := s.api.GetMe(ctx); probeErr != nil {
-					if isUnauthorizedError(probeErr) {
-						s.logf("FATAL: Bot token has been revoked (401 Unauthorized). Shutting down.")
-						return fmt.Errorf("%w: long polling stopped: %v", ErrTokenRevoked, probeErr)
+					if classified := s.classifyTelegramError(probeErr); classified != nil {
+						return fmt.Errorf("long polling stopped: %w", classified)
 					}
 					return fmt.Errorf("long polling stopped: verify bot identity: %w", probeErr)
 				}
 				return nil
 			}
 			if err := s.HandleUpdate(ctx, &update); err != nil {
-				if isUnauthorizedError(err) {
-					s.logf("FATAL: Bot token has been revoked (401 Unauthorized). Shutting down.")
-					return fmt.Errorf("%w: update %d: %v", ErrTokenRevoked, update.UpdateID, err)
+				if errors.Is(err, ErrTokenRevoked) {
+					return err
 				}
 				s.logf("update %d failed: %v", update.UpdateID, err)
 			}
@@ -256,7 +258,7 @@ func (s *Service) registerCommands(ctx context.Context) error {
 	}
 	scope := &telego.BotCommandScopeAllPrivateChats{Type: "all_private_chats"}
 	if err := s.api.SetMyCommands(ctx, &telego.SetMyCommandsParams{Commands: commands, Scope: scope}); err != nil {
-		return err
+		return s.classifyTelegramError(err)
 	}
 	s.logf("Registered %d bot commands: start, settings", len(commands))
 	return nil
@@ -275,7 +277,7 @@ func (s *Service) HandleUpdate(ctx context.Context, update *telego.Update) error
 		if s.api != nil {
 			if err := s.api.AnswerCallbackQuery(ctx, &telego.AnswerCallbackQueryParams{CallbackQueryID: query.ID}); err != nil {
 				s.logf("answer callback query: %v", err)
-				return err
+				return s.classifyTelegramError(err)
 			}
 		}
 		if query.From.ID <= 0 || !s.isConfigured() || !s.isOwner(query.From.ID) {
@@ -375,7 +377,7 @@ func (s *Service) sendAdminWebAppMessage(ctx context.Context, chatID telego.Chat
 		params.ParseMode = "MarkdownV2"
 	}
 	_, err := s.api.SendMessage(ctx, params)
-	return err
+	return s.classifyTelegramError(err)
 }
 
 func (s *Service) isConfigured() bool {
@@ -493,7 +495,7 @@ func (s *Service) sendPlain(ctx context.Context, chatID telego.ChatID, text stri
 		return errors.New("bot service is not configured")
 	}
 	_, err := s.api.SendMessage(ctx, &telego.SendMessageParams{ChatID: chatID, Text: text})
-	return err
+	return s.classifyTelegramError(err)
 }
 
 // Deliver sends one assembled digest to its configured Telegram group and
@@ -525,7 +527,7 @@ func (s *Service) Deliver(ctx context.Context, groupID int64, result *digest.Dig
 	}
 	message, err := s.api.SendMessage(ctx, params)
 	if err != nil {
-		return digest.DeliveryReceipt{}, fmt.Errorf("send digest to group %d: %w", groupID, err)
+		return digest.DeliveryReceipt{}, fmt.Errorf("send digest to group %d: %w", groupID, s.classifyTelegramError(err))
 	}
 	if message == nil || message.MessageID == 0 {
 		return digest.DeliveryReceipt{}, errors.New("Telegram delivery returned no message metadata")
@@ -582,7 +584,7 @@ func (s *Service) handleGroupJoin(ctx context.Context, chat telego.Chat) error {
 	}
 	fullChat, err := s.api.GetChat(ctx, &telego.GetChatParams{ChatID: chat.ChatID()})
 	if err != nil {
-		return fmt.Errorf("get chat %d: %w", chat.ID, err)
+		return fmt.Errorf("get chat %d: %w", chat.ID, s.classifyTelegramError(err))
 	}
 	chat.IsForum = fullChat != nil && fullChat.IsForum
 	if !chat.IsForum {
@@ -602,7 +604,11 @@ func (s *Service) handleGroupJoin(ctx context.Context, chat telego.Chat) error {
 			// scheduler job removed. A transient warning-delivery failure
 			// must not make cleanup unreliable or cause repeated lifecycle
 			// processing to leave a stale active job behind.
-			s.logf("send forum requirement for group %d: %v", chat.ID, sendErr)
+			classifiedSendErr := s.classifyTelegramError(sendErr)
+			if errors.Is(classifiedSendErr, ErrTokenRevoked) {
+				return classifiedSendErr
+			}
+			s.logf("send forum requirement for group %d: %v", chat.ID, classifiedSendErr)
 		}
 		return nil
 	}
@@ -689,7 +695,7 @@ func (s *Service) CreateChannelTopic(ctx context.Context, groupID, channelID int
 		Name:   name,
 	})
 	if err != nil {
-		return fmt.Errorf("create topic for channel %d: %w", channelID, err)
+		return fmt.Errorf("create topic for channel %d: %w", channelID, s.classifyTelegramError(err))
 	}
 	if topic == nil || topic.MessageThreadID <= 0 {
 		return errors.New("create topic returned an invalid message thread id")
@@ -700,7 +706,8 @@ func (s *Service) CreateChannelTopic(ctx context.Context, groupID, channelID int
 			MessageThreadID: int(topic.MessageThreadID),
 		})
 		if cleanupErr != nil {
-			return fmt.Errorf("persist topic for channel %d: %w; rollback topic: %v", channelID, err, cleanupErr)
+			classifiedCleanupErr := s.classifyTelegramError(cleanupErr)
+			return fmt.Errorf("persist topic for channel %d: %w; rollback topic: %w", channelID, err, classifiedCleanupErr)
 		}
 		return fmt.Errorf("persist topic for channel %d: %w", channelID, err)
 	}
@@ -728,7 +735,7 @@ func (s *Service) RenameChannelTopic(ctx context.Context, groupID, channelID int
 		MessageThreadID: int(threadID),
 		Name:            name,
 	}); err != nil {
-		return fmt.Errorf("rename topic: %w", err)
+		return fmt.Errorf("rename topic: %w", s.classifyTelegramError(err))
 	}
 	return nil
 }
@@ -774,9 +781,9 @@ func (s *Service) RemoveChannelTopic(ctx context.Context, groupID, channelID int
 	}); err != nil {
 		rollbackErr := s.groups.AssignChannel(groupID, channelID, &threadID)
 		if rollbackErr != nil {
-			return fmt.Errorf("close topic: %w; rollback topic assignment: %v", err, rollbackErr)
+			return fmt.Errorf("close topic: %w; rollback topic assignment: %v", s.classifyTelegramError(err), rollbackErr)
 		}
-		return fmt.Errorf("close topic: %w", err)
+		return fmt.Errorf("close topic: %w", s.classifyTelegramError(err))
 	}
 	return nil
 }
@@ -822,6 +829,21 @@ func isUnauthorizedError(err error) bool {
 	}
 	message := strings.ToLower(err.Error())
 	return strings.Contains(message, "401") || strings.Contains(message, "unauthorized") || strings.Contains(message, "token is invalid")
+}
+
+func (s *Service) classifyTelegramError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if !isUnauthorizedError(err) {
+		return err
+	}
+	revoked := fmt.Errorf("%w: %w", ErrTokenRevoked, err)
+	s.logf("FATAL: Bot token has been revoked (401 Unauthorized). Shutting down.")
+	if s.onTokenRevoked != nil {
+		s.onTokenRevoked(revoked)
+	}
+	return revoked
 }
 
 func (s *Service) logf(format string, args ...any) {

@@ -28,6 +28,9 @@ type fakeTelegramClient struct {
 	deletedTopics []*telego.DeleteForumTopicParams
 	forumTopic    *telego.ForumTopic
 	closeErr      error
+	apiErr        error
+	pollerErr     error
+	deleteErr     error
 }
 
 func (f *fakeTelegramClient) GetMe(context.Context) (*telego.User, error) {
@@ -41,26 +44,35 @@ func (f *fakeTelegramClient) GetMe(context.Context) (*telego.User, error) {
 
 func (f *fakeTelegramClient) SetMyCommands(_ context.Context, params *telego.SetMyCommandsParams) error {
 	f.commands = params
-	return nil
+	return f.apiErr
 }
 
 func (f *fakeTelegramClient) AnswerCallbackQuery(_ context.Context, params *telego.AnswerCallbackQueryParams) error {
 	f.callbacks = append(f.callbacks, params.CallbackQueryID)
-	return nil
+	return f.apiErr
 }
 
 func (f *fakeTelegramClient) SendMessage(_ context.Context, params *telego.SendMessageParams) (*telego.Message, error) {
 	f.messages = append(f.messages, params)
+	if f.apiErr != nil {
+		return nil, f.apiErr
+	}
 	return &telego.Message{MessageID: len(f.messages)}, nil
 }
 
 func (f *fakeTelegramClient) GetChat(_ context.Context, params *telego.GetChatParams) (*telego.ChatFullInfo, error) {
 	f.getChatCalls++
+	if f.apiErr != nil {
+		return nil, f.apiErr
+	}
 	return f.chats[params.ChatID.ID], nil
 }
 
 func (f *fakeTelegramClient) CreateForumTopic(_ context.Context, params *telego.CreateForumTopicParams) (*telego.ForumTopic, error) {
 	f.topics = append(f.topics, params)
+	if f.apiErr != nil {
+		return nil, f.apiErr
+	}
 	if f.forumTopic == nil {
 		f.forumTopic = &telego.ForumTopic{MessageThreadID: 77, Name: params.Name}
 	}
@@ -69,21 +81,27 @@ func (f *fakeTelegramClient) CreateForumTopic(_ context.Context, params *telego.
 
 func (f *fakeTelegramClient) CloseForumTopic(_ context.Context, params *telego.CloseForumTopicParams) error {
 	f.closedTopics = append(f.closedTopics, params)
+	if f.apiErr != nil {
+		return f.apiErr
+	}
 	return f.closeErr
 }
 
 func (f *fakeTelegramClient) DeleteForumTopic(_ context.Context, params *telego.DeleteForumTopicParams) error {
 	f.deletedTopics = append(f.deletedTopics, params)
-	return nil
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	return f.apiErr
 }
 
 func (f *fakeTelegramClient) EditForumTopic(_ context.Context, params *telego.EditForumTopicParams) error {
 	f.editedTopics = append(f.editedTopics, params)
-	return nil
+	return f.apiErr
 }
 
 func (f *fakeTelegramClient) UpdatesViaLongPolling(context.Context, *telego.GetUpdatesParams, ...telego.LongPollingOption) (<-chan telego.Update, error) {
-	return f.updates, nil
+	return f.updates, f.pollerErr
 }
 
 type fakeOwnerNotifier struct {

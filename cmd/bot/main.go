@@ -20,6 +20,7 @@ import (
 	"github.com/boss/tg-channel-summary-by-ai/internal/config"
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
 	"github.com/boss/tg-channel-summary-by-ai/internal/digest"
+	"github.com/boss/tg-channel-summary-by-ai/internal/lifecycle"
 	"github.com/boss/tg-channel-summary-by-ai/internal/maintenance"
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
 	"github.com/boss/tg-channel-summary-by-ai/internal/parser"
@@ -50,6 +51,7 @@ func main() {
 	}
 
 	ownerNotifier := bot.NewOwnerNotifier(cfg.BotToken, cfg.OwnerTelegramID, cfg.OpenRouterKey)
+	appLifecycle := lifecycle.New(5 * time.Second)
 	ownerNotifier.SetProviderSecretSource(func() []string {
 		providers, err := store.Providers.List()
 		if err != nil {
@@ -69,7 +71,6 @@ func main() {
 		ConfigStore:   store.Config,
 		Notifier:      ownerNotifier,
 	})
-	maintenanceSvc.Start()
 
 	// Configure the HTTP server (health check + WebApp) before wiring the
 	// remaining production services.
@@ -78,6 +79,12 @@ func main() {
 		log.Fatalf("failed to configure WebApp authentication: %v", err)
 	}
 	srv := webapp.NewWithProvidersAuthenticated(store, 10*time.Second, http.DefaultClient, webAppAuth)
+	revocationHandler := func(err error) {
+		log.Printf("FATAL: Bot token revoked (401 Unauthorized): %v", err)
+		srv.EnterTerminal(err)
+		appLifecycle.TokenRevoked(err)
+	}
+	ownerNotifier.SetTokenRevocationHandler(revocationHandler)
 	srv.SetChannelVerificationRetry(cfg.MaxRetries, nil)
 
 	// Wire the production parser -> post storage -> digest path before the
@@ -102,9 +109,23 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to configure Telegram bot: %v", err)
 	}
+	telegramBot.SetTokenRevocationHandler(revocationHandler)
+	appLifecycle.Add(srv)
+	appLifecycle.Add(maintenanceSvc)
+	appLifecycle.Add(sched)
+	appLifecycle.Add(telegramBot)
+	maintenanceSvc.Start()
+	if terminal, _ := appLifecycle.Terminal(); terminal {
+		<-appLifecycle.Done()
+		return
+	}
 	digestService.SetDelivery(telegramBot)
 	if err := sched.Start(); err != nil {
 		log.Fatalf("failed to start scheduler: %v", err)
+	}
+	if terminal, _ := appLifecycle.Terminal(); terminal {
+		<-appLifecycle.Done()
+		return
 	}
 	telegramBot.SetSettingsApplier(func(ctx context.Context, _ *telego.Message, settings bot.BotSettings) error {
 		return applyProductionSettings(ctx, store, sched, settings)
@@ -122,11 +143,15 @@ func main() {
 		}
 	}()
 
-	// Wait for shutdown signal
+	// Wait for a signal or a coordinated terminal transition.
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	sig := <-quit
-	log.Printf("Received signal %v, shutting down...", sig)
+	select {
+	case sig := <-quit:
+		log.Printf("Received signal %v, shutting down...", sig)
+	case <-appLifecycle.Done():
+		log.Printf("Application entered bounded terminal state")
+	}
 
 	// Graceful shutdown
 	srv.Stop()

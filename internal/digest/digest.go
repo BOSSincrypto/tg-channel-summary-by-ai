@@ -18,6 +18,7 @@ import (
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
 	"github.com/boss/tg-channel-summary-by-ai/internal/parser"
 	"github.com/boss/tg-channel-summary-by-ai/internal/summarizer"
+	"github.com/boss/tg-channel-summary-by-ai/internal/telegram"
 )
 
 // Digest represents a single digest for a group.
@@ -331,6 +332,9 @@ func safeDigestMessage(err error) string {
 }
 
 func terminalDigestError(result *Digest, err error, manual bool) error {
+	if err != nil && errors.Is(err, telegram.ErrTokenRevoked) {
+		return err
+	}
 	if manual || result == nil || result.Outcome == OutcomeNoPosts || result.Outcome == OutcomePartial {
 		return nil
 	}

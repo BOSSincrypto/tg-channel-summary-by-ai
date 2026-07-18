@@ -6,7 +6,9 @@ package webapp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
@@ -26,6 +28,8 @@ type Server struct {
 	groupService    *GroupService
 	digestRunner    DigestRunner
 	digestJobs      *digestJobStore
+	terminalMu      sync.RWMutex
+	terminalReason  error
 }
 
 // New creates a new HTTP Server with configured routes.
@@ -37,6 +41,7 @@ func New() *Server {
 		digestJobs: newDigestJobStore(),
 	}
 
+	r.Use(s.terminalMiddleware)
 	r.Get("/health", s.handleHealth)
 	if staticFiles, err := staticwebapp.StaticFS(); err == nil {
 		r.Get("/webapp", func(w http.ResponseWriter, r *http.Request) {
@@ -166,17 +171,67 @@ func (s *Server) Handler() http.Handler {
 	return s.router
 }
 
+// EnterTerminal marks the HTTP boundary as terminal. Health remains
+// observable, while WebApp and API requests receive a bounded 503 response
+// instead of continuing normal application work.
+func (s *Server) EnterTerminal(reason error) {
+	if s == nil {
+		return
+	}
+	s.terminalMu.Lock()
+	if s.terminalReason == nil {
+		if reason == nil {
+			reason = errors.New("application entered terminal state")
+		}
+		s.terminalReason = reason
+	}
+	s.terminalMu.Unlock()
+}
+
+func (s *Server) terminalState() (bool, error) {
+	if s == nil {
+		return false, nil
+	}
+	s.terminalMu.RLock()
+	defer s.terminalMu.RUnlock()
+	return s.terminalReason != nil, s.terminalReason
+}
+
+func (s *Server) terminalMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/health" {
+			if terminal, _ := s.terminalState(); terminal {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+					"error":  "application is shutting down",
+					"status": "terminal",
+				})
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // handleHealth responds with a JSON health check status.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	if terminal, _ := s.terminalState(); terminal {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"status": "terminal",
+			"error":  "application is shutting down",
+		})
+		return
+	}
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{
-		"status": "ok",
-	})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 // Start begins listening on the given port (e.g. ":8080").
 func (s *Server) Start(port string) error {
+	if terminal, _ := s.terminalState(); terminal {
+		return errors.New("HTTP server is in terminal state")
+	}
 	s.srv = &http.Server{
 		Addr:    ":" + port,
 		Handler: s.router,

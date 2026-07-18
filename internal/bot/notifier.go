@@ -22,6 +22,7 @@ type OwnerNotifier struct {
 	httpClient      *http.Client
 	providerSecrets []string
 	secretSource    func() []string
+	onTokenRevoked  func(error)
 }
 
 // NewOwnerNotifier creates a notifier that delivers maintenance alerts to the configured owner.
@@ -45,6 +46,14 @@ func (n *OwnerNotifier) SetProviderSecretSource(source func() []string) {
 		return
 	}
 	n.secretSource = source
+}
+
+// SetTokenRevocationHandler connects owner-notification API failures to the
+// shared application lifecycle boundary.
+func (n *OwnerNotifier) SetTokenRevocationHandler(handler func(error)) {
+	if n != nil {
+		n.onTokenRevoked = handler
+	}
 }
 
 // NotifyOwner sends a plain-text Telegram message to the owner.
@@ -83,6 +92,13 @@ func (n *OwnerNotifier) NotifyOwner(ctx context.Context, text string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusUnauthorized {
+			err := fmt.Errorf("%w: owner notification returned %s", ErrTokenRevoked, resp.Status)
+			if n.onTokenRevoked != nil {
+				n.onTokenRevoked(err)
+			}
+			return err
+		}
 		return fmt.Errorf("send owner notification failed with status %s", resp.Status)
 	}
 

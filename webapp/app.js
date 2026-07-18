@@ -17,6 +17,7 @@
     digestJob: null,
     digestTimer: null,
     retryAfter: 0,
+    rateLimitTimer: null,
     fatal: false,
     destroyed: false
   };
@@ -33,6 +34,18 @@
     "America/New_York", "America/Los_Angeles", "America/Toronto",
     "Australia/Sydney", "UTC"
   ];
+  function supportedTimezones() {
+    var zones = timezoneOptions.slice();
+    if (window.Intl && typeof window.Intl.supportedValuesOf === "function") {
+      try {
+        zones = window.Intl.supportedValuesOf("timeZone");
+      } catch (_) {
+        zones = timezoneOptions.slice();
+      }
+    }
+    if (zones.indexOf("UTC") < 0) zones.push("UTC");
+    return zones.sort();
+  }
 
   function el(tag, className, text) {
     var node = document.createElement(tag);
@@ -47,8 +60,24 @@
   function button(label, className, handler) {
     var node = el("button", "button " + (className || "secondary"), label);
     node.type = "button";
+    if (isRateLimited() && /(^|\s)(primary|danger)(\s|$)/.test(className || "")) node.disabled = true;
     if (handler) node.addEventListener("click", handler);
     return node;
+  }
+  function rateLimitRemaining() {
+    return Math.max(0, Math.ceil((state.retryAfter - Date.now()) / 1000));
+  }
+  function isRateLimited() { return rateLimitRemaining() > 0; }
+  function startRateLimitCountdown() {
+    if (state.rateLimitTimer) window.clearInterval(state.rateLimitTimer);
+    state.rateLimitTimer = window.setInterval(function () {
+      if (!isRateLimited()) {
+        window.clearInterval(state.rateLimitTimer);
+        state.rateLimitTimer = null;
+      }
+      render();
+    }, 1000);
+    render();
   }
   function field(label, name, value, type, options) {
     options = options || {};
@@ -199,19 +228,25 @@
         throw new Error("Сессия истекла или доступ запрещён. Перезапустите бота через /start.");
       }
       if (response.status === 429) {
-        var retryAfter = response.headers.get("Retry-After") || "несколько";
-        state.retryAfter = Date.now() + ((Number(retryAfter) || 5) * 1000);
-        var rateError = new Error("Слишком много запросов. Подождите " + retryAfter + " секунд.");
-        rateError.retryAfter = Number(retryAfter) || 5;
+        var retryAfter = response.headers.get("Retry-After") || "5";
+        var retrySeconds = Number(retryAfter);
+        if (!isFinite(retrySeconds) || retrySeconds < 0) retrySeconds = 5;
+        retrySeconds = Math.ceil(retrySeconds);
+        state.retryAfter = Date.now() + (retrySeconds * 1000);
+        startRateLimitCountdown();
+        var rateError = new Error("Слишком много запросов. Подождите " + retrySeconds + " секунд.");
+        rateError.retryAfter = retrySeconds;
         haptic("error");
         throw rateError;
       }
       if (!response.ok) {
         return response.text().then(function (body) {
           var message = "";
-          try { message = JSON.parse(body).error || JSON.parse(body).message; } catch (_) { message = ""; }
+          var payload = null;
+          try { payload = JSON.parse(body); message = payload.error || payload.message; } catch (_) { payload = null; message = ""; }
           var apiError = new Error(message || "Ошибка сервера (" + response.status + ")");
           apiError.status = response.status;
+          if (payload && payload.field) apiError.field = payload.field;
           throw apiError;
         });
       }
@@ -280,6 +315,9 @@
     });
     shell.appendChild(nav);
     if (state.readonly) shell.appendChild(el("div", "readonly-banner", "Сессия истекла. Данные доступны только для чтения. Перезапустите бота через /start."));
+    if (isRateLimited()) {
+      shell.appendChild(el("div", "readonly-banner warning-text", "Слишком много запросов. Изменения отключены ещё на " + rateLimitRemaining() + " сек."));
+    }
     var content = el("section");
     content.appendChild(renderTab());
     shell.appendChild(content);
@@ -655,9 +693,17 @@
         if (!valid) return;
         save.disabled = true;
         var payload = { name: name.input.value.trim(), base_url: base.input.value.trim(), api_key: key.input.value.trim(), default_model: model.input.value.trim(), is_default: provider.isDefault };
+        if (provider.id) payload.version = provider.version;
         mutation("/api/providers" + (provider.id ? "/" + encodeURIComponent(provider.id) : ""), provider.id ? "PUT" : "POST", payload).then(function () {
           close(); showToast("Провайдер сохранён.", "success"); state.loadedAt.providers = 0; return loadProviders(true);
-        }).catch(function (error) { showToast(apiErrorMessage(error), "error", true); }).finally(function () { save.disabled = false; });
+        }).catch(function (error) {
+          var fields = { name: name, base_url: base, api_key: key, default_model: model };
+          if (error && error.field && fields[error.field]) {
+            fields[error.field].error.textContent = apiErrorMessage(error);
+            fields[error.field].input.setAttribute("aria-invalid", "true");
+          }
+          showToast(apiErrorMessage(error), "error", true);
+        }).finally(function () { save.disabled = false; });
       });
       body.appendChild(form);
       name.input.focus();
@@ -678,10 +724,44 @@
     var time = field("Время дайджеста", "settings-time", saved.digestTime, "time", { required: true, help: "Формат 24 часа, например 21:00." });
     var tz = field("Часовой пояс", "settings-timezone", saved.timezone, "text", { required: true, placeholder: "Начните вводить, например Moscow" });
     var model = field("Модель по умолчанию", "settings-model", saved.model, "text", { required: true, placeholder: "openai/gpt-oss-120b" });
-    var datalist = el("datalist"); datalist.id = "timezone-list";
-    timezoneOptions.forEach(function (zone) { var option = el("option", "", zone); option.value = zone; datalist.appendChild(option); });
-    tz.input.setAttribute("list", datalist.id);
-    grid.appendChild(time.wrap); grid.appendChild(tz.wrap); grid.appendChild(model.wrap); grid.appendChild(datalist); form.appendChild(grid);
+    var timezoneList = supportedTimezones();
+    var timezoneDropdown = el("div", "timezone-dropdown");
+    attr(timezoneDropdown, "role", "listbox");
+    attr(timezoneDropdown, "aria-label", "Доступные часовые пояса");
+    function renderTimezoneChoices() {
+      while (timezoneDropdown.firstChild) timezoneDropdown.removeChild(timezoneDropdown.firstChild);
+      var query = tz.input.value.trim().toLowerCase();
+      var groups = {};
+      timezoneList.forEach(function (zone) {
+        if (query && zone.toLowerCase().indexOf(query) < 0) return;
+        var region = zone.indexOf("/") > 0 ? zone.split("/")[0] : "Other";
+        if (!groups[region]) groups[region] = [];
+        groups[region].push(zone);
+      });
+      Object.keys(groups).sort().forEach(function (region) {
+        var group = el("div", "timezone-group");
+        group.appendChild(el("strong", "", region));
+        groups[region].forEach(function (zone) {
+          var choice = button(zone, "ghost small", function () {
+            tz.input.value = zone;
+            state.settingsDraft = readSettings(form);
+            timezoneDropdown.hidden = true;
+          });
+          attr(choice, "role", "option");
+          group.appendChild(choice);
+        });
+        timezoneDropdown.appendChild(group);
+      });
+      attr(timezoneDropdown, "hidden", true);
+      timezoneDropdown.hidden = !tz.input.matches(":focus") || !timezoneDropdown.firstChild;
+    }
+    tz.wrap.appendChild(timezoneDropdown);
+    tz.input.addEventListener("focus", renderTimezoneChoices);
+    tz.input.addEventListener("input", renderTimezoneChoices);
+    tz.input.addEventListener("blur", function () {
+      window.setTimeout(function () { timezoneDropdown.hidden = true; }, 120);
+    });
+    grid.appendChild(time.wrap); grid.appendChild(tz.wrap); grid.appendChild(model.wrap); form.appendChild(grid);
     var actions = el("div", "actions");
     var save = button("Сохранить настройки", "primary");
     var cancel = button("Отмена", "secondary", function () {
@@ -1008,6 +1088,7 @@
   window.addEventListener("beforeunload", function () {
     state.destroyed = true;
     if (state.digestTimer) window.clearTimeout(state.digestTimer);
+    if (state.rateLimitTimer) window.clearInterval(state.rateLimitTimer);
     if (telegram && telegram.MainButton) telegram.MainButton.offClick(mainButtonAction);
   });
   start();

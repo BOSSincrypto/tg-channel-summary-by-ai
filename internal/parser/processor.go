@@ -27,6 +27,7 @@ type ChannelStatsFetcher interface {
 type ParseStats struct {
 	MediaOnlySkipped int
 	HTTPStatus       int
+	ChannelTitle     string
 }
 
 // ChannelProcessResult describes one channel fetch and storage operation.

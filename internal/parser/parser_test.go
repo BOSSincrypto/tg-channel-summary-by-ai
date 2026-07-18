@@ -184,6 +184,24 @@ func TestParseChannelWithStatsReportsHTTPStatus(t *testing.T) {
 	}
 }
 
+func TestParseChannelWithStatsPreservesVerifiedChannelTitle(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`
+			<div class="tgme_channel_info">
+				<div class="tgme_channel_info_header_title">Verified Channel</div>
+			</div>`))
+	}))
+	defer server.Close()
+
+	_, stats, err := NewWithOptions(Options{Client: server.Client(), BaseURL: server.URL}).ParseChannelWithStats("example")
+	if err != nil {
+		t.Fatalf("ParseChannelWithStats() error = %v", err)
+	}
+	if stats.ChannelTitle != "Verified Channel" {
+		t.Fatalf("channel title = %q, want Verified Channel", stats.ChannelTitle)
+	}
+}
+
 func TestParseChannelRateLimitErrorIncludesRetryAfter(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", "17")

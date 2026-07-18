@@ -76,6 +76,9 @@ func NewProviderServiceForTesting(repository providerRepository, client *http.Cl
 }
 
 func (s *ProviderService) Create(ctx context.Context, input ProviderInput) (*model.AIProvider, error) {
+	if s == nil || s.repository == nil {
+		return nil, errors.New("provider service is not configured")
+	}
 	if err := validateProviderInput(input); err != nil {
 		return nil, err
 	}
@@ -101,6 +104,9 @@ func (s *ProviderService) Create(ctx context.Context, input ProviderInput) (*mod
 }
 
 func (s *ProviderService) Update(ctx context.Context, id int64, input ProviderInput) (*model.AIProvider, error) {
+	if s == nil || s.repository == nil {
+		return nil, errors.New("provider service is not configured")
+	}
 	if input.Version <= 0 {
 		return nil, fmt.Errorf("provider version: %w", db.ErrConflict)
 	}
@@ -146,6 +152,9 @@ func (s *ProviderService) Update(ctx context.Context, id int64, input ProviderIn
 }
 
 func (s *ProviderService) List() ([]model.AIProvider, error) {
+	if s == nil || s.repository == nil {
+		return nil, errors.New("provider service is not configured")
+	}
 	providers, err := s.repository.List()
 	if err != nil {
 		return nil, fmt.Errorf("list providers: %w", err)
@@ -157,6 +166,9 @@ func (s *ProviderService) List() ([]model.AIProvider, error) {
 }
 
 func (s *ProviderService) Delete(id, version int64) error {
+	if s == nil || s.repository == nil {
+		return errors.New("provider service is not configured")
+	}
 	if version <= 0 {
 		return fmt.Errorf("provider version: %w", db.ErrConflict)
 	}
@@ -181,6 +193,9 @@ func (s *ProviderService) Delete(id, version int64) error {
 }
 
 func (s *ProviderService) ensureUniqueName(name string, currentID int64) error {
+	if s == nil || s.repository == nil {
+		return errors.New("provider service is not configured")
+	}
 	providers, err := s.repository.List()
 	if err != nil {
 		return fmt.Errorf("check provider name: %w", err)
@@ -194,6 +209,9 @@ func (s *ProviderService) ensureUniqueName(name string, currentID int64) error {
 }
 
 func (s *ProviderService) getMasked(id int64) (*model.AIProvider, error) {
+	if s == nil || s.repository == nil {
+		return nil, errors.New("provider service is not configured")
+	}
 	provider, err := s.repository.GetByID(id)
 	if err != nil {
 		return nil, fmt.Errorf("load provider: %w", err)
@@ -249,6 +267,7 @@ func maskAPIKey(value string) string {
 func writeProviderError(w http.ResponseWriter, err error) {
 	status := http.StatusBadRequest
 	message := err.Error()
+	field := providerErrorField(message)
 	lower := strings.ToLower(message)
 	if strings.Contains(lower, "deadline") || strings.Contains(lower, "timeout") {
 		status = http.StatusGatewayTimeout
@@ -257,6 +276,10 @@ func writeProviderError(w http.ResponseWriter, err error) {
 		message = "Не удалось подключиться к провайдеру: " + message
 	} else if strings.Contains(lower, "not found") {
 		status = http.StatusNotFound
+	} else if errors.Is(err, db.ErrDuplicate) {
+		status = http.StatusConflict
+		message = "Провайдер с таким именем уже существует"
+		field = "name"
 	} else if strings.Contains(lower, "name already exists") {
 		status = http.StatusConflict
 		message = "Провайдер с таким именем уже существует"
@@ -269,7 +292,35 @@ func writeProviderError(w http.ResponseWriter, err error) {
 	} else if strings.Contains(lower, "unique constraint") || strings.Contains(lower, "already exists") {
 		status = http.StatusConflict
 	}
-	writeJSON(w, status, map[string]string{"error": message})
+	response := map[string]string{"error": message}
+	if field != "" {
+		response["field"] = field
+	}
+	writeJSON(w, status, response)
+}
+
+func providerErrorField(message string) string {
+	lower := strings.ToLower(message)
+	switch {
+	case strings.Contains(lower, "name") && (strings.Contains(lower, "exist") || strings.Contains(lower, "required") || strings.Contains(lower, "duplicate")):
+		return "name"
+	case strings.Contains(lower, "base url") || strings.Contains(lower, "base_url") || strings.Contains(lower, "endpoint") || strings.Contains(lower, "url"):
+		return "base_url"
+	case strings.Contains(lower, "api key") || strings.Contains(lower, "api_key") || strings.Contains(lower, "authorization"):
+		return "api_key"
+	case strings.Contains(lower, "model"):
+		return "default_model"
+	case strings.Contains(lower, "timeout") || strings.Contains(lower, "deadline") ||
+		strings.Contains(lower, "connection") || strings.Contains(lower, "transport") ||
+		strings.Contains(lower, "custom provider test request failed"):
+		if strings.Contains(lower, "401") || strings.Contains(lower, "403") ||
+			strings.Contains(lower, "unauthorized") || strings.Contains(lower, "forbidden") {
+			return "api_key"
+		}
+		return "base_url"
+	default:
+		return ""
+	}
 }
 
 func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request) {

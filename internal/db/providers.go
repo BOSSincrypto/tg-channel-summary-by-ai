@@ -37,6 +37,9 @@ func (r *ProviderRepository) Insert(ap *model.AIProvider) (int64, error) {
 		ap.Name, ap.BaseURL, encryptedKey, ap.DefaultModel, boolToInt(ap.IsDefault),
 	)
 	if err != nil {
+		if isUniqueViolation(err) {
+			return 0, fmt.Errorf("insert provider %q: %w", ap.Name, ErrDuplicate)
+		}
 		return 0, fmt.Errorf("insert provider: %w", err)
 	}
 	id, err := result.LastInsertId()
@@ -73,7 +76,7 @@ func (r *ProviderRepository) GetByName(name string) (*model.AIProvider, error) {
 	var isDefault int
 	err := r.db.Conn().QueryRow(
 		`SELECT id, version, name, base_url, api_key, default_model, is_default, created_at
-		 FROM ai_providers WHERE name = ?`, name,
+		 FROM ai_providers WHERE name = ? COLLATE NOCASE`, name,
 	).Scan(&ap.ID, &ap.Version, &ap.Name, &ap.BaseURL, &ap.APIKey, &ap.DefaultModel, &isDefault, &ap.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
@@ -160,6 +163,9 @@ func (r *ProviderRepository) Update(ap *model.AIProvider) error {
 		ap.Name, ap.BaseURL, encryptedKey, ap.DefaultModel, boolToInt(ap.IsDefault), ap.ID,
 	)
 	if err != nil {
+		if isUniqueViolation(err) {
+			return fmt.Errorf("update provider %q: %w", ap.Name, ErrDuplicate)
+		}
 		return fmt.Errorf("update provider: %w", err)
 	}
 	return nil
@@ -190,6 +196,9 @@ func (r *ProviderRepository) UpdateOptimistic(ap *model.AIProvider, version int6
 		ap.Name, ap.BaseURL, encryptedKey, ap.DefaultModel, boolToInt(ap.IsDefault), ap.ID, version,
 	)
 	if err != nil {
+		if isUniqueViolation(err) {
+			return fmt.Errorf("update provider %q: %w", ap.Name, ErrDuplicate)
+		}
 		return fmt.Errorf("update provider: %w", err)
 	}
 	affected, err := result.RowsAffected()

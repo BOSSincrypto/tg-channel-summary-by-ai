@@ -247,6 +247,9 @@ func (s *Service) Stop() {
 }
 
 func (s *Service) registerCommands(ctx context.Context) error {
+	if s == nil || s.api == nil {
+		return errors.New("bot service is not configured")
+	}
 	commands := []telego.BotCommand{
 		{Command: "start", Description: "Start the bot"},
 		{Command: "settings", Description: "Configure bot settings"},
@@ -355,6 +358,9 @@ func (s *Service) handleSettings(ctx context.Context, message *telego.Message, _
 }
 
 func (s *Service) sendAdminWebAppMessage(ctx context.Context, chatID telego.ChatID, text string, markdown bool) error {
+	if s == nil || s.api == nil {
+		return errors.New("bot service is not configured")
+	}
 	if !isHTTPSWebAppURL(s.webAppURL) {
 		return s.sendPlain(ctx, chatID, "Bot is not configured.")
 	}
@@ -483,6 +489,9 @@ func decodeAndValidateSettings(data string, settings *BotSettings) error {
 }
 
 func (s *Service) sendPlain(ctx context.Context, chatID telego.ChatID, text string) error {
+	if s == nil || s.api == nil {
+		return errors.New("bot service is not configured")
+	}
 	_, err := s.api.SendMessage(ctx, &telego.SendMessageParams{ChatID: chatID, Text: text})
 	return err
 }
@@ -565,6 +574,9 @@ func (s *Service) handleMyChatMember(ctx context.Context, update *telego.ChatMem
 }
 
 func (s *Service) handleGroupJoin(ctx context.Context, chat telego.Chat) error {
+	if s == nil || s.api == nil {
+		return errors.New("bot service is not configured")
+	}
 	if s.groups == nil {
 		return errors.New("group repository is not configured")
 	}
@@ -586,7 +598,11 @@ func (s *Service) handleGroupJoin(ctx context.Context, chat telego.Chat) error {
 			Text:   "This bot requires a forum supergroup with topics enabled. Please convert the group to a forum or create a new forum group.",
 		})
 		if sendErr != nil {
-			return fmt.Errorf("send forum requirement: %w", sendErr)
+			// The group has already been persisted as ineligible and its
+			// scheduler job removed. A transient warning-delivery failure
+			// must not make cleanup unreliable or cause repeated lifecycle
+			// processing to leave a stale active job behind.
+			s.logf("send forum requirement for group %d: %v", chat.ID, sendErr)
 		}
 		return nil
 	}
@@ -626,6 +642,9 @@ func (s *Service) upsertGroup(chat telego.Chat, status string) (*model.Group, er
 
 // CreateChannelTopic creates and persists a topic for an existing assignment.
 func (s *Service) CreateChannelTopic(ctx context.Context, groupID, channelID int64) error {
+	if s == nil || s.api == nil {
+		return errors.New("bot service is not configured")
+	}
 	if s.groups == nil {
 		return errors.New("group repository is not configured")
 	}
@@ -690,6 +709,9 @@ func (s *Service) CreateChannelTopic(ctx context.Context, groupID, channelID int
 
 // RenameChannelTopic updates the Telegram topic name for an assignment.
 func (s *Service) RenameChannelTopic(ctx context.Context, groupID, channelID int64, name string) error {
+	if s == nil || s.api == nil {
+		return errors.New("bot service is not configured")
+	}
 	if s.groups == nil {
 		return errors.New("group repository is not configured")
 	}
@@ -713,6 +735,9 @@ func (s *Service) RenameChannelTopic(ctx context.Context, groupID, channelID int
 
 // RemoveChannelTopic closes the topic before removing its persisted assignment.
 func (s *Service) RemoveChannelTopic(ctx context.Context, groupID, channelID int64) error {
+	if s == nil || s.api == nil {
+		return errors.New("bot service is not configured")
+	}
 	if s.groups == nil {
 		return errors.New("group repository is not configured")
 	}

@@ -159,6 +159,7 @@ func (p *Parser) ParseChannelWithStats(username string) ([]ParsedPost, ParseStat
 		document.Find(".tgme_channel_info").Length() == 0 {
 		return nil, stats, fmt.Errorf("parse t.me/s/%s: %w", username, ErrChannelUnavailable)
 	}
+	stats.ChannelTitle = extractChannelTitle(document)
 
 	posts := make([]ParsedPost, 0)
 	document.Find(".tgme_widget_message[data-post]").Each(func(_ int, selection *goquery.Selection) {
@@ -170,6 +171,23 @@ func (p *Parser) ParseChannelWithStats(username string) ([]ParsedPost, ParseStat
 		stats.MediaOnlySkipped++
 	})
 	return posts, stats, nil
+}
+
+func extractChannelTitle(document *goquery.Document) string {
+	if document == nil {
+		return ""
+	}
+	for _, selector := range []string{
+		".tgme_channel_info_header_title",
+		".tgme_channel_info .tgme_page_title",
+		".tgme_channel_info h1",
+	} {
+		title := strings.TrimSpace(document.Find(selector).First().Text())
+		if title != "" {
+			return title
+		}
+	}
+	return ""
 }
 
 func parsePost(selection *goquery.Selection) (ParsedPost, bool) {

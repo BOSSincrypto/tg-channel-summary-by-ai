@@ -49,6 +49,9 @@ func (n *OwnerNotifier) SetProviderSecretSource(source func() []string) {
 
 // NotifyOwner sends a plain-text Telegram message to the owner.
 func (n *OwnerNotifier) NotifyOwner(ctx context.Context, text string) error {
+	if n == nil {
+		return fmt.Errorf("owner notifier is not configured")
+	}
 	if n.botToken == "" {
 		return fmt.Errorf("bot token is required")
 	}

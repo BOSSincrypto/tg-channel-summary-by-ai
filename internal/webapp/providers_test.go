@@ -217,6 +217,38 @@ func TestProviderServiceListMasksAPIKeys(t *testing.T) {
 	}
 }
 
+func TestProviderHTTPDuplicateNameIdentifiesNameField(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+
+	validation := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer validation.Close()
+
+	server := NewWithProvidersForTesting(store, time.Second, validation.Client())
+	first := doJSON(t, server.Handler(), http.MethodPost, "/api/providers",
+		`{"name":"First","base_url":"`+validation.URL+`","api_key":"unit-provider-key","default_model":"model"}`)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first provider status = %d, body=%s", first.Code, first.Body.String())
+	}
+	duplicate := doJSON(t, server.Handler(), http.MethodPost, "/api/providers",
+		`{"name":"fIrSt","base_url":"`+validation.URL+`","api_key":"unit-provider-key","default_model":"model"}`)
+	if duplicate.Code != http.StatusConflict {
+		t.Fatalf("duplicate status = %d, body=%s", duplicate.Code, duplicate.Body.String())
+	}
+	var response map[string]string
+	if err := json.Unmarshal(duplicate.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode duplicate response: %v", err)
+	}
+	if response["field"] != "name" || response["error"] != "Провайдер с таким именем уже существует" {
+		t.Fatalf("duplicate response = %#v, want name field error", response)
+	}
+}
+
 func TestProviderMutationsRequireCurrentPositiveVersion(t *testing.T) {
 	store, err := db.Open(":memory:")
 	if err != nil {

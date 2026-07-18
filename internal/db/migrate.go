@@ -22,6 +22,9 @@ func runMigrations(conn *sql.DB) error {
 	if err := ensureVersionColumns(conn); err != nil {
 		return fmt.Errorf("migrate optimistic locking versions: %w", err)
 	}
+	if err := ensureProviderNameUniqueness(conn); err != nil {
+		return fmt.Errorf("migrate provider name uniqueness: %w", err)
+	}
 	return nil
 }
 
@@ -128,6 +131,13 @@ func ensureVersionColumns(conn *sql.DB) error {
 	return nil
 }
 
+func ensureProviderNameUniqueness(conn *sql.DB) error {
+	if _, err := conn.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_providers_name_nocase ON ai_providers(name COLLATE NOCASE)`); err != nil {
+		return fmt.Errorf("create case-insensitive provider name index: %w", err)
+	}
+	return nil
+}
+
 // migrations is an ordered list of DDL statements that define the database schema.
 // They must be applied in order.
 var migrations = []string{
@@ -175,7 +185,7 @@ var migrations = []string{
 	`CREATE TABLE IF NOT EXISTS ai_providers (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		version INTEGER NOT NULL DEFAULT 1,
-		name TEXT NOT NULL UNIQUE,
+		name TEXT NOT NULL UNIQUE COLLATE NOCASE,
 		base_url TEXT NOT NULL,
 		api_key TEXT NOT NULL,
 		default_model TEXT DEFAULT '',

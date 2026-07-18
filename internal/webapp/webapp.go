@@ -75,6 +75,9 @@ func NewWithProvidersForTesting(store *db.DB, timeout time.Duration, client *htt
 func newWithProviders(store *db.DB, timeout time.Duration, client *http.Client, auth *WebAppAuth, allowPrivateHosts ...bool) *Server {
 	s := New()
 	s.database = store
+	if store == nil {
+		return s
+	}
 	service := NewProviderService(store.Providers, client)
 	if len(allowPrivateHosts) > 0 && allowPrivateHosts[0] {
 		service.allowPrivateHosts = true

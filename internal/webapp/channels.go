@@ -30,12 +30,11 @@ type parserChannelVerifier struct {
 }
 
 func (v parserChannelVerifier) Verify(_ context.Context, username string) (string, error) {
-	posts, err := v.parser.ParseChannel(username)
+	_, stats, err := v.parser.ParseChannelWithStats(username)
 	if err != nil {
 		return "", err
 	}
-	_ = posts
-	return username, nil
+	return strings.TrimSpace(stats.ChannelTitle), nil
 }
 
 // ChannelService owns channel validation and persistence.

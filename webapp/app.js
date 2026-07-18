@@ -17,6 +17,7 @@
     loadRequests: {},
     loadGenerations: {},
     groupCollectionGeneration: 0,
+    groupAppliedGenerations: {},
     groupReloads: {},
     digestJob: null,
     digestTimer: null,
@@ -289,7 +290,10 @@
     var previous = state.loadRequests[tab];
     if (previous && previous.controller) previous.controller.abort();
     var generation = (state.loadGenerations[tab] || 0) + 1;
-    var collectionGeneration = state.groupCollectionGeneration;
+    var collectionGeneration = tab === "groups"
+      ? state.groupCollectionGeneration + 1
+      : state.groupCollectionGeneration;
+    if (tab === "groups") state.groupCollectionGeneration = collectionGeneration;
     var controller = new AbortController();
     var request = { generation: generation, collectionGeneration: collectionGeneration, controller: controller, promise: null };
     state.loadGenerations[tab] = generation;
@@ -300,7 +304,6 @@
     request.promise = api(path, { controller: controller }).then(function (result) {
       if (state.loadGenerations[tab] !== generation) return;
       var mapped = mapper(result);
-      if (tab === "groups" && collectionGeneration !== state.groupCollectionGeneration) return;
       if (tab === "groups") mapped = mergeGroupList(mapped, collectionGeneration);
       state.data[tab] = mapped;
       state.loadedAt[tab] = Date.now();
@@ -319,27 +322,106 @@
   function loadGroups(force) { return load("groups", "/api/groups?with_channels=true", function (data) { return asArray(data).map(normalizeGroup); }, force); }
   function loadProviders(force) { return load("providers", "/api/providers", function (data) { return asArray(data).map(normalizeProvider); }, force); }
   function loadSettings(force) { return load("settings", "/api/settings", normalizeSettings, force); }
+  function groupVersion(group) {
+    var version = Number(group && group.version);
+    return isFinite(version) && version > 0 ? Math.floor(version) : 0;
+  }
+  function groupGeneration(value) {
+    var generation = Number(value);
+    return isFinite(generation) && generation > 0 ? Math.floor(generation) : 0;
+  }
+  function preferGroup(candidate, candidateGeneration, existing, existingGeneration) {
+    if (!existing) return candidate;
+    var candidateVersion = groupVersion(candidate);
+    var existingVersion = groupVersion(existing);
+    if (candidateVersion < existingVersion) return existing;
+    if (candidateVersion > existingVersion) return candidate;
+    return groupGeneration(candidateGeneration) >= groupGeneration(existingGeneration) ? candidate : existing;
+  }
   function mergeGroupList(groups, collectionGeneration) {
     var incoming = {};
-    groups.forEach(function (group) { incoming[String(group.id)] = group; });
+    var incomingGenerations = {};
+    var current = {};
+    var listed = {};
+    (state.data.groups || []).forEach(function (group) { current[String(group.id)] = group; });
+    groups.forEach(function (group) {
+      var key = String(group.id);
+      listed[key] = true;
+      var reload = state.groupReloads[key];
+      var existing = current[key];
+      if (reload && reload.promise && !reload.value) {
+        if (existing) {
+          incoming[key] = existing;
+          incomingGenerations[key] = groupGeneration(state.groupAppliedGenerations[key]);
+        }
+        return;
+      }
+      var appliedGeneration = groupGeneration(state.groupAppliedGenerations[key]);
+      if (!existing && appliedGeneration > collectionGeneration) return;
+      var selected = preferGroup(group, collectionGeneration, existing, state.groupAppliedGenerations[key]);
+      incoming[key] = selected;
+      incomingGenerations[key] = selected === existing
+        ? appliedGeneration
+        : collectionGeneration;
+    });
+    Object.keys(current).forEach(function (key) {
+      if (listed[key] || incoming[key]) return;
+      var appliedGeneration = groupGeneration(state.groupAppliedGenerations[key]);
+      if (appliedGeneration > collectionGeneration) {
+        incoming[key] = current[key];
+        incomingGenerations[key] = appliedGeneration;
+      } else {
+        state.groupAppliedGenerations[key] = collectionGeneration;
+      }
+    });
     Object.keys(state.groupReloads).forEach(function (key) {
       var reload = state.groupReloads[key];
-      if (!reload || !reload.value || reload.appliedCollectionGeneration <= collectionGeneration) return;
-      incoming[key] = reload.value;
+      if (!reload || !reload.value || reload.issuedCollectionGeneration <= collectionGeneration) return;
+      var selected = preferGroup(
+        reload.value,
+        reload.issuedCollectionGeneration,
+        incoming[key],
+        collectionGeneration
+      );
+      incoming[key] = selected;
+      if (selected === reload.value) incomingGenerations[key] = reload.issuedCollectionGeneration;
+    });
+    Object.keys(incoming).forEach(function (key) {
+      state.groupAppliedGenerations[key] = incomingGenerations[key] || collectionGeneration;
     });
     return Object.keys(incoming).map(function (key) { return incoming[key]; });
   }
-  function replaceGroup(group) {
+  function replaceGroup(group, sourceGeneration) {
     var groups = state.data.groups || [];
     var key = String(group.id);
     var index = groups.findIndex(function (item) { return String(item.id) === key; });
+    var existing = index < 0 ? null : groups[index];
+    var incomingGeneration = groupGeneration(sourceGeneration);
+    var existingGeneration = groupGeneration(state.groupAppliedGenerations[key]);
+    if (existingGeneration > incomingGeneration) return existing;
+    var selected = preferGroup(group, incomingGeneration, existing, existingGeneration);
+    if (selected !== group) return selected;
     if (index < 0) groups.push(group);
     else groups[index] = group;
+    state.groupAppliedGenerations[key] = incomingGeneration;
     state.data.groups = groups;
+    return group;
   }
   function findChannel(channelID) {
     var key = String(channelID);
     return (state.data.channels || []).find(function (item) { return String(item.id) === key; }) || null;
+  }
+  function channelVersion(channel) {
+    var version = Number(channel && channel.version);
+    return isFinite(version) && version > 0 ? Math.floor(version) : 0;
+  }
+  function reconcileChannel(channelID, updated) {
+    var current = findChannel(channelID);
+    if (!updated || !current) return current;
+    var incoming = normalizeChannel(updated);
+    if (channelVersion(current) > channelVersion(incoming)) return current;
+    Object.assign(current, incoming);
+    return current;
   }
   function findGroup(groupID) {
     var key = String(groupID);
@@ -360,22 +442,22 @@
     var request = {
       generation: generation,
       controller: controller,
-      value: previous && previous.value ? previous.value : null,
-      appliedCollectionGeneration: previous && previous.appliedCollectionGeneration ? previous.appliedCollectionGeneration : 0,
+      value: null,
+      issuedCollectionGeneration: state.groupCollectionGeneration + 1,
       promise: null
     };
     state.groupReloads[key] = request;
-    state.groupCollectionGeneration += 1;
+    state.groupCollectionGeneration = request.issuedCollectionGeneration;
     request.promise = api("/api/groups/" + encodeURIComponent(groupID), { controller: controller }).then(function (result) {
       var current = state.groupReloads[key];
       if (!current || current.generation !== generation) return { applied: false };
       var group = normalizeGroup(result);
-      current.value = group;
-      current.appliedCollectionGeneration = state.groupCollectionGeneration;
-      replaceGroup(group);
+      var applied = replaceGroup(group, current.issuedCollectionGeneration);
+      if (applied !== group) return { applied: false };
+      current.value = applied;
       state.loadedAt.groups = 0;
       render();
-      return { applied: true, group: group };
+      return { applied: true, group: applied };
     }).catch(function (error) {
       var current = state.groupReloads[key];
       if (!current || current.generation !== generation || error.cancelled) return { applied: false };
@@ -524,8 +606,7 @@
         render();
         mutation("/api/channels/" + encodeURIComponent(channel.id), "PATCH", { enabled: channel.enabled, version: beforeVersion }).then(function (updated) {
           if (state.pendingChannelToggles[channelKey] !== request) return;
-          var current = findChannel(channelKey);
-          if (updated && current) Object.assign(current, normalizeChannel(updated));
+          var current = reconcileChannel(channelKey, updated);
           delete state.pendingChannelToggles[channelKey];
           if (!current) {
             state.loadedAt.channels = 0;

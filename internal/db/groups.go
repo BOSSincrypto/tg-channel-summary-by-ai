@@ -6,13 +6,15 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
 )
 
 // GroupRepository provides CRUD operations for Telegram groups.
 type GroupRepository struct {
-	db *DB
+	db           *DB
+	assignmentMu sync.Mutex
 }
 
 // Insert adds a new group and creates a default group_settings row.
@@ -291,6 +293,95 @@ func (r *GroupRepository) AssignChannel(groupID, channelID int64, topicThreadID 
 	return nil
 }
 
+// AssignChannelOptimistic links a channel to a group and advances the group's
+// aggregate version in the same transaction.
+func (r *GroupRepository) AssignChannelOptimistic(groupID, channelID int64, topicThreadID *int64, expectedVersion int64) (int64, error) {
+	if expectedVersion <= 0 {
+		return 0, ErrConflict
+	}
+	r.assignmentMu.Lock()
+	defer r.assignmentMu.Unlock()
+	current, err := r.GetByID(groupID)
+	if errors.Is(err, ErrNotFound) {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, fmt.Errorf("load group for optimistic channel assignment: %w", err)
+	}
+	if current.Version != expectedVersion {
+		return 0, ErrConflict
+	}
+	tx, err := r.db.Conn().Begin()
+	if err != nil {
+		return 0, fmt.Errorf("begin optimistic channel assignment: %w", err)
+	}
+	defer tx.Rollback()
+
+	result, err := tx.Exec(
+		`UPDATE groups SET version = version + 1 WHERE id = ? AND version = ?`,
+		groupID, expectedVersion,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("advance group assignment version: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("group assignment version rows affected: %w", err)
+	}
+	if affected == 0 {
+		var currentVersion int64
+		err := tx.QueryRow(`SELECT version FROM groups WHERE id = ?`, groupID).Scan(&currentVersion)
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, ErrNotFound
+		}
+		if err != nil {
+			return 0, fmt.Errorf("inspect group assignment version: %w", err)
+		}
+		return 0, fmt.Errorf("expected group assignment version %d, current version %d: %w",
+			expectedVersion, currentVersion, ErrConflict)
+	}
+
+	var threadID interface{}
+	if topicThreadID != nil {
+		threadID = *topicThreadID
+	}
+	result, err = tx.Exec(
+		`INSERT OR IGNORE INTO group_channels (group_id, channel_id, topic_thread_id)
+		 SELECT ?, ?, ?
+		 WHERE ? IS NULL OR NOT EXISTS (
+			SELECT 1 FROM forum_topics
+			WHERE group_id = ? AND message_thread_id = ?
+				AND (closed = 1 OR close_pending = 1)
+		 )`,
+		groupID, channelID, threadID, threadID, groupID, threadID,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("optimistic channel assignment: %w", err)
+	}
+	affected, err = result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("optimistic channel assignment rows affected: %w", err)
+	}
+	if affected == 0 {
+		var exists int
+		if err := tx.QueryRow(`
+			SELECT EXISTS(
+				SELECT 1 FROM group_channels
+				WHERE group_id = ? AND channel_id = ?
+			)`, groupID, channelID).Scan(&exists); err != nil {
+			return 0, fmt.Errorf("check optimistic channel assignment: %w", err)
+		}
+		if exists == 1 {
+			return 0, ErrDuplicate
+		}
+		return 0, ErrConflict
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit optimistic channel assignment: %w", err)
+	}
+	return expectedVersion + 1, nil
+}
+
 // UpdateChannelTopic stores the Telegram message thread ID for an assignment.
 func (r *GroupRepository) UpdateChannelTopic(groupID, channelID int64, topicThreadID int64) error {
 	result, err := r.db.Conn().Exec(
@@ -325,6 +416,120 @@ func (r *GroupRepository) UnassignChannel(groupID, channelID int64) error {
 	}
 	if affected == 0 {
 		return ErrNotFound
+	}
+	return nil
+}
+
+// UnassignChannelOptimistic removes a channel assignment and advances the
+// group's aggregate version in the same transaction.
+func (r *GroupRepository) UnassignChannelOptimistic(groupID, channelID, expectedVersion int64) (int64, error) {
+	if expectedVersion <= 0 {
+		return 0, ErrConflict
+	}
+	r.assignmentMu.Lock()
+	defer r.assignmentMu.Unlock()
+	current, err := r.GetByID(groupID)
+	if errors.Is(err, ErrNotFound) {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, fmt.Errorf("load group for optimistic channel unassignment: %w", err)
+	}
+	if current.Version != expectedVersion {
+		return 0, ErrConflict
+	}
+	tx, err := r.db.Conn().Begin()
+	if err != nil {
+		return 0, fmt.Errorf("begin optimistic channel unassignment: %w", err)
+	}
+	defer tx.Rollback()
+
+	result, err := tx.Exec(
+		`UPDATE groups SET version = version + 1 WHERE id = ? AND version = ?`,
+		groupID, expectedVersion,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("advance group unassignment version: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("group unassignment version rows affected: %w", err)
+	}
+	if affected == 0 {
+		var currentVersion int64
+		err := tx.QueryRow(`SELECT version FROM groups WHERE id = ?`, groupID).Scan(&currentVersion)
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, ErrNotFound
+		}
+		if err != nil {
+			return 0, fmt.Errorf("inspect group unassignment version: %w", err)
+		}
+		return 0, fmt.Errorf("expected group unassignment version %d, current version %d: %w",
+			expectedVersion, currentVersion, ErrConflict)
+	}
+	result, err = tx.Exec(
+		`DELETE FROM group_channels WHERE group_id = ? AND channel_id = ?`,
+		groupID, channelID,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("optimistic channel unassignment: %w", err)
+	}
+	affected, err = result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("optimistic channel unassignment rows affected: %w", err)
+	}
+	if affected == 0 {
+		return 0, ErrNotFound
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit optimistic channel unassignment: %w", err)
+	}
+	return expectedVersion + 1, nil
+}
+
+// RollbackAssignmentOptimistic removes a provisional assignment and restores
+// the prior group version after a failed topic-creation side effect.
+func (r *GroupRepository) RollbackAssignmentOptimistic(groupID, channelID, assignedVersion int64) error {
+	if assignedVersion <= 1 {
+		return ErrConflict
+	}
+	r.assignmentMu.Lock()
+	defer r.assignmentMu.Unlock()
+	tx, err := r.db.Conn().Begin()
+	if err != nil {
+		return fmt.Errorf("begin optimistic assignment rollback: %w", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(
+		`DELETE FROM group_channels WHERE group_id = ? AND channel_id = ?`,
+		groupID, channelID,
+	)
+	if err != nil {
+		return fmt.Errorf("rollback channel assignment: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("rollback assignment rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrNotFound
+	}
+	result, err = tx.Exec(
+		`UPDATE groups SET version = version - 1 WHERE id = ? AND version = ?`,
+		groupID, assignedVersion,
+	)
+	if err != nil {
+		return fmt.Errorf("restore group assignment version: %w", err)
+	}
+	affected, err = result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("restore group assignment version rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrConflict
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit optimistic assignment rollback: %w", err)
 	}
 	return nil
 }

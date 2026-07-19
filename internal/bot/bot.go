@@ -853,57 +853,92 @@ func (s *Service) RenameChannelTopic(ctx context.Context, groupID, channelID int
 	return nil
 }
 
+type versionedAssignmentRepository interface {
+	UnassignChannelOptimistic(int64, int64, int64) (int64, error)
+}
+
 // RemoveChannelTopic removes an assignment and closes the Telegram topic only
 // when the durable registry proves that this bot created it.
 func (s *Service) RemoveChannelTopic(ctx context.Context, groupID, channelID int64) error {
+	_, err := s.removeChannelTopic(ctx, groupID, channelID, 0)
+	return err
+}
+
+// RemoveChannelTopicWithVersion removes an assignment only when the supplied
+// group aggregate version is current. The versioned check happens before any
+// permission or Telegram lifecycle call.
+func (s *Service) RemoveChannelTopicWithVersion(ctx context.Context, groupID, channelID, expectedVersion int64) (int64, error) {
+	if expectedVersion <= 0 {
+		return 0, db.ErrConflict
+	}
+	return s.removeChannelTopic(ctx, groupID, channelID, expectedVersion)
+}
+
+func (s *Service) removeChannelTopic(ctx context.Context, groupID, channelID, expectedVersion int64) (int64, error) {
 	if s == nil || s.api == nil {
-		return errors.New("bot service is not configured")
+		return 0, errors.New("bot service is not configured")
 	}
 	if s.groups == nil {
-		return errors.New("group repository is not configured")
+		return 0, errors.New("group repository is not configured")
 	}
 	group, err := s.groups.GetByID(groupID)
 	if err != nil {
-		return fmt.Errorf("load group: %w", err)
+		return 0, fmt.Errorf("load group: %w", err)
+	}
+	if expectedVersion > 0 && group.Version != expectedVersion {
+		return 0, db.ErrConflict
 	}
 	if err := s.ensureTopicPermission(ctx, group.TelegramChatID); err != nil {
-		return fmt.Errorf("check topic permission before removal: %w", err)
+		return 0, fmt.Errorf("check topic permission before removal: %w", err)
 	}
 	s.topicMu.Lock()
 	defer s.topicMu.Unlock()
+	unassign := func() (int64, error) {
+		if expectedVersion <= 0 {
+			if err := s.groups.UnassignChannel(groupID, channelID); err != nil {
+				return 0, err
+			}
+			return 0, nil
+		}
+		repository, ok := interface{}(s.groups).(versionedAssignmentRepository)
+		if !ok {
+			return 0, errors.New("versioned assignment repository is not configured")
+		}
+		return repository.UnassignChannelOptimistic(groupID, channelID, expectedVersion)
+	}
 	threadID, chatID, err := s.topicAssignment(groupID, channelID)
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
-			return s.groups.UnassignChannel(groupID, channelID)
+			return unassign()
 		}
-		return err
+		return 0, err
 	}
 	var registeredTopic *model.ForumTopic
 	if s.topicRegistry != nil {
 		topic, registryErr := s.topicRegistry.Get(groupID, threadID)
 		if errors.Is(registryErr, db.ErrNotFound) {
-			return s.groups.UnassignChannel(groupID, channelID)
+			return unassign()
 		}
 		if registryErr != nil {
-			return fmt.Errorf("load forum topic ownership: %w", registryErr)
+			return 0, fmt.Errorf("load forum topic ownership: %w", registryErr)
 		}
 		if !topic.LifecycleOwned {
-			return s.groups.UnassignChannel(groupID, channelID)
+			return unassign()
 		}
 		registeredTopic = topic
 	}
 	assignments, err := s.groups.GetChannelAssignments(groupID)
 	if err != nil {
-		return fmt.Errorf("load topic assignments: %w", err)
+		return 0, fmt.Errorf("load topic assignments: %w", err)
 	}
 	shared := hasOtherTopicAssignment(assignments, channelID, threadID)
 	closeCoordinator, coordinated := s.topicRegistry.(forumTopicCloseCoordinator)
 	if registeredTopic != nil && registeredTopic.Closed {
-		return s.groups.UnassignChannel(groupID, channelID)
+		return unassign()
 	}
 	if registeredTopic == nil || registeredTopic.LifecycleOwned {
 		if err := s.ensureTopicPermission(ctx, chatID); err != nil {
-			return fmt.Errorf("check topic permission before close: %w", err)
+			return 0, fmt.Errorf("check topic permission before close: %w", err)
 		}
 	}
 	// The initial shared-assignment check deliberately happens before close
@@ -911,24 +946,27 @@ func (s *Service) RemoveChannelTopic(ctx context.Context, groupID, channelID int
 	// after unassignment, so the final removal can close an otherwise-unused
 	// lifecycle-owned topic without closing a topic that still has a survivor.
 	if shared {
-		if err := s.groups.UnassignChannel(groupID, channelID); err != nil {
-			return fmt.Errorf("remove shared topic assignment: %w", err)
+		if _, err := unassign(); err != nil {
+			return 0, fmt.Errorf("remove shared topic assignment: %w", err)
 		}
 	} else {
 		// Remove the assignment before recording close intent. This keeps an
 		// assignment-persistence failure from creating a pending close that
 		// still points at the topic. BeginClose below atomically verifies that
 		// no other assignment appeared while this removal was in flight.
-		if err := s.groups.UnassignChannel(groupID, channelID); err != nil {
-			return fmt.Errorf("remove topic assignment: %w", err)
+		if _, err := unassign(); err != nil {
+			return 0, fmt.Errorf("remove topic assignment: %w", err)
 		}
 	}
 	if coordinated {
 		if err := closeCoordinator.BeginClose(groupID, threadID); err != nil {
 			if errors.Is(err, db.ErrNotFound) {
-				return nil
+				if expectedVersion > 0 {
+					return expectedVersion + 1, nil
+				}
+				return 0, nil
 			}
-			return fmt.Errorf("record topic close intent: %w", err)
+			return 0, fmt.Errorf("record topic close intent: %w", err)
 		}
 	}
 	// Re-read group_channels immediately before the irreversible Telegram
@@ -937,47 +975,52 @@ func (s *Service) RemoveChannelTopic(ctx context.Context, groupID, channelID int
 	// allowing recovery to close a still-referenced topic.
 	assignments, err = s.groups.GetChannelAssignments(groupID)
 	if err != nil {
-		return fmt.Errorf("recheck topic assignments before close: %w", err)
+		return 0, fmt.Errorf("recheck topic assignments before close: %w", err)
 	}
 	if hasTopicAssignment(assignments, threadID) {
 		if coordinated {
 			if err := s.topicRegistry.MarkReopened(groupID, threadID); err != nil &&
 				!errors.Is(err, db.ErrNotFound) {
-				return fmt.Errorf("cancel shared topic close: %w", err)
+				return 0, fmt.Errorf("cancel shared topic close: %w", err)
 			}
 		}
-		return nil
+		if expectedVersion > 0 {
+			return expectedVersion + 1, nil
+		}
+		return 0, nil
 	}
 	if err := s.ensureTopicPermission(ctx, chatID); err != nil {
-		return fmt.Errorf("check topic permission before close: %w", err)
+		return 0, fmt.Errorf("check topic permission before close: %w", err)
 	}
 	if err := s.api.CloseForumTopic(ctx, &telego.CloseForumTopicParams{
-		ChatID:          groupTelegramChatID(chatID),
 		MessageThreadID: int(threadID),
 	}); err != nil {
 		if coordinated {
-			return fmt.Errorf("close topic: %w; durable close intent remains pending", s.classifyTelegramError(err))
+			return 0, fmt.Errorf("close topic: %w; durable close intent remains pending", s.classifyTelegramError(err))
 		}
 		rollbackErr := s.groups.AssignChannel(groupID, channelID, &threadID)
 		if rollbackErr != nil {
-			return fmt.Errorf("close topic: %w; rollback topic assignment: %v", s.classifyTelegramError(err), rollbackErr)
+			return 0, fmt.Errorf("close topic: %w; rollback topic assignment: %v", s.classifyTelegramError(err), rollbackErr)
 		}
-		return fmt.Errorf("close topic: %w", s.classifyTelegramError(err))
+		return 0, fmt.Errorf("close topic: %w", s.classifyTelegramError(err))
 	}
 	if s.topicRegistry != nil {
 		if err := s.topicRegistry.MarkClosed(groupID, threadID); err != nil &&
 			!errors.Is(err, db.ErrNotFound) {
 			if coordinated {
-				return fmt.Errorf("persist closed topic state: %w; durable close intent remains pending", err)
+				return 0, fmt.Errorf("persist closed topic state: %w; durable close intent remains pending", err)
 			}
 			rollbackErr := s.groups.AssignChannel(groupID, channelID, &threadID)
 			if rollbackErr != nil {
-				return fmt.Errorf("persist closed topic state: %w; rollback topic assignment: %v", err, rollbackErr)
+				return 0, fmt.Errorf("persist closed topic state: %w; rollback topic assignment: %v", err, rollbackErr)
 			}
-			return fmt.Errorf("persist closed topic state: %w", err)
+			return 0, fmt.Errorf("persist closed topic state: %w", err)
 		}
 	}
-	return nil
+	if expectedVersion > 0 {
+		return expectedVersion + 1, nil
+	}
+	return 0, nil
 }
 
 // ReconcilePendingTopicClosures retries durable close intents once during

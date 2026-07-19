@@ -722,7 +722,7 @@
         assignmentNode.appendChild(line);
         assignmentNode.appendChild(button("Отвязать", "ghost small", function () {
           openConfirm("Отвязать канал @" + assignment.username + "?", "Канал останется в списке каналов.", "Отвязать", function () {
-            mutation("/api/groups/" + encodeURIComponent(group.id) + "/channels/" + encodeURIComponent(assignment.channelId), "DELETE").then(function () {
+            mutation("/api/groups/" + encodeURIComponent(group.id) + "/channels/" + encodeURIComponent(assignment.channelId), "DELETE", { version: group.version }).then(function () {
               return reloadGroup(group.id, true).then(function (result) {
                 if (!result.applied) throw new Error("Не удалось подтвердить актуальное состояние группы.");
                 showToast("Канал отвязан.", "success");
@@ -818,12 +818,18 @@
           save.disabled = true;
           var currentGroup = findGroup(authoritativeGroup.id) || authoritativeGroup;
           var currentVersion = positiveVersion(currentGroup.version, 1);
-          Promise.allSettled(selected.map(function (channelId) {
-            var payload = { channel_id: channelId, version: currentVersion };
-            if (currentGroup.isForum && topic && topic.input.value) payload.topic_thread_id = topic.input.value;
-            return mutation("/api/groups/" + encodeURIComponent(currentGroup.id) + "/channels", "POST", payload);
-          })).then(function (results) {
-            var failed = results.filter(function (result) { return result.status === "rejected"; });
+          var failed = [];
+          selected.reduce(function (promise, channelId) {
+            return promise.then(function () {
+              var payload = { channel_id: channelId, version: currentVersion };
+              if (currentGroup.isForum && topic && topic.input.value) payload.topic_thread_id = topic.input.value;
+              return mutation("/api/groups/" + encodeURIComponent(currentGroup.id) + "/channels", "POST", payload).then(function (saved) {
+                currentVersion = positiveVersion(saved && saved.version, currentVersion + 1);
+              }).catch(function (error) {
+                failed.push(error);
+              });
+            });
+          }, Promise.resolve()).then(function () {
             return reloadGroup(currentGroup.id, true).then(function (reloadResult) {
               if (!reloadResult.applied) throw new Error("Не удалось подтвердить актуальное состояние группы.");
               close();

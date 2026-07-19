@@ -388,7 +388,7 @@ func TestProductionWebAppUsesRealBotTopicRemovalBoundary(t *testing.T) {
 	assignment := httptest.NewRequest(http.MethodPost,
 		"/api/groups/"+strconv.FormatInt(groupID, 10)+"/channels",
 		strings.NewReader(`{"channel_id":"`+strconv.FormatInt(channelID, 10)+`","topic_thread_id":`+
-			strconv.FormatInt(threadID, 10)+`}`))
+			strconv.FormatInt(threadID, 10)+`,"version":1}`))
 	assignment.Header.Set("Content-Type", "application/json")
 	assignmentResponse := httptest.NewRecorder()
 	server.Handler().ServeHTTP(assignmentResponse, assignment)
@@ -397,7 +397,9 @@ func TestProductionWebAppUsesRealBotTopicRemovalBoundary(t *testing.T) {
 	}
 
 	removal := httptest.NewRequest(http.MethodDelete,
-		"/api/groups/"+strconv.FormatInt(groupID, 10)+"/channels/"+strconv.FormatInt(channelID, 10), nil)
+		"/api/groups/"+strconv.FormatInt(groupID, 10)+"/channels/"+strconv.FormatInt(channelID, 10),
+		strings.NewReader(`{"version":2}`))
+	removal.Header.Set("Content-Type", "application/json")
 	removalResponse := httptest.NewRecorder()
 	server.Handler().ServeHTTP(removalResponse, removal)
 	if removalResponse.Code != http.StatusBadGateway {

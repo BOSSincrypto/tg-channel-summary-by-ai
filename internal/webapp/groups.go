@@ -37,6 +37,12 @@ type TopicLifecycle interface {
 	CheckTopicPermission(context.Context, int64) error
 }
 
+// VersionedTopicLifecycle performs an unassignment together with the
+// aggregate-version check before any Telegram topic side effect.
+type VersionedTopicLifecycle interface {
+	RemoveChannelTopicWithVersion(context.Context, int64, int64, int64) (int64, error)
+}
+
 // Topic describes a selectable forum topic. MessageThreadID is always
 // positive; the WebApp never exposes the general topic as a placeholder ID.
 type Topic struct {
@@ -138,6 +144,12 @@ type optimisticGroupRepository interface {
 	DeleteOptimistic(int64, int64) error
 }
 
+type optimisticAssignmentRepository interface {
+	AssignChannelOptimistic(int64, int64, *int64, int64) (int64, error)
+	UnassignChannelOptimistic(int64, int64, int64) (int64, error)
+	RollbackAssignmentOptimistic(int64, int64, int64) error
+}
+
 type forumTopicStateLookup interface {
 	GetForumTopic(int64, int64) (*model.ForumTopic, error)
 }
@@ -199,6 +211,7 @@ type groupInput struct {
 type assignmentInput struct {
 	ChannelID     string          `json:"channel_id"`
 	TopicThreadID json.RawMessage `json:"topic_thread_id"`
+	Version       int64           `json:"version"`
 }
 
 func (s *GroupService) Create(chatIDValue string) (*model.Group, error) {
@@ -421,11 +434,6 @@ func (s *Server) handleGroupChannels(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Некорректный ID группы"})
 		return
 	}
-	group, err := s.groupService.repository.GetByID(groupID)
-	if err != nil {
-		writeGroupError(w, err)
-		return
-	}
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -434,6 +442,19 @@ func (s *Server) handleGroupChannels(w http.ResponseWriter, r *http.Request) {
 	var input assignmentInput
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&input); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Некорректный JSON"})
+		return
+	}
+	if input.Version <= 0 {
+		writeGroupError(w, db.ErrConflict)
+		return
+	}
+	group, err := s.groupService.repository.GetByID(groupID)
+	if err != nil {
+		writeGroupError(w, err)
+		return
+	}
+	if group.Version != input.Version {
+		writeGroupError(w, db.ErrConflict)
 		return
 	}
 	channelID, err := parsePositiveID(input.ChannelID)
@@ -471,6 +492,14 @@ func (s *Server) handleGroupChannels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if topic != nil {
+		if s.groupService.topics == nil {
+			writeGroupError(w, errors.New("topic permission lifecycle is not configured"))
+			return
+		}
+		if err := s.groupService.topics.CheckTopicPermission(r.Context(), groupID); err != nil {
+			writeGroupError(w, err)
+			return
+		}
 		topics, err := s.groupService.listTopics(r.Context(), groupID)
 		if err != nil {
 			writeGroupError(w, err)
@@ -488,30 +517,41 @@ func (s *Server) handleGroupChannels(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if topic == nil && s.groupService.topics != nil && forum {
-		if err := s.groupService.topics.CheckTopicPermission(r.Context(), groupID); err != nil {
-			writeGroupError(w, err)
+	if forum {
+		if s.groupService.topics == nil {
+			writeGroupError(w, errors.New("topic permission lifecycle is not configured"))
 			return
 		}
+		if topic == nil {
+			if err := s.groupService.topics.CheckTopicPermission(r.Context(), groupID); err != nil {
+				writeGroupError(w, err)
+				return
+			}
+		}
 	}
-	if err := s.groupService.repository.AssignChannel(groupID, channelID, topic); err != nil {
+	optimistic, ok := s.groupService.repository.(optimisticAssignmentRepository)
+	if !ok {
+		writeGroupError(w, errors.New("assignment locking is not configured"))
+		return
+	}
+	nextVersion, err := optimistic.AssignChannelOptimistic(groupID, channelID, topic, input.Version)
+	if err != nil {
 		writeGroupError(w, err)
 		return
 	}
 	// A forum assignment without a selected topic is completed by the shared
-	// Telegram lifecycle. If creation fails, compensate the provisional row so
-	// the WebApp cannot leave a partial assignment behind.
-	if topic == nil && s.groupService.topics != nil &&
-		forum {
+	// Telegram lifecycle. If creation fails, compensate the provisional row
+	// and restore the aggregate version.
+	if topic == nil && forum {
 		if err := s.groupService.topics.CreateChannelTopic(r.Context(), groupID, channelID); err != nil {
-			if rollbackErr := s.groupService.repository.UnassignChannel(groupID, channelID); rollbackErr != nil {
+			if rollbackErr := optimistic.RollbackAssignmentOptimistic(groupID, channelID, nextVersion); rollbackErr != nil {
 				err = fmt.Errorf("%w; rollback assignment: %v", err, rollbackErr)
 			}
 			writeGroupError(w, err)
 			return
 		}
 	}
-	writeJSON(w, http.StatusCreated, map[string]string{"status": "assigned"})
+	writeJSON(w, http.StatusCreated, map[string]any{"status": "assigned", "version": nextVersion})
 }
 
 func (s *Server) handleGroupChannelByID(w http.ResponseWriter, r *http.Request) {
@@ -530,9 +570,21 @@ func (s *Server) handleGroupChannelByID(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	var input versionInput
+	if err := decodeJSON(r, w, &input); err != nil {
+		return
+	}
+	if input.Version <= 0 {
+		writeGroupError(w, db.ErrConflict)
+		return
+	}
 	group, err := s.groupService.repository.GetByID(groupID)
 	if err != nil {
 		writeGroupError(w, err)
+		return
+	}
+	if group.Version != input.Version {
+		writeGroupError(w, db.ErrConflict)
 		return
 	}
 	assignments, err := s.groupService.repository.GetChannelAssignments(groupID)
@@ -553,15 +605,30 @@ func (s *Server) handleGroupChannelByID(w http.ResponseWriter, r *http.Request) 
 	}
 	if assignment.TopicThreadID != nil && s.groupService.topics != nil &&
 		(group.Status == "" || group.Status == model.GroupStatusActive) {
-		if err := s.groupService.topics.RemoveChannelTopic(r.Context(), groupID, channelID); err != nil {
+		versioned, ok := s.groupService.topics.(VersionedTopicLifecycle)
+		if !ok {
+			writeGroupError(w, errors.New("versioned topic lifecycle is not configured"))
+			return
+		}
+		nextVersion, err := versioned.RemoveChannelTopicWithVersion(r.Context(), groupID, channelID, input.Version)
+		if err != nil {
 			writeGroupError(w, err)
 			return
 		}
-	} else if err := s.groupService.repository.UnassignChannel(groupID, channelID); err != nil {
-		writeGroupError(w, err)
-		return
+		writeJSON(w, http.StatusOK, map[string]any{"status": "unassigned", "version": nextVersion})
+	} else {
+		optimistic, ok := s.groupService.repository.(optimisticAssignmentRepository)
+		if !ok {
+			writeGroupError(w, errors.New("assignment locking is not configured"))
+			return
+		}
+		nextVersion, err := optimistic.UnassignChannelOptimistic(groupID, channelID, input.Version)
+		if err != nil {
+			writeGroupError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"status": "unassigned", "version": nextVersion})
 	}
-	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) groupAssignments(groupID int64, forum bool) ([]map[string]any, error) {
@@ -697,6 +764,9 @@ func writeGroupError(w http.ResponseWriter, err error) {
 		status, message = http.StatusConflict, "Группа уже добавлена"
 	case errors.Is(err, db.ErrConflict):
 		status, message = http.StatusConflict, "Топик больше недоступен для назначения"
+	case strings.Contains(strings.ToLower(err.Error()), "database table is locked"),
+		strings.Contains(strings.ToLower(err.Error()), "database is locked"):
+		status, message = http.StatusConflict, "Группа была изменена в другой сессии. Обновите страницу."
 	case strings.Contains(strings.ToLower(err.Error()), "chat_id"):
 		status, message = http.StatusBadRequest, "Chat ID должен быть числом (например, -1001234567890)"
 	case strings.Contains(strings.ToLower(err.Error()), "verification"):

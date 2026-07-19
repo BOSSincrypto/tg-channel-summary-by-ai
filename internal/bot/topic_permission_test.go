@@ -265,7 +265,7 @@ func TestProductionWebAppTopicCreationChecksPermissionBeforeAssignment(t *testin
 
 	request := httptest.NewRequest(http.MethodPost,
 		"/api/groups/"+strconv.FormatInt(groupID, 10)+"/channels",
-		strings.NewReader(`{"channel_id":"`+strconv.FormatInt(channelID, 10)+`"}`))
+		strings.NewReader(`{"channel_id":"`+strconv.FormatInt(channelID, 10)+`","version":1}`))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)

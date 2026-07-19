@@ -354,6 +354,7 @@ func TestChannelMutationsRequireCurrentPositiveVersion(t *testing.T) {
 
 func TestGroupsAPIUsesStringChatIDAndRejectsDuplicateAssignments(t *testing.T) {
 	server, store := newBackendTestServer(t)
+	server.SetTopicLifecycle(&fakeTopicLifecycle{store: store})
 	available := httptest.NewRecorder()
 	server.Handler().ServeHTTP(available, httptest.NewRequest(http.MethodGet, "/api/groups/available", nil))
 	if available.Code != http.StatusOK {
@@ -377,7 +378,7 @@ func TestGroupsAPIUsesStringChatIDAndRejectsDuplicateAssignments(t *testing.T) {
 	}
 	groupID := int64(group["id"].(float64))
 
-	assignBody := `{"channel_id":"` + strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(jsonNumber(channelID)), "+")) + `"}`
+	assignBody := `{"channel_id":"` + strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(jsonNumber(channelID)), "+")) + `","version":1}`
 	assigned := doJSON(t, server.Handler(), http.MethodPost, "/api/groups/"+jsonNumber(groupID)+"/channels", assignBody)
 	if assigned.Code != http.StatusCreated {
 		t.Fatalf("assign status = %d, body=%s", assigned.Code, assigned.Body.String())
@@ -408,7 +409,7 @@ func TestProductionTopicLifecycleIsUsedForAssignmentAndRemoval(t *testing.T) {
 
 	assigned := doJSON(t, server.Handler(), http.MethodPost,
 		"/api/groups/"+jsonNumber(groupID)+"/channels",
-		`{"channel_id":"`+jsonNumber(channelID)+`"}`)
+		`{"channel_id":"`+jsonNumber(channelID)+`","version":1}`)
 	if assigned.Code != http.StatusCreated {
 		t.Fatalf("assignment status = %d, body=%s", assigned.Code, assigned.Body.String())
 	}
@@ -424,8 +425,9 @@ func TestProductionTopicLifecycleIsUsedForAssignmentAndRemoval(t *testing.T) {
 	}
 
 	removed := doJSON(t, server.Handler(), http.MethodDelete,
-		"/api/groups/"+jsonNumber(groupID)+"/channels/"+jsonNumber(channelID), "")
-	if removed.Code != http.StatusNoContent {
+		"/api/groups/"+jsonNumber(groupID)+"/channels/"+jsonNumber(channelID),
+		`{"version":2}`)
+	if removed.Code != http.StatusOK {
 		t.Fatalf("removal status = %d, body=%s", removed.Code, removed.Body.String())
 	}
 	if len(lifecycle.removed) != 1 || lifecycle.removed[0] != [2]int64{groupID, channelID} {
@@ -460,7 +462,7 @@ func TestProductionTopicLifecycleFailureLeavesAssignmentUnchanged(t *testing.T) 
 
 	response := doJSON(t, server.Handler(), http.MethodPost,
 		"/api/groups/"+jsonNumber(groupID)+"/channels",
-		`{"channel_id":"`+jsonNumber(channelID)+`"}`)
+		`{"channel_id":"`+jsonNumber(channelID)+`","version":1}`)
 	if response.Code != http.StatusBadGateway {
 		t.Fatalf("failure status = %d, body=%s", response.Code, response.Body.String())
 	}
@@ -496,7 +498,7 @@ func TestProductionWebAppTopicCreationRequiresLifecyclePermission(t *testing.T) 
 
 	response := doJSON(t, server.Handler(), http.MethodPost,
 		"/api/groups/"+jsonNumber(groupID)+"/channels",
-		`{"channel_id":"`+jsonNumber(channelID)+`"}`)
+		`{"channel_id":"`+jsonNumber(channelID)+`","version":1}`)
 	if response.Code != http.StatusBadGateway {
 		t.Fatalf("permission status = %d, body=%s, want 502", response.Code, response.Body.String())
 	}
@@ -535,7 +537,7 @@ func TestProductionWebAppTopicCloseFailureLeavesDurablePendingState(t *testing.T
 
 	assigned := doJSON(t, server.Handler(), http.MethodPost,
 		"/api/groups/"+jsonNumber(groupID)+"/channels",
-		`{"channel_id":"`+jsonNumber(channelID)+`"}`)
+		`{"channel_id":"`+jsonNumber(channelID)+`","version":1}`)
 	if assigned.Code != http.StatusCreated {
 		t.Fatalf("assignment status = %d, body=%s", assigned.Code, assigned.Body.String())
 	}
@@ -560,7 +562,8 @@ func TestProductionWebAppTopicCloseFailureLeavesDurablePendingState(t *testing.T
 		t.Fatalf("clear simulated pending close: %v", err)
 	}
 	removed := doJSON(t, server.Handler(), http.MethodDelete,
-		"/api/groups/"+jsonNumber(groupID)+"/channels/"+jsonNumber(channelID), "")
+		"/api/groups/"+jsonNumber(groupID)+"/channels/"+jsonNumber(channelID),
+		`{"version":2}`)
 	if removed.Code != http.StatusInternalServerError {
 		t.Fatalf("removal status = %d, body=%s", removed.Code, removed.Body.String())
 	}
@@ -621,7 +624,7 @@ func TestNonForumAssignmentDoesNotCallTopicLifecycle(t *testing.T) {
 
 	response := doJSON(t, server.Handler(), http.MethodPost,
 		"/api/groups/"+jsonNumber(groupID)+"/channels",
-		`{"channel_id":"`+jsonNumber(channelID)+`"}`)
+		`{"channel_id":"`+jsonNumber(channelID)+`","version":1}`)
 	if response.Code != http.StatusCreated {
 		t.Fatalf("assignment status = %d, body=%s", response.Code, response.Body.String())
 	}
@@ -701,6 +704,7 @@ func TestProductionForumTopicCatalogReturnsUnassignedObservedTopic(t *testing.T)
 
 func TestProductionForumTopicSelectionReusesObservedTopic(t *testing.T) {
 	server, store := newBackendTestServer(t)
+	server.SetTopicLifecycle(&fakeTopicLifecycle{store: store})
 	groupID, err := store.Groups.Insert(&model.Group{
 		TelegramChatID: -1019,
 		Title:          "Observed Forum",
@@ -718,7 +722,7 @@ func TestProductionForumTopicSelectionReusesObservedTopic(t *testing.T) {
 	}
 	response := doJSON(t, server.Handler(), http.MethodPost,
 		"/api/groups/"+jsonNumber(groupID)+"/channels",
-		`{"channel_id":"`+jsonNumber(channelID)+`","topic_thread_id":1502}`)
+		`{"channel_id":"`+jsonNumber(channelID)+`","topic_thread_id":1502,"version":1}`)
 	if response.Code != http.StatusCreated {
 		t.Fatalf("selection status = %d, body=%s", response.Code, response.Body.String())
 	}
@@ -732,8 +736,199 @@ func TestProductionForumTopicSelectionReusesObservedTopic(t *testing.T) {
 	}
 }
 
+func TestForumTopicSelectionChecksPermissionBeforeCatalogAndAssignment(t *testing.T) {
+	server, store := newBackendTestServer(t)
+	lifecycle := &fakeTopicLifecycle{permissionErr: errors.New("missing can_manage_topics")}
+	server.SetTopicLifecycle(lifecycle)
+	groupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: -1020,
+		Title:          "Permission forum",
+		Status:         model.GroupStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	channelID, err := store.Channels.Insert(&model.Channel{Username: "permission_existing", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	if err := store.ForumTopics.Observe(groupID, 1503, "Existing topic"); err != nil {
+		t.Fatalf("observe topic: %v", err)
+	}
+
+	response := doJSON(t, server.Handler(), http.MethodPost,
+		"/api/groups/"+jsonNumber(groupID)+"/channels",
+		`{"channel_id":"`+jsonNumber(channelID)+`","topic_thread_id":1503,"version":1}`)
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("permission response = %d, body=%s, want 502", response.Code, response.Body.String())
+	}
+	if lifecycle.permissionChecks != 1 {
+		t.Fatalf("permission checks = %d, want one", lifecycle.permissionChecks)
+	}
+	assignments, err := store.Groups.GetChannelAssignments(groupID)
+	if err != nil {
+		t.Fatalf("load assignments: %v", err)
+	}
+	if len(assignments) != 0 {
+		t.Fatalf("permission failure persisted assignment = %#v", assignments)
+	}
+	group, err := store.Groups.GetByID(groupID)
+	if err != nil {
+		t.Fatalf("load group: %v", err)
+	}
+	if group.Version != 1 {
+		t.Fatalf("permission failure advanced version to %d", group.Version)
+	}
+}
+
+func TestChannelTopicAssignmentsRequireCurrentPositiveGroupVersion(t *testing.T) {
+	server, store := newBackendTestServer(t)
+	lifecycle := &fakeTopicLifecycle{store: store}
+	server.SetTopicLifecycle(lifecycle)
+	groupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: -1021,
+		Title:          "Locked forum",
+		Status:         model.GroupStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	channelID, err := store.Channels.Insert(&model.Channel{Username: "locked_assign", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	before, err := store.Groups.GetByID(groupID)
+	if err != nil {
+		t.Fatalf("load group before matrix: %v", err)
+	}
+
+	for name, body := range map[string]string{
+		"missing":   `{"channel_id":"` + jsonNumber(channelID) + `"}`,
+		"zero":      `{"channel_id":"` + jsonNumber(channelID) + `","version":0}`,
+		"negative":  `{"channel_id":"` + jsonNumber(channelID) + `","version":-1}`,
+		"malformed": `{"channel_id":"` + jsonNumber(channelID) + `","version":"1"}`,
+		"stale":     `{"channel_id":"` + jsonNumber(channelID) + `","version":99}`,
+	} {
+		response := doJSON(t, server.Handler(), http.MethodPost,
+			"/api/groups/"+jsonNumber(groupID)+"/channels", body)
+		if name == "malformed" {
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("%s status = %d, body=%s, want 400", name, response.Code, response.Body.String())
+			}
+		} else if response.Code != http.StatusConflict {
+			t.Fatalf("%s status = %d, body=%s, want 409", name, response.Code, response.Body.String())
+		}
+	}
+	if lifecycle.permissionChecks != 0 {
+		t.Fatalf("rejected version matrix performed permission checks = %d", lifecycle.permissionChecks)
+	}
+	assignments, err := store.Groups.GetChannelAssignments(groupID)
+	if err != nil {
+		t.Fatalf("load assignments after rejected matrix: %v", err)
+	}
+	if len(assignments) != 0 {
+		t.Fatalf("rejected assignment matrix changed rows = %#v", assignments)
+	}
+	after, err := store.Groups.GetByID(groupID)
+	if err != nil {
+		t.Fatalf("load group after rejected matrix: %v", err)
+	}
+	if *after != *before {
+		t.Fatalf("rejected assignment matrix changed group: before=%#v after=%#v", before, after)
+	}
+
+	current := doJSON(t, server.Handler(), http.MethodPost,
+		"/api/groups/"+jsonNumber(groupID)+"/channels",
+		`{"channel_id":"`+jsonNumber(channelID)+`","topic_thread_id":null,"version":1}`)
+	if current.Code != http.StatusCreated || !strings.Contains(current.Body.String(), `"version":2`) {
+		t.Fatalf("current assignment = %d %s, want version 2", current.Code, current.Body.String())
+	}
+	assigned, err := store.Groups.GetChannelAssignments(groupID)
+	if err != nil {
+		t.Fatalf("load current assignment: %v", err)
+	}
+	if len(assigned) != 1 {
+		t.Fatalf("current assignment rows = %#v", assigned)
+	}
+
+	staleRemoval := doJSON(t, server.Handler(), http.MethodDelete,
+		"/api/groups/"+jsonNumber(groupID)+"/channels/"+jsonNumber(channelID),
+		`{"version":1}`)
+	if staleRemoval.Code != http.StatusConflict {
+		t.Fatalf("stale removal = %d %s, want 409", staleRemoval.Code, staleRemoval.Body.String())
+	}
+	currentRemoval := doJSON(t, server.Handler(), http.MethodDelete,
+		"/api/groups/"+jsonNumber(groupID)+"/channels/"+jsonNumber(channelID),
+		`{"version":2}`)
+	if currentRemoval.Code != http.StatusOK || !strings.Contains(currentRemoval.Body.String(), `"version":3`) {
+		t.Fatalf("current removal = %d %s, want version 3", currentRemoval.Code, currentRemoval.Body.String())
+	}
+}
+
+func TestConcurrentChannelAssignmentsAllowOnlyOneCurrentVersion(t *testing.T) {
+	store, err := db.Open(t.TempDir() + "/assignment-concurrency.db")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	server := NewWithProvidersForTesting(store, 0, http.DefaultClient)
+	lifecycle := &fakeTopicLifecycle{}
+	server.SetTopicLifecycle(lifecycle)
+	groupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: -1022,
+		Title:          "Concurrent forum",
+		Status:         model.GroupStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	firstChannelID, err := store.Channels.Insert(&model.Channel{Username: "concurrent_one", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert first channel: %v", err)
+	}
+	secondChannelID, err := store.Channels.Insert(&model.Channel{Username: "concurrent_two", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert second channel: %v", err)
+	}
+
+	type concurrentResponse struct {
+		code int
+		body string
+	}
+	responses := make(chan concurrentResponse, 2)
+	for _, channelID := range []int64{firstChannelID, secondChannelID} {
+		go func(channelID int64) {
+			response := doJSON(t, server.Handler(), http.MethodPost,
+				"/api/groups/"+jsonNumber(groupID)+"/channels",
+				`{"channel_id":"`+jsonNumber(channelID)+`","version":1}`)
+			responses <- concurrentResponse{code: response.Code, body: response.Body.String()}
+		}(channelID)
+	}
+	first, second := <-responses, <-responses
+	if !((first.code == http.StatusCreated && second.code == http.StatusConflict) ||
+		(first.code == http.StatusConflict && second.code == http.StatusCreated)) {
+		t.Fatalf("concurrent statuses = %d (%s), %d (%s), want one 201 and one 409",
+			first.code, first.body, second.code, second.body)
+	}
+	group, err := store.Groups.GetByID(groupID)
+	if err != nil {
+		t.Fatalf("load concurrent group: %v", err)
+	}
+	if group.Version != 2 {
+		t.Fatalf("concurrent group version = %d, want 2", group.Version)
+	}
+	assignments, err := store.Groups.GetChannelAssignments(groupID)
+	if err != nil {
+		t.Fatalf("load concurrent assignments: %v", err)
+	}
+	if len(assignments) != 1 {
+		t.Fatalf("concurrent assignments = %#v, want one row", assignments)
+	}
+}
+
 func TestInjectedForumTopicCatalogIsUsedForSelection(t *testing.T) {
 	server, store := newBackendTestServer(t)
+	server.SetTopicLifecycle(&fakeTopicLifecycle{store: store})
 	catalogChannelID, err := store.Channels.Insert(&model.Channel{Username: "injected_catalog", Title: "Injected Channel", Enabled: true})
 	if err != nil {
 		t.Fatalf("insert channel: %v", err)
@@ -750,7 +945,7 @@ func TestInjectedForumTopicCatalogIsUsedForSelection(t *testing.T) {
 	}
 	assignmentResponse := doJSON(t, server.Handler(), http.MethodPost,
 		"/api/groups/"+jsonNumber(groupID)+"/channels",
-		`{"channel_id":"`+jsonNumber(catalogChannelID)+`","topic_thread_id":1201}`)
+		`{"channel_id":"`+jsonNumber(catalogChannelID)+`","topic_thread_id":1201,"version":1}`)
 	if assignmentResponse.Code != http.StatusCreated {
 		t.Fatalf("injected topic assignment = %d %s", assignmentResponse.Code, assignmentResponse.Body.String())
 	}
@@ -785,7 +980,7 @@ func TestWebAppGroupCreationPersistsNonForumEligibility(t *testing.T) {
 	groupID := int64(group["id"].(float64))
 	assignment := doJSON(t, server.Handler(), http.MethodPost,
 		"/api/groups/"+jsonNumber(groupID)+"/channels",
-		`{"channel_id":"`+jsonNumber(channelID)+`","topic_thread_id":1202}`)
+		`{"channel_id":"`+jsonNumber(channelID)+`","topic_thread_id":1202,"version":1}`)
 	if assignment.Code != http.StatusBadRequest {
 		t.Fatalf("non-forum topic assignment status = %d, body=%s", assignment.Code, assignment.Body.String())
 	}
@@ -847,7 +1042,7 @@ func TestNonForumResponsesOmitTopicFieldsAndRejectTopicPayloads(t *testing.T) {
 
 	assignmentResponse := doJSON(t, server.Handler(), http.MethodPost,
 		"/api/groups/"+jsonNumber(groupID)+"/channels",
-		`{"channel_id":"`+jsonNumber(unassignedChannelID)+`","topic_thread_id":"903"}`)
+		`{"channel_id":"`+jsonNumber(unassignedChannelID)+`","topic_thread_id":"903","version":1}`)
 	if assignmentResponse.Code != http.StatusBadRequest {
 		t.Fatalf("non-forum topic assignment status = %d, body=%s", assignmentResponse.Code, assignmentResponse.Body.String())
 	}
@@ -873,7 +1068,7 @@ func TestZeroTopicIDIsRejectedWithoutAssignmentMutation(t *testing.T) {
 
 	response := doJSON(t, server.Handler(), http.MethodPost,
 		"/api/groups/"+jsonNumber(groupID)+"/channels",
-		`{"channel_id":"`+jsonNumber(channelID)+`","topic_thread_id":0}`)
+		`{"channel_id":"`+jsonNumber(channelID)+`","topic_thread_id":0,"version":1}`)
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("zero topic status = %d, body=%s", response.Code, response.Body.String())
 	}
@@ -935,6 +1130,20 @@ func (f *failureRecoverableTopicLifecycle) RemoveChannelTopic(_ context.Context,
 	return f.store.ForumTopics.MarkClosed(groupID, *assignments[0].TopicThreadID)
 }
 
+func (f *failureRecoverableTopicLifecycle) RemoveChannelTopicWithVersion(ctx context.Context, groupID, channelID, version int64) (int64, error) {
+	group, err := f.store.Groups.GetByID(groupID)
+	if err != nil {
+		return 0, err
+	}
+	if group.Version != version {
+		return 0, db.ErrConflict
+	}
+	if err := f.RemoveChannelTopic(ctx, groupID, channelID); err != nil {
+		return 0, err
+	}
+	return version + 1, nil
+}
+
 func (f *failureRecoverableTopicLifecycle) Reconcile() error {
 	pending, err := f.store.ForumTopics.ListPending()
 	if err != nil {
@@ -982,6 +1191,9 @@ func (f *fakeTopicLifecycle) CreateChannelTopic(_ context.Context, groupID, chan
 		return f.err
 	}
 	f.created = append(f.created, [2]int64{groupID, channelID})
+	if f.store == nil {
+		return nil
+	}
 	threadID := int64(700 + len(f.created))
 	return f.store.Groups.UpdateChannelTopic(groupID, channelID, threadID)
 }
@@ -997,6 +1209,15 @@ func (f *fakeTopicLifecycle) RemoveChannelTopic(_ context.Context, groupID, chan
 	}
 	f.removed = append(f.removed, [2]int64{groupID, channelID})
 	return f.store.Groups.UnassignChannel(groupID, channelID)
+}
+
+func (f *fakeTopicLifecycle) RemoveChannelTopicWithVersion(_ context.Context, groupID, channelID, version int64) (int64, error) {
+	if f.err != nil {
+		return 0, f.err
+	}
+	f.removed = append(f.removed, [2]int64{groupID, channelID})
+	next, err := f.store.Groups.UnassignChannelOptimistic(groupID, channelID, version)
+	return next, err
 }
 
 func TestSettingsAPIUsesOptimisticLocking(t *testing.T) {

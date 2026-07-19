@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
@@ -41,6 +42,12 @@ type TopicLifecycle interface {
 // aggregate-version check before any Telegram topic side effect.
 type VersionedTopicLifecycle interface {
 	RemoveChannelTopicWithVersion(context.Context, int64, int64, int64) (int64, error)
+}
+
+// TransactionalTopicAssignmentLifecycle commits a forum assignment together
+// with externally created-topic ownership and the group aggregate version.
+type TransactionalTopicAssignmentLifecycle interface {
+	AssignChannelTopicWithVersion(context.Context, int64, int64, *int64, int64) (int64, error)
 }
 
 // Topic describes a selectable forum topic. MessageThreadID is always
@@ -121,11 +128,12 @@ func (v telegramGroupVerifier) VerifyGroup(chatID int64) (string, bool, error) {
 }
 
 type GroupService struct {
-	repository dbGroupRepository
-	channels   dbChannelLookup
-	verifier   GroupVerifier
-	topics     TopicLifecycle
-	catalog    TopicCatalog
+	repository   dbGroupRepository
+	channels     dbChannelLookup
+	verifier     GroupVerifier
+	topics       TopicLifecycle
+	catalog      TopicCatalog
+	assignmentMu sync.Mutex
 }
 
 type dbGroupRepository interface {
@@ -442,6 +450,8 @@ func (s *Server) handleGroupChannels(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	s.groupService.assignmentMu.Lock()
+	defer s.groupService.assignmentMu.Unlock()
 	var input assignmentInput
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&input); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Некорректный JSON"})
@@ -493,6 +503,19 @@ func (s *Server) handleGroupChannels(w http.ResponseWriter, r *http.Request) {
 	if topic != nil && *topic <= 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "topic_thread_id должен быть положительным"})
 		return
+	}
+	if forum {
+		if lifecycle, ok := s.groupService.topics.(TransactionalTopicAssignmentLifecycle); ok {
+			nextVersion, err := lifecycle.AssignChannelTopicWithVersion(
+				r.Context(), groupID, channelID, topic, input.Version,
+			)
+			if err != nil {
+				writeGroupError(w, err)
+				return
+			}
+			writeJSON(w, http.StatusCreated, map[string]any{"status": "assigned", "version": nextVersion})
+			return
+		}
 	}
 	if topic != nil {
 		if s.groupService.topics == nil {

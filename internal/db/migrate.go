@@ -311,4 +311,18 @@ var migrations = []string{
 	`CREATE INDEX IF NOT EXISTS idx_group_channels_group ON group_channels(group_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_group_channels_channel ON group_channels(channel_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_forum_topics_group_open ON forum_topics(group_id, closed, message_thread_id)`,
+
+	// --------------------------------------------------
+	// 11. forum topic creation recovery
+	// --------------------------------------------------
+	`CREATE TABLE IF NOT EXISTS forum_topic_creation_recovery (
+		group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+		message_thread_id INTEGER NOT NULL CHECK (message_thread_id > 0),
+		chat_id INTEGER NOT NULL,
+		name TEXT NOT NULL,
+		created_at TEXT DEFAULT (datetime('now')),
+		PRIMARY KEY (group_id, message_thread_id)
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_forum_topic_creation_recovery_group
+		ON forum_topic_creation_recovery(group_id, message_thread_id)`,
 }

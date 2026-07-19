@@ -830,6 +830,196 @@ func (s *Service) CreateChannelTopic(ctx context.Context, groupID, channelID int
 	return nil
 }
 
+// AssignChannelTopicWithVersion serializes forum assignment creation across
+// Telegram and SQLite. A selected topic is committed with the current group
+// version. A newly created topic is only exposed after its registry row,
+// assignment, and aggregate version commit together.
+func (s *Service) AssignChannelTopicWithVersion(
+	ctx context.Context, groupID, channelID int64, selectedThreadID *int64, expectedVersion int64,
+) (int64, error) {
+	if expectedVersion <= 0 {
+		return 0, db.ErrConflict
+	}
+	if s == nil || s.api == nil {
+		return 0, errors.New("bot service is not configured")
+	}
+	if s.groups == nil {
+		return 0, errors.New("group repository is not configured")
+	}
+	s.topicMu.Lock()
+	defer s.topicMu.Unlock()
+
+	group, err := s.groups.GetByID(groupID)
+	if err != nil {
+		return 0, fmt.Errorf("load group for topic assignment: %w", err)
+	}
+	if group.Version != expectedVersion {
+		return 0, db.ErrConflict
+	}
+	if group.Status != "" && group.Status != model.GroupStatusActive {
+		return 0, errors.New("group is not eligible for forum topics")
+	}
+	if err := s.ensureTopicPermission(ctx, group.TelegramChatID); err != nil {
+		return 0, fmt.Errorf("check topic permission before assignment: %w", err)
+	}
+
+	assignments, err := s.groups.GetChannelAssignments(groupID)
+	if err != nil {
+		return 0, fmt.Errorf("load topic assignments: %w", err)
+	}
+	for _, assignment := range assignments {
+		if assignment.ChannelID == channelID {
+			return 0, db.ErrDuplicate
+		}
+	}
+
+	if selectedThreadID != nil {
+		topic, err := s.groups.GetForumTopic(groupID, *selectedThreadID)
+		if err != nil {
+			return 0, fmt.Errorf("load selected forum topic: %w", err)
+		}
+		if topic.Closed || topic.ClosePending || topic.MessageThreadID <= 0 {
+			return 0, db.ErrConflict
+		}
+		return s.groups.AssignChannelOptimistic(groupID, channelID, selectedThreadID, expectedVersion)
+	}
+	if s.channels == nil {
+		return 0, errors.New("channel repository is not configured")
+	}
+	channel, err := s.channels.GetByID(channelID)
+	if err != nil {
+		return 0, fmt.Errorf("load channel for topic assignment: %w", err)
+	}
+	name := strings.TrimSpace(channel.Title)
+	if name == "" {
+		name = "@" + channel.Username
+	}
+	name = truncateRunes(name, 128)
+	topic, err := s.api.CreateForumTopic(ctx, &telego.CreateForumTopicParams{
+		ChatID: groupTelegramChatID(group.TelegramChatID),
+		Name:   name,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("create topic for channel %d: %w", channelID, s.classifyTelegramError(err))
+	}
+	if topic == nil || topic.MessageThreadID <= 0 {
+		return 0, errors.New("create topic returned an invalid message thread id")
+	}
+	threadID := int64(topic.MessageThreadID)
+	nextVersion, err := s.groups.FinalizeCreatedTopicAssignment(
+		groupID, channelID, threadID, expectedVersion, name,
+	)
+	if err == nil {
+		return nextVersion, nil
+	}
+
+	cleanupErr := s.cleanupCreatedTopic(ctx, group, threadID, name)
+	if cleanupErr != nil {
+		return 0, fmt.Errorf("finalize topic assignment: %w; durable cleanup: %v", err, cleanupErr)
+	}
+	return 0, fmt.Errorf("finalize topic assignment: %w; external topic compensated", err)
+}
+
+func (s *Service) cleanupCreatedTopic(
+	ctx context.Context, group *model.Group, threadID int64, name string,
+) error {
+	if group == nil {
+		return errors.New("created topic group is missing")
+	}
+	if err := s.ensureTopicPermission(ctx, group.TelegramChatID); err != nil {
+		if recordErr := s.groups.RecordTopicCreationRecovery(
+			group.ID, threadID, group.TelegramChatID, name,
+		); recordErr != nil {
+			return fmt.Errorf("check cleanup permission: %w; record recovery: %v", err, recordErr)
+		}
+		return fmt.Errorf("check cleanup permission: %w", err)
+	}
+	err := s.api.DeleteForumTopic(ctx, &telego.DeleteForumTopicParams{
+		ChatID:          groupTelegramChatID(group.TelegramChatID),
+		MessageThreadID: int(threadID),
+	})
+	if err == nil {
+		return nil
+	}
+	classified := s.classifyTelegramError(err)
+	if recordErr := s.groups.RecordTopicCreationRecovery(
+		group.ID, threadID, group.TelegramChatID, name,
+	); recordErr != nil {
+		return fmt.Errorf("delete created topic: %w; record recovery: %v", classified, recordErr)
+	}
+	return fmt.Errorf("delete created topic: %w", classified)
+}
+
+// ReconcilePendingTopicCreations retries durable compensation left by a
+// failed assignment finalization. Existing assignments always win, so a late
+// cleanup retry can never delete a topic that a concurrent request committed.
+func (s *Service) ReconcilePendingTopicCreations(ctx context.Context) error {
+	if s == nil || s.api == nil || s.groups == nil {
+		return nil
+	}
+	s.topicMu.Lock()
+	defer s.topicMu.Unlock()
+	recoveries, err := s.groups.ListPendingTopicCreationRecoveries()
+	if err != nil {
+		return fmt.Errorf("list topic creation recoveries: %w", err)
+	}
+	var reconcileErr error
+	for _, recovery := range recoveries {
+		group, err := s.groups.GetByID(recovery.GroupID)
+		if err != nil {
+			reconcileErr = errors.Join(reconcileErr,
+				fmt.Errorf("load recovery group %d: %w", recovery.GroupID, err))
+			continue
+		}
+		assignments, err := s.groups.GetChannelAssignments(recovery.GroupID)
+		if err != nil {
+			reconcileErr = errors.Join(reconcileErr,
+				fmt.Errorf("load recovery assignments %d: %w", recovery.MessageThreadID, err))
+			continue
+		}
+		if hasTopicAssignment(assignments, recovery.MessageThreadID) {
+			// A concurrent finalization owns the topic now only when its
+			// registry row is present as well. Otherwise retain the recovery
+			// record and never delete a topic referenced by an assignment.
+			topic, topicErr := s.groups.GetForumTopic(recovery.GroupID, recovery.MessageThreadID)
+			if topicErr != nil || !topic.LifecycleOwned {
+				if topicErr != nil && !errors.Is(topicErr, db.ErrNotFound) {
+					reconcileErr = errors.Join(reconcileErr,
+						fmt.Errorf("inspect converged topic %d: %w", recovery.MessageThreadID, topicErr))
+				}
+				continue
+			}
+			if err := s.groups.DeleteTopicCreationRecovery(
+				recovery.GroupID, recovery.MessageThreadID,
+			); err != nil && !errors.Is(err, db.ErrNotFound) {
+				reconcileErr = errors.Join(reconcileErr,
+					fmt.Errorf("clear converged topic recovery %d: %w", recovery.MessageThreadID, err))
+			}
+			continue
+		}
+		if err := s.ensureTopicPermission(ctx, group.TelegramChatID); err != nil {
+			reconcileErr = errors.Join(reconcileErr,
+				fmt.Errorf("check recovery topic permission %d: %w", recovery.MessageThreadID, err))
+			continue
+		}
+		if err := s.api.DeleteForumTopic(ctx, &telego.DeleteForumTopicParams{
+			ChatID:          groupTelegramChatID(group.TelegramChatID),
+			MessageThreadID: int(recovery.MessageThreadID),
+		}); err != nil {
+			reconcileErr = errors.Join(reconcileErr,
+				fmt.Errorf("reconcile created topic %d: %w", recovery.MessageThreadID, s.classifyTelegramError(err)))
+			continue
+		}
+		if err := s.groups.DeleteTopicCreationRecovery(
+			recovery.GroupID, recovery.MessageThreadID,
+		); err != nil && !errors.Is(err, db.ErrNotFound) {
+			reconcileErr = errors.Join(reconcileErr,
+				fmt.Errorf("clear topic recovery %d: %w", recovery.MessageThreadID, err))
+		}
+	}
+	return reconcileErr
+}
+
 // RenameChannelTopic updates the Telegram topic name for an assignment.
 func (s *Service) RenameChannelTopic(ctx context.Context, groupID, channelID int64, name string) error {
 	if s == nil || s.api == nil {

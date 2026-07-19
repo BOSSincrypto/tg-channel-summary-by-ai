@@ -54,6 +54,16 @@ type ForumTopic struct {
 	UpdatedAt       string
 }
 
+// ForumTopicCreationRecovery records an externally created topic whose
+// durable assignment could not be finalized and must be cleaned up.
+type ForumTopicCreationRecovery struct {
+	GroupID         int64
+	MessageThreadID int64
+	ChatID          int64
+	Name            string
+	CreatedAt       string
+}
+
 const (
 	ForumTopicStatusObserved  = "observed"
 	ForumTopicStatusPersisted = "persisted"

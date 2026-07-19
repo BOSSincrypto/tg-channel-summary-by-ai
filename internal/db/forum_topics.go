@@ -269,3 +269,81 @@ func (r *ForumTopicRepository) DeleteOwned(groupID, threadID int64) error {
 	}
 	return nil
 }
+
+// RecordCreationRecovery durably records an externally created topic that
+// could not be committed with its assignment and registry state.
+func (r *ForumTopicRepository) RecordCreationRecovery(groupID, threadID, chatID int64, name string) error {
+	if r == nil || r.db == nil {
+		return errors.New("forum topic repository is not configured")
+	}
+	if groupID <= 0 || threadID <= 0 || chatID == 0 {
+		return errors.New("forum topic creation recovery identifiers are invalid")
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("forum topic creation recovery name is required")
+	}
+	_, err := r.db.Conn().Exec(`
+		INSERT INTO forum_topic_creation_recovery
+			(group_id, message_thread_id, chat_id, name)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(group_id, message_thread_id) DO UPDATE SET
+			chat_id = excluded.chat_id,
+			name = excluded.name`,
+		groupID, threadID, chatID, name,
+	)
+	if err != nil {
+		return fmt.Errorf("record forum topic creation recovery: %w", err)
+	}
+	return nil
+}
+
+// ListCreationRecoveries returns durable topic cleanup records.
+func (r *ForumTopicRepository) ListCreationRecoveries() ([]model.ForumTopicCreationRecovery, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("forum topic repository is not configured")
+	}
+	rows, err := r.db.Conn().Query(`
+		SELECT group_id, message_thread_id, chat_id, name, created_at
+		FROM forum_topic_creation_recovery
+		ORDER BY group_id, message_thread_id`)
+	if err != nil {
+		return nil, fmt.Errorf("list forum topic creation recoveries: %w", err)
+	}
+	defer rows.Close()
+	var recoveries []model.ForumTopicCreationRecovery
+	for rows.Next() {
+		var recovery model.ForumTopicCreationRecovery
+		if err := rows.Scan(&recovery.GroupID, &recovery.MessageThreadID, &recovery.ChatID,
+			&recovery.Name, &recovery.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan forum topic creation recovery: %w", err)
+		}
+		recoveries = append(recoveries, recovery)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate forum topic creation recoveries: %w", err)
+	}
+	return recoveries, nil
+}
+
+// DeleteCreationRecovery removes a converged topic cleanup record.
+func (r *ForumTopicRepository) DeleteCreationRecovery(groupID, threadID int64) error {
+	if r == nil || r.db == nil {
+		return errors.New("forum topic repository is not configured")
+	}
+	result, err := r.db.Conn().Exec(`
+		DELETE FROM forum_topic_creation_recovery
+		WHERE group_id = ? AND message_thread_id = ?`,
+		groupID, threadID)
+	if err != nil {
+		return fmt.Errorf("delete forum topic creation recovery: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("forum topic creation recovery rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}

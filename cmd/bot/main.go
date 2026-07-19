@@ -120,6 +120,9 @@ func main() {
 	if err := telegramBot.ReconcilePendingTopicClosures(context.Background()); err != nil {
 		log.Printf("pending forum topic reconciliation incomplete: %v", err)
 	}
+	if err := telegramBot.ReconcilePendingTopicCreations(context.Background()); err != nil {
+		log.Printf("pending forum topic creation cleanup incomplete: %v", err)
+	}
 	appLifecycle.Add(srv)
 	appLifecycle.Add(maintenanceSvc)
 	appLifecycle.Add(sched)

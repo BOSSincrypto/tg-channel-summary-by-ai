@@ -382,6 +382,75 @@ func (r *GroupRepository) AssignChannelOptimistic(groupID, channelID int64, topi
 	return expectedVersion + 1, nil
 }
 
+// FinalizeCreatedTopicAssignment commits a newly created Telegram topic,
+// its lifecycle-owned registry row, the channel assignment, and the group
+// aggregate version in one serialized SQLite transaction.
+func (r *GroupRepository) FinalizeCreatedTopicAssignment(
+	groupID, channelID, threadID, expectedVersion int64, name string,
+) (int64, error) {
+	if groupID <= 0 || channelID <= 0 || threadID <= 0 || expectedVersion <= 0 {
+		return 0, ErrConflict
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return 0, errors.New("created topic name is required")
+	}
+	r.assignmentMu.Lock()
+	defer r.assignmentMu.Unlock()
+
+	tx, err := r.db.Conn().Begin()
+	if err != nil {
+		return 0, fmt.Errorf("begin created topic assignment: %w", err)
+	}
+	defer tx.Rollback()
+
+	var currentVersion int64
+	if err := tx.QueryRow(`SELECT version FROM groups WHERE id = ?`, groupID).Scan(&currentVersion); errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrNotFound
+	} else if err != nil {
+		return 0, fmt.Errorf("load created topic group version: %w", err)
+	}
+	if currentVersion != expectedVersion {
+		return 0, ErrConflict
+	}
+
+	if _, err := tx.Exec(`
+		INSERT INTO forum_topics
+			(group_id, message_thread_id, name, status, lifecycle_owned, closed, close_pending)
+		VALUES (?, ?, ?, 'persisted', 1, 0, 0)`,
+		groupID, threadID, name); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+			return 0, ErrConflict
+		}
+		return 0, fmt.Errorf("persist created topic registry: %w", err)
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO group_channels (group_id, channel_id, topic_thread_id)
+		VALUES (?, ?, ?)`, groupID, channelID, threadID); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+			return 0, ErrDuplicate
+		}
+		return 0, fmt.Errorf("persist created topic assignment: %w", err)
+	}
+	result, err := tx.Exec(`
+		UPDATE groups SET version = version + 1
+		WHERE id = ? AND version = ?`, groupID, expectedVersion)
+	if err != nil {
+		return 0, fmt.Errorf("advance created topic group version: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("created topic group version rows affected: %w", err)
+	}
+	if affected == 0 {
+		return 0, ErrConflict
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit created topic assignment: %w", err)
+	}
+	return expectedVersion + 1, nil
+}
+
 // UpdateChannelTopic stores the Telegram message thread ID for an assignment.
 func (r *GroupRepository) UpdateChannelTopic(groupID, channelID int64, topicThreadID int64) error {
 	result, err := r.db.Conn().Exec(
@@ -578,6 +647,32 @@ func (r *GroupRepository) GetForumTopic(groupID, threadID int64) (*model.ForumTo
 		return nil, errors.New("forum topic repository is not configured")
 	}
 	return r.db.ForumTopics.Get(groupID, threadID)
+}
+
+// ListPendingTopicCreationRecoveries returns created topics whose durable
+// assignment lifecycle still needs external cleanup.
+func (r *GroupRepository) ListPendingTopicCreationRecoveries() ([]model.ForumTopicCreationRecovery, error) {
+	if r == nil || r.db == nil || r.db.ForumTopics == nil {
+		return nil, errors.New("forum topic repository is not configured")
+	}
+	return r.db.ForumTopics.ListCreationRecoveries()
+}
+
+// RecordTopicCreationRecovery stores a retryable cleanup intent for an
+// externally created topic that has no committed assignment.
+func (r *GroupRepository) RecordTopicCreationRecovery(groupID, threadID, chatID int64, name string) error {
+	if r == nil || r.db == nil || r.db.ForumTopics == nil {
+		return errors.New("forum topic repository is not configured")
+	}
+	return r.db.ForumTopics.RecordCreationRecovery(groupID, threadID, chatID, name)
+}
+
+// DeleteTopicCreationRecovery clears a converged topic cleanup intent.
+func (r *GroupRepository) DeleteTopicCreationRecovery(groupID, threadID int64) error {
+	if r == nil || r.db == nil || r.db.ForumTopics == nil {
+		return errors.New("forum topic repository is not configured")
+	}
+	return r.db.ForumTopics.DeleteCreationRecovery(groupID, threadID)
 }
 
 // GetChannelsForGroup returns full channel objects assigned to a group.

@@ -212,3 +212,99 @@ func TestAssignChannelRejectsPendingOrClosedTopic(t *testing.T) {
 		})
 	}
 }
+
+func TestForumTopicTombstoneUsesChatIdentityAfterGroupRecreation(t *testing.T) {
+	store, cleanup := newTestDB(t)
+	defer cleanup()
+	const chatID = int64(-100208)
+	oldGroupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: chatID,
+		Status:         model.GroupStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("insert old group: %v", err)
+	}
+	threadID := int64(908)
+	if err := store.ForumTopics.PersistClosedTombstone(oldGroupID, threadID, "Retired"); err != nil {
+		t.Fatalf("persist tombstone: %v", err)
+	}
+	if err := store.Groups.Delete(oldGroupID); err != nil {
+		t.Fatalf("delete old group: %v", err)
+	}
+	newGroupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: chatID,
+		Status:         model.GroupStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("insert recreated group: %v", err)
+	}
+	if err := store.ForumTopics.Observe(newGroupID, threadID, "Late observation"); err != nil {
+		t.Fatalf("observe tombstoned topic: %v", err)
+	}
+	topic, err := store.ForumTopics.Get(newGroupID, threadID)
+	if err != nil {
+		t.Fatalf("get tombstoned topic: %v", err)
+	}
+	if !topic.Closed || !topic.LifecycleOwned || topic.Name != "Retired" {
+		t.Fatalf("tombstoned topic after recreation = %#v", topic)
+	}
+	open, err := store.ForumTopics.ListOpen(newGroupID)
+	if err != nil {
+		t.Fatalf("list recreated group topics: %v", err)
+	}
+	if len(open) != 0 {
+		t.Fatalf("recreated group open topics = %#v, want none", open)
+	}
+	channelID, err := store.Channels.Insert(&model.Channel{Username: "tombstoned"})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	if err := store.Groups.AssignChannel(newGroupID, channelID, &threadID); !errors.Is(err, ErrConflict) {
+		t.Fatalf("assign tombstoned topic = %v, want ErrConflict", err)
+	}
+	if err := store.ForumTopics.MarkReopened(newGroupID, threadID); !errors.Is(err, ErrConflict) {
+		t.Fatalf("reopen tombstoned topic = %v, want ErrConflict", err)
+	}
+}
+
+func TestForumTopicCreationJournalFailureLeavesUnknownOutcome(t *testing.T) {
+	store, cleanup := newTestDB(t)
+	defer cleanup()
+	groupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: -100209,
+		Status:         model.GroupStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	channelID, err := store.Channels.Insert(&model.Channel{Username: "unknown_journal"})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	intentID, err := store.ForumTopics.BeginCreationIntent(
+		groupID, channelID, -100209, 1, "Unknown journal",
+	)
+	if err != nil {
+		t.Fatalf("begin creation intent: %v", err)
+	}
+	if _, err := store.Conn().Exec(`
+		CREATE TRIGGER reject_topic_journal
+		BEFORE UPDATE OF message_thread_id ON forum_topic_creation_intents
+		WHEN NEW.state = 'pending_cleanup'
+		BEGIN
+			SELECT RAISE(ABORT, 'injected journal failure');
+		END`); err != nil {
+		t.Fatalf("create journal failure trigger: %v", err)
+	}
+	if err := store.ForumTopics.JournalCreationIntent(intentID, 991); err == nil {
+		t.Fatal("journal unexpectedly succeeded")
+	}
+	recoveries, err := store.ForumTopics.ListCreationRecoveries()
+	if err != nil {
+		t.Fatalf("list creation recoveries: %v", err)
+	}
+	if len(recoveries) != 1 || recoveries[0].State != "unknown_outcome" ||
+		recoveries[0].MessageThreadID != 0 {
+		t.Fatalf("unknown recoveries = %#v", recoveries)
+	}
+}

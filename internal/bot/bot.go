@@ -67,6 +67,18 @@ type forumTopicCloseCoordinator interface {
 	ListPending() ([]model.ForumTopic, error)
 }
 
+type forumTopicCreationRecoveryRecorder interface {
+	RecordTopicCreationRecoveryForIntent(int64, int64, int64, int64, string) error
+}
+
+type forumTopicUnknownOutcomeMarker interface {
+	MarkUnknownTopicCreationOutcome(int64) error
+}
+
+type forumTopicUnknownOutcomeResolver interface {
+	ResolveUnknownTopicCreationObservation(int64, int64, string) (bool, bool, error)
+}
+
 // GroupLifecycle receives scheduler lifecycle events without coupling the bot
 // package to the scheduler package.
 type GroupLifecycle interface {
@@ -409,11 +421,25 @@ func (s *Service) observeForumTopicMessage(message *telego.Message) error {
 			if name == "" {
 				return nil
 			}
+			if resolver, ok := interface{}(s.groups).(forumTopicUnknownOutcomeResolver); ok {
+				if _, _, err := resolver.ResolveUnknownTopicCreationObservation(
+					message.Chat.ID, threadID, name,
+				); err != nil {
+					return fmt.Errorf("resolve unknown forum topic creation: %w", err)
+				}
+			}
 			return s.topicRegistry.Observe(group.ID, threadID, name)
 		case message.ForumTopicEdited != nil:
 			name := strings.TrimSpace(message.ForumTopicEdited.Name)
 			if name == "" {
 				return nil
+			}
+			if resolver, ok := interface{}(s.groups).(forumTopicUnknownOutcomeResolver); ok {
+				if _, _, err := resolver.ResolveUnknownTopicCreationObservation(
+					message.Chat.ID, threadID, name,
+				); err != nil {
+					return fmt.Errorf("resolve unknown edited forum topic creation: %w", err)
+				}
 			}
 			if err := s.topicRegistry.MarkEdited(group.ID, threadID, name); err != nil {
 				if !errors.Is(err, db.ErrNotFound) {
@@ -431,7 +457,7 @@ func (s *Service) observeForumTopicMessage(message *telego.Message) error {
 			}
 		case message.ForumTopicReopened != nil:
 			if err := s.topicRegistry.MarkReopened(group.ID, threadID); err != nil &&
-				!errors.Is(err, db.ErrNotFound) {
+				!errors.Is(err, db.ErrNotFound) && !errors.Is(err, db.ErrConflict) {
 				return err
 			}
 		}
@@ -931,13 +957,39 @@ func (s *Service) AssignChannelTopicWithVersion(
 			Name:   name,
 		})
 		if err != nil {
+			if marker, ok := interface{}(s.groups).(forumTopicUnknownOutcomeMarker); ok {
+				if markErr := marker.MarkUnknownTopicCreationOutcome(intentID); markErr != nil {
+					return fmt.Errorf("create topic for channel %d: %w; mark unknown outcome: %v",
+						channelID, s.classifyTelegramError(err), markErr)
+				}
+			}
 			return fmt.Errorf("create topic for channel %d: %w", channelID, s.classifyTelegramError(err))
 		}
 		if topic == nil || topic.MessageThreadID <= 0 {
+			if marker, ok := interface{}(s.groups).(forumTopicUnknownOutcomeMarker); ok {
+				if markErr := marker.MarkUnknownTopicCreationOutcome(intentID); markErr != nil {
+					return fmt.Errorf("create topic for channel %d returned unknown outcome: mark unknown outcome: %v",
+						channelID, markErr)
+				}
+			}
 			return errors.New("create topic returned an invalid message thread id")
 		}
 		threadID := int64(topic.MessageThreadID)
 		if err := s.groups.JournalTopicCreationIntent(intentID, threadID); err != nil {
+			if recorder, ok := interface{}(s.groups).(forumTopicCreationRecoveryRecorder); ok {
+				if recoveryErr := recorder.RecordTopicCreationRecoveryForIntent(
+					intentID, groupID, threadID, group.TelegramChatID, name,
+				); recoveryErr == nil {
+					return fmt.Errorf("journal created topic %d: %w; durable cleanup pending",
+						threadID, err)
+				}
+			}
+			if marker, ok := interface{}(s.groups).(forumTopicUnknownOutcomeMarker); ok {
+				if markErr := marker.MarkUnknownTopicCreationOutcome(intentID); markErr != nil {
+					return fmt.Errorf("journal created topic %d: %w; mark unknown outcome: %v",
+						threadID, err, markErr)
+				}
+			}
 			return fmt.Errorf("journal created topic %d: %w", threadID, err)
 		}
 		nextVersion, err := s.groups.FinalizeCreatedTopicAssignmentWithIntent(

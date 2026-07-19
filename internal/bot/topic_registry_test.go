@@ -898,3 +898,267 @@ func TestAlreadyDeletedTopicRecoveryLeavesClosedTombstoneAndIgnoresLateObservati
 		t.Fatalf("late observation reopened tombstone: %#v", openTopics)
 	}
 }
+
+func TestUnknownTopicCreateOutcomeStaysVisibleWithoutBlindRetryAndBindsUniqueObservation(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+	groupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: -100323,
+		Status:         model.GroupStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	channelID, err := store.Channels.Insert(&model.Channel{
+		Username: "unknown_create", Title: "Unknown create",
+	})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	api := &fakeTelegramClient{
+		forumTopic: &telego.ForumTopic{},
+	}
+	service := newServiceForTest(api, nil)
+	service.groups = store.Groups
+	service.channels = store.Channels
+	service.SetForumTopicRegistry(store.ForumTopics)
+
+	if _, err := service.AssignChannelTopicWithVersion(
+		context.Background(), groupID, channelID, nil, 1,
+	); err == nil {
+		t.Fatal("unknown create outcome unexpectedly succeeded")
+	}
+	recoveries, err := store.Groups.ListPendingTopicCreationRecoveries()
+	if err != nil {
+		t.Fatalf("list unknown create outcome: %v", err)
+	}
+	if len(recoveries) != 1 || recoveries[0].MessageThreadID != 0 ||
+		recoveries[0].State != "unknown_outcome" {
+		t.Fatalf("unknown create recoveries = %#v", recoveries)
+	}
+	if len(api.deletedTopics) != 0 {
+		t.Fatalf("unknown create cleanup calls = %#v, want none", api.deletedTopics)
+	}
+	if _, err := service.AssignChannelTopicWithVersion(
+		context.Background(), groupID, channelID, nil, 1,
+	); !errors.Is(err, db.ErrConflict) {
+		t.Fatalf("blind retry result = %v, want conflict", err)
+	}
+	if len(api.topics) != 1 {
+		t.Fatalf("blind retry create calls = %d, want one", len(api.topics))
+	}
+
+	update := telego.Update{Message: &telego.Message{
+		MessageID: 2001, MessageThreadID: 2001,
+		Chat:              telego.Chat{ID: -100323, Type: telego.ChatTypeSupergroup},
+		ForumTopicCreated: &telego.ForumTopicCreated{Name: "Unknown create"},
+	}}
+	if err := service.HandleUpdate(context.Background(), &update); err != nil {
+		t.Fatalf("bind unique observation: %v", err)
+	}
+	recoveries, err = store.Groups.ListPendingTopicCreationRecoveries()
+	if err != nil {
+		t.Fatalf("list bound create outcome: %v", err)
+	}
+	if len(recoveries) != 1 || recoveries[0].MessageThreadID != 2001 ||
+		recoveries[0].State != "pending_cleanup" {
+		t.Fatalf("bound create recoveries = %#v", recoveries)
+	}
+	if err := service.ReconcilePendingTopicCreations(context.Background()); err != nil {
+		t.Fatalf("reconcile bound create outcome: %v", err)
+	}
+	if len(api.deletedTopics) != 1 || api.deletedTopics[0].MessageThreadID != 2001 {
+		t.Fatalf("bound cleanup calls = %#v", api.deletedTopics)
+	}
+}
+
+func TestJournalFailureWithPositiveThreadCreatesRetryableCleanupRecovery(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+	groupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: -100326,
+		Status:         model.GroupStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	channelID, err := store.Channels.Insert(&model.Channel{
+		Username: "journal_failure", Title: "Journal failure",
+	})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	api := &fakeTelegramClient{
+		forumTopic: &telego.ForumTopic{MessageThreadID: 2020, Name: "Journal failure"},
+	}
+	service := newServiceForTest(api, nil)
+	service.groups = store.Groups
+	service.channels = store.Channels
+	service.SetForumTopicRegistry(store.ForumTopics)
+	if _, err := store.Conn().Exec(`
+		CREATE TRIGGER reject_topic_journal
+		BEFORE UPDATE OF message_thread_id ON forum_topic_creation_intents
+		WHEN NEW.state = 'pending_cleanup'
+		BEGIN
+			SELECT RAISE(ABORT, 'injected journal failure');
+		END`); err != nil {
+		t.Fatalf("create journal failure trigger: %v", err)
+	}
+	if _, err := service.AssignChannelTopicWithVersion(
+		context.Background(), groupID, channelID, nil, 1,
+	); err == nil {
+		t.Fatal("assignment unexpectedly succeeded despite journal failure")
+	}
+	recoveries, err := store.Groups.ListPendingTopicCreationRecoveries()
+	if err != nil {
+		t.Fatalf("list journal recovery: %v", err)
+	}
+	if len(recoveries) != 1 || recoveries[0].MessageThreadID != 2020 {
+		t.Fatalf("journal recoveries = %#v, want positive thread 2020", recoveries)
+	}
+	if len(api.deletedTopics) != 0 {
+		t.Fatalf("journal cleanup before reconciliation = %#v, want none", api.deletedTopics)
+	}
+	if err := service.ReconcilePendingTopicCreations(context.Background()); err != nil {
+		t.Fatalf("reconcile journal recovery: %v", err)
+	}
+	if len(api.deletedTopics) != 1 || api.deletedTopics[0].MessageThreadID != 2020 {
+		t.Fatalf("journal cleanup calls = %#v, want one positive delete", api.deletedTopics)
+	}
+}
+
+func TestUnknownTopicCreateOutcomeObservationRemainsAmbiguous(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+	groupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: -100324,
+		Status:         model.GroupStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	for _, username := range []string{"ambiguous_one", "ambiguous_two"} {
+		channelID, insertErr := store.Channels.Insert(&model.Channel{
+			Username: username, Title: "Ambiguous",
+		})
+		if insertErr != nil {
+			t.Fatalf("insert channel %s: %v", username, insertErr)
+		}
+		intentID, beginErr := store.ForumTopics.BeginCreationIntent(
+			groupID, channelID, -100324, 1, "Ambiguous",
+		)
+		if beginErr != nil {
+			t.Fatalf("begin intent %s: %v", username, beginErr)
+		}
+		if markErr := store.ForumTopics.MarkUnknownOutcome(intentID); markErr != nil {
+			t.Fatalf("mark intent %s unknown: %v", username, markErr)
+		}
+	}
+	bound, ambiguous, err := store.ForumTopics.ResolveUnknownCreationObservation(
+		-100324, 2002, "Ambiguous",
+	)
+	if err != nil {
+		t.Fatalf("resolve ambiguous observation: %v", err)
+	}
+	if bound || !ambiguous {
+		t.Fatalf("ambiguous resolution = bound:%v ambiguous:%v", bound, ambiguous)
+	}
+	recoveries, err := store.ForumTopics.ListCreationRecoveries()
+	if err != nil {
+		t.Fatalf("list ambiguous outcomes: %v", err)
+	}
+	if len(recoveries) != 2 {
+		t.Fatalf("ambiguous outcomes = %#v", recoveries)
+	}
+}
+
+func TestProductionWebAppRejectsTombstonedTopicAfterGroupRecreation(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+	const chatID = int64(-100325)
+	oldGroupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: chatID,
+		Status:         model.GroupStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("insert old group: %v", err)
+	}
+	const tombstonedThreadID = int64(2010)
+	if err := store.ForumTopics.PersistClosedTombstone(
+		oldGroupID, tombstonedThreadID, "Retired",
+	); err != nil {
+		t.Fatalf("persist tombstone: %v", err)
+	}
+	if err := store.Groups.Delete(oldGroupID); err != nil {
+		t.Fatalf("delete old group: %v", err)
+	}
+	groupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: chatID,
+		Status:         model.GroupStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("insert recreated group: %v", err)
+	}
+	channelID, err := store.Channels.Insert(&model.Channel{Username: "recreated_topic"})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	api := &fakeTelegramClient{}
+	service := newServiceForTest(api, nil)
+	service.groups = store.Groups
+	service.channels = store.Channels
+	service.SetForumTopicRegistry(store.ForumTopics)
+	lateObservation := telego.Update{Message: &telego.Message{
+		MessageID: int(tombstonedThreadID), MessageThreadID: int(tombstonedThreadID),
+		Chat:             telego.Chat{ID: chatID, Type: telego.ChatTypeSupergroup},
+		ForumTopicEdited: &telego.ForumTopicEdited{Name: "Late rename"},
+	}}
+	if err := service.HandleUpdate(context.Background(), &lateObservation); err != nil {
+		t.Fatalf("late tombstone observation: %v", err)
+	}
+	if err := store.ForumTopics.Observe(groupID, 2011, "Selectable"); err != nil {
+		t.Fatalf("observe control topic: %v", err)
+	}
+	server := webapp.NewWithProvidersForTesting(store, 0, http.DefaultClient)
+	server.SetTopicLifecycle(service)
+	topicsRequest := httptest.NewRequest(
+		http.MethodGet,
+		"/api/groups/"+strconv.FormatInt(groupID, 10)+"/topics",
+		nil,
+	)
+	topicsResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(topicsResponse, topicsRequest)
+	if topicsResponse.Code != http.StatusOK ||
+		strings.Contains(topicsResponse.Body.String(), `"message_thread_id":2010`) ||
+		!strings.Contains(topicsResponse.Body.String(), `"message_thread_id":2011`) {
+		t.Fatalf("recreated topic catalog status=%d body=%s", topicsResponse.Code, topicsResponse.Body.String())
+	}
+	assignment := httptest.NewRequest(
+		http.MethodPost,
+		"/api/groups/"+strconv.FormatInt(groupID, 10)+"/channels",
+		strings.NewReader(`{"channel_id":"`+strconv.FormatInt(channelID, 10)+
+			`","topic_thread_id":2010,"version":1}`),
+	)
+	assignment.Header.Set("Content-Type", "application/json")
+	assignmentResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(assignmentResponse, assignment)
+	if assignmentResponse.Code != http.StatusConflict {
+		t.Fatalf("tombstoned assignment status=%d body=%s", assignmentResponse.Code, assignmentResponse.Body.String())
+	}
+	if len(api.topics) != 0 || len(api.closedTopics) != 0 || len(api.deletedTopics) != 0 {
+		t.Fatalf("tombstoned assignment lifecycle calls = created:%d closed:%d deleted:%d",
+			len(api.topics), len(api.closedTopics), len(api.deletedTopics))
+	}
+}

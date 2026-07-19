@@ -268,9 +268,12 @@ func (r *GroupRepository) AssignChannel(groupID, channelID int64, topicThreadID 
 				AND (closed = 1 OR close_pending = 1)
 			UNION ALL
 			SELECT 1 FROM forum_topic_tombstones
-			WHERE group_id = ? AND message_thread_id = ?
+			WHERE message_thread_id = ?
+				AND (group_id = ? OR chat_id = (
+					SELECT telegram_chat_id FROM groups WHERE id = ?
+				))
 		 )`,
-		groupID, channelID, threadID, threadID, groupID, threadID, groupID, threadID,
+		groupID, channelID, threadID, threadID, groupID, threadID, groupID, threadID, groupID,
 	)
 	if err != nil {
 		return fmt.Errorf("assign channel: %w", err)
@@ -357,9 +360,12 @@ func (r *GroupRepository) AssignChannelOptimistic(groupID, channelID int64, topi
 				AND (closed = 1 OR close_pending = 1)
 			UNION ALL
 			SELECT 1 FROM forum_topic_tombstones
-			WHERE group_id = ? AND message_thread_id = ?
+			WHERE message_thread_id = ?
+				AND (group_id = ? OR chat_id = (
+					SELECT telegram_chat_id FROM groups WHERE id = ?
+				))
 		 )`,
-		groupID, channelID, threadID, threadID, groupID, threadID, groupID, threadID,
+		groupID, channelID, threadID, threadID, groupID, threadID, groupID, threadID, groupID,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("optimistic channel assignment: %w", err)
@@ -431,8 +437,11 @@ func (r *GroupRepository) FinalizeCreatedTopicAssignmentWithIntent(
 	if err := tx.QueryRow(`
 		SELECT EXISTS(
 			SELECT 1 FROM forum_topic_tombstones
-			WHERE group_id = ? AND message_thread_id = ?
-		)`, groupID, threadID).Scan(&tombstone); err != nil {
+			WHERE message_thread_id = ?
+				AND (group_id = ? OR chat_id = (
+					SELECT telegram_chat_id FROM groups WHERE id = ?
+				))
+		)`, threadID, groupID, groupID).Scan(&tombstone); err != nil {
 		return 0, fmt.Errorf("inspect created topic tombstone: %w", err)
 	}
 	if tombstone == 1 {
@@ -701,6 +710,19 @@ func (r *GroupRepository) RecordTopicCreationRecovery(groupID, threadID, chatID 
 	return r.db.ForumTopics.RecordCreationRecovery(groupID, threadID, chatID, name)
 }
 
+// RecordTopicCreationRecoveryForIntent records known-positive cleanup while
+// removing the exact pre-create intent, even if journaling failed.
+func (r *GroupRepository) RecordTopicCreationRecoveryForIntent(
+	intentID, groupID, threadID, chatID int64, name string,
+) error {
+	if r == nil || r.db == nil || r.db.ForumTopics == nil {
+		return errors.New("forum topic repository is not configured")
+	}
+	return r.db.ForumTopics.RecordCreationRecoveryForIntent(
+		intentID, groupID, threadID, chatID, name,
+	)
+}
+
 // DeleteTopicCreationRecovery clears a converged topic cleanup intent.
 func (r *GroupRepository) DeleteTopicCreationRecovery(groupID, threadID int64) error {
 	if r == nil || r.db == nil || r.db.ForumTopics == nil {
@@ -732,6 +754,26 @@ func (r *GroupRepository) CompleteTopicCreationIntent(intentID int64) error {
 		return errors.New("forum topic repository is not configured")
 	}
 	return r.db.ForumTopics.CompleteCreationIntent(intentID)
+}
+
+// MarkUnknownTopicCreationOutcome retains an unresolved create intent without
+// exposing a zero thread ID to Telegram mutation code.
+func (r *GroupRepository) MarkUnknownTopicCreationOutcome(intentID int64) error {
+	if r == nil || r.db == nil || r.db.ForumTopics == nil {
+		return errors.New("forum topic repository is not configured")
+	}
+	return r.db.ForumTopics.MarkUnknownOutcome(intentID)
+}
+
+// ResolveUnknownTopicCreationObservation binds only a unique matching
+// observation to an unresolved create intent.
+func (r *GroupRepository) ResolveUnknownTopicCreationObservation(
+	chatID, threadID int64, name string,
+) (bool, bool, error) {
+	if r == nil || r.db == nil || r.db.ForumTopics == nil {
+		return false, false, errors.New("forum topic repository is not configured")
+	}
+	return r.db.ForumTopics.ResolveUnknownCreationObservation(chatID, threadID, name)
 }
 
 // PersistClosedTopicTombstone keeps successful compensation visible only as

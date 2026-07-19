@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/bot"
+	"github.com/boss/tg-channel-summary-by-ai/internal/config"
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
 	"github.com/boss/tg-channel-summary-by-ai/internal/digest"
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
@@ -25,6 +26,58 @@ import (
 	"github.com/boss/tg-channel-summary-by-ai/internal/summarizer"
 	"github.com/boss/tg-channel-summary-by-ai/internal/webapp"
 )
+
+func TestValidatorHTTPOnlyEnabledRequiresExactOptIn(t *testing.T) {
+	t.Setenv("VALIDATOR_HTTP_ONLY", "1")
+	if !validatorHTTPOnlyEnabled() {
+		t.Fatal("validator mode should be enabled for VALIDATOR_HTTP_ONLY=1")
+	}
+	t.Setenv("VALIDATOR_HTTP_ONLY", "true")
+	if validatorHTTPOnlyEnabled() {
+		t.Fatal("validator mode should require the exact opt-in value")
+	}
+	t.Setenv("VALIDATOR_HTTP_ONLY", "")
+	if validatorHTTPOnlyEnabled() {
+		t.Fatal("validator mode should remain disabled when unset")
+	}
+}
+
+func TestValidatorHTTPServerServesHealthAndEmbeddedWebAppWithoutBot(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+
+	server, err := newValidatorHTTPServer(&config.Config{
+		BotToken:        "validator:fake",
+		OwnerTelegramID: "715602446",
+		WebAppURL:       "https://validator.example/webapp/",
+	}, store)
+	if err != nil {
+		t.Fatalf("create validator server: %v", err)
+	}
+	testServer := httptest.NewServer(server.Handler())
+	defer testServer.Close()
+
+	healthResponse, err := testServer.Client().Get(testServer.URL + "/health")
+	if err != nil {
+		t.Fatalf("GET /health: %v", err)
+	}
+	defer healthResponse.Body.Close()
+	if healthResponse.StatusCode != http.StatusOK {
+		t.Fatalf("GET /health status = %d, want 200", healthResponse.StatusCode)
+	}
+
+	webAppResponse, err := testServer.Client().Get(testServer.URL + "/webapp/")
+	if err != nil {
+		t.Fatalf("GET /webapp/: %v", err)
+	}
+	defer webAppResponse.Body.Close()
+	if webAppResponse.StatusCode != http.StatusOK {
+		t.Fatalf("GET /webapp/ status = %d, want 200", webAppResponse.StatusCode)
+	}
+}
 
 func TestEnsureDefaultAIProviderSeedsOpenRouter(t *testing.T) {
 	store, err := db.Open(":memory:")

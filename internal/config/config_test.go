@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -461,5 +462,62 @@ func TestParse_CRLFLineEndings(t *testing.T) {
 	}
 	if cfg.BotToken != "test" {
 		t.Errorf("BotToken = %q, want %q", cfg.BotToken, "test")
+	}
+}
+
+func TestLoadValidator_RequiresExplicitFakeCredentialsAndTempDatabase(t *testing.T) {
+	chdirToTempDir(t)
+	t.Setenv("VALIDATOR_HTTP_ONLY", "1")
+	t.Setenv("BOT_TOKEN", "validator:fake")
+	t.Setenv("OWNER_TELEGRAM_ID", "715602446")
+	t.Setenv("OPENROUTER_API_KEY", "validator-openrouter-key")
+	t.Setenv("PROVIDER_ENCRYPTION_KEY", "")
+	t.Setenv("CUSTOM_PROVIDERS", "")
+	dbPath := filepath.Join(os.TempDir(), "tg-channel-summary-validator-test.sqlite")
+	t.Setenv("DB_PATH", dbPath)
+	t.Setenv("PORT", "9999")
+
+	if err := os.WriteFile(".env", []byte("BOT_TOKEN=production-token\nOPENROUTER_API_KEY=production-key\n"), 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+
+	cfg, err := LoadValidator()
+	if err != nil {
+		t.Fatalf("load validator config: %v", err)
+	}
+	if cfg.BotToken != "validator:fake" || cfg.OpenRouterKey != "validator-openrouter-key" {
+		t.Fatalf("validator credentials came from an unsafe source: bot=%q openrouter=%q", cfg.BotToken, cfg.OpenRouterKey)
+	}
+	if cfg.Port != "8080" {
+		t.Fatalf("validator port = %q, want 8080", cfg.Port)
+	}
+	if cfg.DBPath != dbPath {
+		t.Fatalf("validator DB path = %q, want %q", cfg.DBPath, dbPath)
+	}
+	if cfg.WebAppURL != "http://localhost:8080/webapp/" {
+		t.Fatalf("validator WebApp URL = %q, want local HTTP origin", cfg.WebAppURL)
+	}
+	if cfg.ProviderKey != cfg.BotToken {
+		t.Fatalf("validator provider encryption key was not replaced with fake bot credential")
+	}
+}
+
+func TestLoadValidatorRejectsProductionCredentialShape(t *testing.T) {
+	chdirToTempDir(t)
+	t.Setenv("VALIDATOR_HTTP_ONLY", "1")
+	t.Setenv("BOT_TOKEN", "123456:production-token")
+	t.Setenv("OWNER_TELEGRAM_ID", "715602446")
+	t.Setenv("OPENROUTER_API_KEY", "sk-or-v1-production-key")
+	t.Setenv("DB_PATH", filepath.Join(os.TempDir(), "tg-channel-summary-validator-test.sqlite"))
+
+	if _, err := LoadValidator(); err == nil {
+		t.Fatal("expected validator mode to reject production-shaped credentials")
+	}
+}
+
+func TestLoadValidatorRequiresExplicitOptIn(t *testing.T) {
+	t.Setenv("VALIDATOR_HTTP_ONLY", "")
+	if _, err := LoadValidator(); err == nil {
+		t.Fatal("expected validator config to require VALIDATOR_HTTP_ONLY=1")
 	}
 }

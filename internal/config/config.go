@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -44,6 +45,51 @@ func Load() (*Config, error) {
 	}
 	defer f.Close()
 	return Parse(f)
+}
+
+// LoadValidator loads only environment-provided settings for the explicit
+// validator HTTP mode. It deliberately ignores .env so a local production
+// secret cannot accidentally be used by browser validation.
+func LoadValidator() (*Config, error) {
+	if os.Getenv("VALIDATOR_HTTP_ONLY") != "1" {
+		return nil, fmt.Errorf("VALIDATOR_HTTP_ONLY=1 is required for validator HTTP mode")
+	}
+
+	cfg, err := Parse(strings.NewReader(""))
+	if err != nil {
+		return nil, fmt.Errorf("load validator configuration: %w", err)
+	}
+	if !strings.HasPrefix(cfg.BotToken, "validator:") || len(cfg.BotToken) <= len("validator:") {
+		return nil, fmt.Errorf("validator HTTP mode requires a fake BOT_TOKEN with validator: prefix")
+	}
+	if !strings.HasPrefix(cfg.OpenRouterKey, "validator-") || len(cfg.OpenRouterKey) <= len("validator-") {
+		return nil, fmt.Errorf("validator HTTP mode requires a fake OPENROUTER_API_KEY with validator- prefix")
+	}
+	if cfg.CustomProviders != "" {
+		return nil, fmt.Errorf("validator HTTP mode does not allow custom providers")
+	}
+
+	rawDBPath, ok := os.LookupEnv("DB_PATH")
+	if !ok || strings.TrimSpace(rawDBPath) == "" {
+		return nil, fmt.Errorf("validator HTTP mode requires DB_PATH inside the system temporary directory")
+	}
+	dbPath, err := filepath.Abs(filepath.Clean(rawDBPath))
+	if err != nil {
+		return nil, fmt.Errorf("validator HTTP mode resolves DB_PATH: %w", err)
+	}
+	tempDir, err := filepath.Abs(filepath.Clean(os.TempDir()))
+	if err != nil {
+		return nil, fmt.Errorf("validator HTTP mode resolves temporary directory: %w", err)
+	}
+	relative, err := filepath.Rel(tempDir, dbPath)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return nil, fmt.Errorf("validator HTTP mode requires DB_PATH inside %s", tempDir)
+	}
+	cfg.DBPath = dbPath
+	cfg.Port = "8080"
+	cfg.ProviderKey = cfg.BotToken
+	cfg.WebAppURL = "http://localhost:8080/webapp/"
+	return cfg, nil
 }
 
 // Parse reads configuration from an io.Reader in KEY=VALUE format.

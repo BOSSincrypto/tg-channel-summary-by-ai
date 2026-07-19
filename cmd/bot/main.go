@@ -37,6 +37,13 @@ var productionSettingsMu sync.Mutex
 func main() {
 	log.Println("tg-channel-summary-by-ai starting...")
 
+	if validatorHTTPOnlyEnabled() {
+		if err := runValidatorHTTPOnly(); err != nil {
+			log.Fatalf("validator HTTP mode stopped: %v", err)
+		}
+		return
+	}
+
 	// Load configuration from .env or environment variables.
 	cfg, err := config.Load()
 	if err != nil {
@@ -185,6 +192,89 @@ func main() {
 	telegramBot.Stop()
 
 	log.Println("Shutdown complete")
+}
+
+func validatorHTTPOnlyEnabled() bool {
+	return os.Getenv("VALIDATOR_HTTP_ONLY") == "1"
+}
+
+// newValidatorHTTPServer wires only the database-backed HTTP/WebApp surface.
+// It intentionally does not construct Telegram, parser, scheduler, or
+// maintenance services, so browser validation cannot create external traffic.
+func newValidatorHTTPServer(cfg *config.Config, store *db.DB) (*webapp.Server, error) {
+	if cfg == nil || store == nil {
+		return nil, errors.New("validator HTTP mode requires configuration and database")
+	}
+	auth, err := webapp.NewWebAppAuthWithOrigin(cfg.BotToken, cfg.OwnerTelegramID, cfg.WebAppURL)
+	if err != nil {
+		return nil, fmt.Errorf("configure validator WebApp authentication: %w", err)
+	}
+	server := webapp.NewWithProvidersAuthenticated(
+		store,
+		10*time.Second,
+		&http.Client{Transport: validatorHTTPTransport{}},
+		auth,
+	)
+	server.SetChannelVerifier(validatorChannelVerifier{})
+	server.SetGroupVerifier(validatorGroupVerifier{})
+	return server, nil
+}
+
+type validatorHTTPTransport struct{}
+
+func (validatorHTTPTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("validator HTTP mode blocks external requests")
+}
+
+type validatorChannelVerifier struct{}
+
+func (validatorChannelVerifier) Verify(context.Context, string) (string, error) {
+	return "", errors.New("channel verification is disabled in validator HTTP mode")
+}
+
+type validatorGroupVerifier struct{}
+
+func (validatorGroupVerifier) Verify(int64) (string, error) {
+	return "", errors.New("group verification is disabled in validator HTTP mode")
+}
+
+func runValidatorHTTPOnly() error {
+	cfg, err := config.LoadValidator()
+	if err != nil {
+		return err
+	}
+	store, err := db.OpenWithEncryptionKey(cfg.DBPath, cfg.ProviderKey)
+	if err != nil {
+		return fmt.Errorf("open validator database at %s: %w", cfg.DBPath, err)
+	}
+	defer store.Close()
+	if err := ensureDefaultAIProvider(store, cfg.OpenRouterKey); err != nil {
+		return fmt.Errorf("configure validator AI provider: %w", err)
+	}
+
+	srv, err := newValidatorHTTPServer(cfg, store)
+	if err != nil {
+		return err
+	}
+	serverErr := make(chan error, 1)
+	go func() {
+		if err := srv.Start(cfg.Port); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(quit)
+	select {
+	case sig := <-quit:
+		log.Printf("Validator HTTP mode received signal %v, shutting down...", sig)
+	case err := <-serverErr:
+		srv.Stop()
+		return fmt.Errorf("validator HTTP server: %w", err)
+	}
+	srv.Stop()
+	return nil
 }
 
 // applyProductionSettings is the production update boundary for Telegram

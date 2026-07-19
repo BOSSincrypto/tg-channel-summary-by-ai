@@ -2,11 +2,13 @@ package webapp
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strconv"
 	"sync"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/digest"
+	"github.com/boss/tg-channel-summary-by-ai/internal/model"
 )
 
 // DigestRunner is the narrow production dependency needed by the manual
@@ -129,41 +131,76 @@ func (s *Server) handleDigestTest(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) runDigestJob(ctx context.Context, jobID string, groupID int64) {
-	s.digestJobs.update(jobID, func(job *digestJob) {
-		job.Status = "summarizing"
+	err := s.withGroupSchedulerLifecycle(func() error {
+		if activeErr := s.ensureGroupActive(groupID); activeErr != nil {
+			s.digestJobs.update(jobID, func(job *digestJob) {
+				job.Status = "error"
+				job.Outcome = digest.OutcomeAIFailed
+				job.Message = "Не удалось выполнить дайджест: группа больше недоступна."
+			})
+			return nil
+		}
+
+		s.digestJobs.update(jobID, func(job *digestJob) {
+			job.Status = "summarizing"
+		})
+		var (
+			result *digest.Digest
+			runErr error
+		)
+		if runner, ok := s.digestRunner.(typedDigestRunner); ok {
+			result, runErr = runner.GenerateManualResult(groupID)
+		} else {
+			result, runErr = s.digestRunner.GenerateManual(groupID)
+		}
+		if runErr != nil {
+			s.digestJobs.update(jobID, func(job *digestJob) {
+				if result != nil && isDigestOutcome(result.Outcome) {
+					applyDigestResult(job, result)
+					job.Status = digestJobStatus(result.Outcome)
+					return
+				}
+				job.Status = "error"
+				job.Outcome = digest.OutcomeAIFailed
+				job.Message = "Не удалось выполнить дайджест: " + safeDigestError(runErr)
+			})
+			return nil
+		}
+		if result == nil {
+			s.digestJobs.update(jobID, func(job *digestJob) {
+				job.Status = "error"
+				job.Outcome = digest.OutcomeAIFailed
+				job.Message = "Не удалось выполнить дайджест: пустой результат."
+			})
+			return nil
+		}
+		s.digestJobs.update(jobID, func(job *digestJob) {
+			applyDigestResult(job, result)
+		})
+		return nil
 	})
-	var (
-		result *digest.Digest
-		err    error
-	)
-	if runner, ok := s.digestRunner.(typedDigestRunner); ok {
-		result, err = runner.GenerateManualResult(groupID)
-	} else {
-		result, err = s.digestRunner.GenerateManual(groupID)
-	}
 	if err != nil {
 		s.digestJobs.update(jobID, func(job *digestJob) {
-			if result != nil && isDigestOutcome(result.Outcome) {
-				applyDigestResult(job, result)
-				job.Status = digestJobStatus(result.Outcome)
-				return
-			}
 			job.Status = "error"
 			job.Outcome = digest.OutcomeAIFailed
 			job.Message = "Не удалось выполнить дайджест: " + safeDigestError(err)
 		})
-		return
 	}
 	_ = ctx
-	s.digestJobs.update(jobID, func(job *digestJob) {
-		if result == nil {
-			job.Status = "error"
-			job.Outcome = digest.OutcomeAIFailed
-			job.Message = "Не удалось выполнить дайджест: пустой результат."
-			return
-		}
-		applyDigestResult(job, result)
-	})
+}
+
+func (s *Server) ensureGroupActive(groupID int64) error {
+	if s == nil || s.groupService == nil || s.groupService.repository == nil {
+		return nil
+	}
+	group, err := s.groupService.repository.GetByID(groupID)
+	if err != nil {
+		return err
+	}
+	if group.Status != "" && group.Status != model.GroupStatusActive {
+		return errors.New("group is not active")
+	}
+	return nil
 }
 
 func isDigestOutcome(outcome string) bool {

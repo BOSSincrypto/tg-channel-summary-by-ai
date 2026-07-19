@@ -91,14 +91,27 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
-		encoded, err := json.Marshal(settingsPayload{
-			DigestTime: input.DigestTime, Timezone: input.Timezone, DefaultModel: strings.TrimSpace(input.DefaultModel),
-		})
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Не удалось сохранить настройки"})
-			return
+		var (
+			version int64
+			err     error
+		)
+		if s.settingsApplier != nil {
+			version, err = s.settingsApplier(r.Context(), SettingsMutation{
+				DigestTime:   strings.TrimSpace(input.DigestTime),
+				Timezone:     strings.TrimSpace(input.Timezone),
+				DefaultModel: strings.TrimSpace(input.DefaultModel),
+				Version:      input.Version,
+			})
+		} else {
+			encoded, marshalErr := json.Marshal(settingsPayload{
+				DigestTime: input.DigestTime, Timezone: input.Timezone, DefaultModel: strings.TrimSpace(input.DefaultModel),
+			})
+			if marshalErr != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Не удалось сохранить настройки"})
+				return
+			}
+			version, err = s.settingsRepository().SetOptimistic(settingsConfigKey, string(encoded), input.Version)
 		}
-		version, err := s.settingsRepository().SetOptimistic(settingsConfigKey, string(encoded), input.Version)
 		if err != nil {
 			if errors.Is(err, db.ErrConflict) {
 				writeJSON(w, http.StatusConflict, map[string]string{"error": "Configuration was modified by another session. Please reload and try again."})

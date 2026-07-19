@@ -27,11 +27,26 @@ type Server struct {
 	channelService  *ChannelService
 	groupService    *GroupService
 	digestRunner    DigestRunner
+	settingsApplier SettingsApplier
 	digestJobs      *digestJobStore
 	terminalMu      sync.RWMutex
 	terminalReason  error
 	onTokenRevoked  func(error)
 }
+
+// SettingsMutation is the validated settings payload shared by authenticated
+// WebApp HTTP writes and the Telegram web_app_data production adapter.
+type SettingsMutation struct {
+	DigestTime   string
+	Timezone     string
+	DefaultModel string
+	Channels     []string
+	Version      int64
+}
+
+// SettingsApplier persists a settings mutation and refreshes its downstream
+// runtime dependencies. The returned version is the persisted config version.
+type SettingsApplier func(context.Context, SettingsMutation) (int64, error)
 
 type tokenRevocationConfigurer interface {
 	SetTokenRevocationHandler(func(error))
@@ -128,6 +143,14 @@ func newWithProviders(store *db.DB, timeout time.Duration, client *http.Client, 
 // service without making the HTTP package depend on scheduler internals.
 func (s *Server) SetDigestRunner(runner DigestRunner) {
 	s.digestRunner = runner
+}
+
+// SetSettingsApplier connects authenticated HTTP settings writes to the same
+// production application boundary used by Telegram WebApp sendData.
+func (s *Server) SetSettingsApplier(applier SettingsApplier) {
+	if s != nil {
+		s.settingsApplier = applier
+	}
 }
 
 // SetChannelVerifier replaces the t.me/s verifier, primarily for deterministic

@@ -966,6 +966,31 @@ func TestSettingsAPIUsesOptimisticLocking(t *testing.T) {
 	}
 }
 
+func TestSettingsAPIUsesConfiguredProductionApplier(t *testing.T) {
+	server, _ := newBackendTestServer(t)
+	var got SettingsMutation
+	server.SetSettingsApplier(func(_ context.Context, mutation SettingsMutation) (int64, error) {
+		got = mutation
+		return 7, nil
+	})
+
+	response := doJSON(t, server.Handler(), http.MethodPut, "/api/settings",
+		`{"digest_time":"09:30","timezone":"UTC","default_model":"gpt-4o","version":1}`)
+	if response.Code != http.StatusOK {
+		t.Fatalf("settings update status = %d, body=%s", response.Code, response.Body.String())
+	}
+	var saved settingsPayload
+	if err := json.Unmarshal(response.Body.Bytes(), &saved); err != nil {
+		t.Fatalf("decode saved settings: %v", err)
+	}
+	if saved.Version != 7 {
+		t.Fatalf("saved version = %d, want 7", saved.Version)
+	}
+	if got.DigestTime != "09:30" || got.Timezone != "UTC" || got.DefaultModel != "gpt-4o" || got.Version != 1 {
+		t.Fatalf("production mutation = %+v", got)
+	}
+}
+
 func TestChannelDeleteCascadesAssignments(t *testing.T) {
 	server, store := newBackendTestServer(t)
 	channelID, err := store.Channels.Insert(&model.Channel{Username: "cascade_"})

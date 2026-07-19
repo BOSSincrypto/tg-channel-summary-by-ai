@@ -136,6 +136,9 @@ func main() {
 	telegramBot.SetSettingsApplier(func(ctx context.Context, _ *telego.Message, settings bot.BotSettings) error {
 		return applyProductionSettings(ctx, store, sched, settings)
 	})
+	srv.SetSettingsApplier(func(ctx context.Context, mutation webapp.SettingsMutation) (int64, error) {
+		return applyProductionSettingsMutation(ctx, store, sched, mutation)
+	})
 	go func() {
 		log.Printf("HTTP server listening on :%s", cfg.Port)
 		if err := srv.Start(cfg.Port); err != nil {
@@ -171,55 +174,94 @@ func main() {
 // WebApp sendData. It persists the payload and updates every configured group
 // while refreshing the already-running shared scheduler instance.
 func applyProductionSettings(ctx context.Context, store *db.DB, sched *scheduler.Scheduler, settings bot.BotSettings) error {
+	_, err := applyProductionSettingsMutation(ctx, store, sched, webapp.SettingsMutation{
+		DigestTime: settings.DigestTime,
+		Channels:   settings.Channels,
+	})
+	return err
+}
+
+type persistedWebAppSettings struct {
+	DigestTime   string   `json:"digest_time"`
+	Timezone     string   `json:"timezone"`
+	DefaultModel string   `json:"default_model"`
+	Channels     []string `json:"channels"`
+}
+
+func applyProductionSettingsMutation(ctx context.Context, store *db.DB, sched *scheduler.Scheduler, mutation webapp.SettingsMutation) (int64, error) {
 	if store == nil || sched == nil {
-		return errors.New("production settings dependencies are not configured")
+		return 0, errors.New("production settings dependencies are not configured")
 	}
-	digestTime := strings.TrimSpace(settings.DigestTime)
+	if err := ctx.Err(); err != nil {
+		return 0, fmt.Errorf("apply production settings: %w", err)
+	}
+	digestTime := strings.TrimSpace(mutation.DigestTime)
 	parsed, err := time.Parse("15:04", digestTime)
 	if err != nil || parsed.Format("15:04") != digestTime {
-		return errors.New("digest_time must be in HH:MM format")
+		return 0, errors.New("digest_time must be in HH:MM format")
 	}
-	if settings.Channels == nil {
-		return errors.New("channels is required")
+	current := persistedWebAppSettings{
+		DigestTime:   digestTime,
+		Timezone:     "Europe/Moscow",
+		DefaultModel: summarizer.DefaultOpenRouterModel,
 	}
-	encoded, err := json.Marshal(struct {
-		DigestTime string   `json:"digest_time"`
-		Channels   []string `json:"channels"`
-	}{
-		DigestTime: digestTime,
-		Channels:   append([]string(nil), settings.Channels...),
-	})
+	if value, getErr := store.Config.Get("webapp_settings"); getErr == nil {
+		if unmarshalErr := json.Unmarshal([]byte(value), &current); unmarshalErr != nil {
+			return 0, fmt.Errorf("decode persisted WebApp settings: %w", unmarshalErr)
+		}
+	} else if !errors.Is(getErr, db.ErrNotFound) {
+		return 0, fmt.Errorf("load persisted WebApp settings: %w", getErr)
+	}
+	if strings.TrimSpace(current.Timezone) == "" {
+		current.Timezone = "Europe/Moscow"
+	}
+	if strings.TrimSpace(current.DefaultModel) == "" {
+		current.DefaultModel = summarizer.DefaultOpenRouterModel
+	}
+	current.DigestTime = digestTime
+	if timezone := strings.TrimSpace(mutation.Timezone); timezone != "" {
+		current.Timezone = timezone
+	}
+	if model := strings.TrimSpace(mutation.DefaultModel); model != "" {
+		current.DefaultModel = model
+	}
+	if mutation.Channels != nil {
+		current.Channels = append([]string(nil), mutation.Channels...)
+	}
+	encoded, err := json.Marshal(current)
 	if err != nil {
-		return fmt.Errorf("encode WebApp settings: %w", err)
+		return 0, fmt.Errorf("encode WebApp settings: %w", err)
 	}
-	if err := store.Config.Set("webapp_settings", string(encoded)); err != nil {
-		return fmt.Errorf("persist WebApp settings: %w", err)
+	version, err := store.Config.SetOptimistic("webapp_settings", string(encoded), mutation.Version)
+	if err != nil {
+		return 0, fmt.Errorf("persist WebApp settings: %w", err)
 	}
 
 	groups, err := store.Groups.List()
 	if err != nil {
-		return fmt.Errorf("list groups for WebApp settings: %w", err)
+		return 0, fmt.Errorf("list groups for WebApp settings: %w", err)
 	}
 	for _, group := range groups {
 		groupSettings, err := store.Groups.GetGroupSettings(group.ID)
 		if err != nil {
-			return fmt.Errorf("load settings for group %d: %w", group.ID, err)
+			return 0, fmt.Errorf("load settings for group %d: %w", group.ID, err)
 		}
 		groupSettings.DigestTime = digestTime
-		if strings.TrimSpace(groupSettings.Timezone) == "" {
-			groupSettings.Timezone = "Europe/Moscow"
+		if timezone := strings.TrimSpace(mutation.Timezone); timezone != "" {
+			groupSettings.Timezone = timezone
+		} else if strings.TrimSpace(groupSettings.Timezone) == "" {
+			groupSettings.Timezone = current.Timezone
 		}
 		if err := store.Groups.UpdateGroupSettings(groupSettings); err != nil {
-			return fmt.Errorf("persist settings for group %d: %w", group.ID, err)
+			return 0, fmt.Errorf("persist settings for group %d: %w", group.ID, err)
 		}
 		if group.Status == "" || group.Status == model.GroupStatusActive {
 			if err := sched.RefreshGroup(group.ID); err != nil {
-				return fmt.Errorf("refresh scheduler for group %d: %w", group.ID, err)
+				return 0, fmt.Errorf("refresh scheduler for group %d: %w", group.ID, err)
 			}
 		}
 	}
-	_ = ctx
-	return nil
+	return version, nil
 }
 
 func ensureDefaultAIProvider(store *db.DB, apiKey string) error {

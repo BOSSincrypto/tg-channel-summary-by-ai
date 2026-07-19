@@ -29,6 +29,7 @@ class Element {
     this.disabled = false;
     this.hidden = false;
     this.selected = false;
+    this.focused = false;
     this.textContent = "";
   }
 
@@ -72,6 +73,11 @@ class Element {
 
   click() {
     if (!this.disabled) this.dispatchEvent({ type: "click" });
+  }
+
+  focus() {
+    this.focused = true;
+    this.dispatchEvent({ type: "focus" });
   }
 
   requestSubmit() {
@@ -124,6 +130,7 @@ class Element {
     const attributeMatches = [...selector.matchAll(/\[([A-Za-z0-9_-]+)=["']([^"']*)["']\]/g)];
     if (attributeMatches.some((match) => this.getAttribute(match[1]) !== match[2])) return false;
     if (selector.includes(":checked") && !this.checked) return false;
+    if (selector.includes(":focus") && !this.focused) return false;
     return true;
   }
 }
@@ -381,11 +388,63 @@ async function testAssignmentReusesNewestGroupVersion() {
   assert(app.hooks.findGroup("7").version === 6, "Assignment did not apply its authoritative follow-up group");
 }
 
+async function testTimezoneFocusShowsCatalogAndTypingFilters() {
+  const app = makeApp();
+  const channels = app.findPending("/api/channels");
+  app.resolve(channels, []);
+  await settle();
+
+  const settingsTab = app.document.querySelectorAll("button").find((button) =>
+    button.children.some((child) => child.textContent === "Настройки")
+  );
+  assert(settingsTab, "Settings tab was not rendered");
+  settingsTab.click();
+  const settings = app.findPending("/api/settings");
+  app.resolve(settings, {
+    digest_time: "21:00",
+    timezone: "Europe/Moscow",
+    default_model: "openai/gpt-oss-120b",
+    version: 3
+  });
+  await settle();
+
+  const timezoneInput = app.document.querySelector("#settings-timezone");
+  const timezoneDropdown = app.document.querySelector('[role="listbox"]');
+  assert(timezoneInput && timezoneDropdown, "Timezone field was not rendered");
+  timezoneInput.focus();
+  const catalogOptions = timezoneDropdown.querySelectorAll('[role="option"]');
+  assert(!timezoneDropdown.hidden, "Timezone catalog stayed hidden on focus");
+  assert(timezoneInput.value === "Europe/Moscow", "Saved timezone value was not preserved on focus");
+  assert(catalogOptions.length > 100, "Focus did not show the complete timezone catalog");
+  assert(
+    timezoneDropdown.querySelectorAll(".timezone-group").length > 3,
+    "Timezone catalog was not grouped by region"
+  );
+
+  timezoneInput.value = "Moscow";
+  timezoneInput.dispatchEvent({ type: "input" });
+  const filteredOptions = timezoneDropdown.querySelectorAll('[role="option"]');
+  assert(filteredOptions.length > 0, "Timezone search returned no Moscow matches");
+  assert(
+    filteredOptions.every((option) => option.textContent.toLowerCase().includes("moscow")),
+    "Timezone search did not filter by the explicit query"
+  );
+  assert(
+    filteredOptions.every((option) => !option.textContent.includes("Europe/London")),
+    "Timezone search left unrelated entries visible"
+  );
+
+  filteredOptions[0].click();
+  assert(timezoneInput.value === filteredOptions[0].textContent, "Timezone selection did not update the input");
+  assert(timezoneDropdown.hidden, "Timezone catalog stayed open after selection");
+}
+
 async function run() {
   await testChannelToggleUsesStableID();
   await testGroupRefreshSuppressesStaleGeneration();
   await testAssignmentReusesNewestGroupVersion();
-  console.log("WebApp refresh regression harness passed: stable IDs, stale generations, newest optimistic versions.");
+  await testTimezoneFocusShowsCatalogAndTypingFilters();
+  console.log("WebApp refresh regression harness passed: stable IDs, stale generations, newest optimistic versions, timezone focus catalog.");
 }
 
 run().catch((error) => {

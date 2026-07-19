@@ -940,9 +940,10 @@
     var timezoneDropdown = el("div", "timezone-dropdown");
     attr(timezoneDropdown, "role", "listbox");
     attr(timezoneDropdown, "aria-label", "Доступные часовые пояса");
+    var timezoneSearchActive = false;
     function renderTimezoneChoices() {
       while (timezoneDropdown.firstChild) timezoneDropdown.removeChild(timezoneDropdown.firstChild);
-      var query = tz.input.value.trim().toLowerCase();
+      var query = timezoneSearchActive ? tz.input.value.trim().toLowerCase() : "";
       var groups = {};
       timezoneList.forEach(function (zone) {
         if (query && zone.toLowerCase().indexOf(query) < 0) return;
@@ -957,6 +958,7 @@
           var choice = button(zone, "ghost small", function () {
             tz.input.value = zone;
             state.settingsDraft = readSettings(form);
+            timezoneSearchActive = false;
             timezoneDropdown.hidden = true;
           });
           attr(choice, "role", "option");
@@ -968,8 +970,14 @@
       timezoneDropdown.hidden = !tz.input.matches(":focus") || !timezoneDropdown.firstChild;
     }
     tz.wrap.appendChild(timezoneDropdown);
-    tz.input.addEventListener("focus", renderTimezoneChoices);
-    tz.input.addEventListener("input", renderTimezoneChoices);
+    tz.input.addEventListener("focus", function () {
+      timezoneSearchActive = false;
+      renderTimezoneChoices();
+    });
+    tz.input.addEventListener("input", function () {
+      timezoneSearchActive = true;
+      renderTimezoneChoices();
+    });
     tz.input.addEventListener("blur", function () {
       window.setTimeout(function () { timezoneDropdown.hidden = true; }, 120);
     });

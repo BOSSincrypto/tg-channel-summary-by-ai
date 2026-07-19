@@ -100,6 +100,7 @@ func main() {
 	digestService := digest.NewWithProcessorAndAIWithMaxPostsPerChannel(store, channelProcessor, store.Groups, http.DefaultClient, cfg.MaxPostsPerChan, ownerNotifier)
 	srv.SetDigestRunner(digestService)
 	sched := scheduler.New(digestService, scheduler.WithGroupSource(store.Groups))
+	srv.SetGroupScheduler(sched)
 
 	telegramBot, err := bot.NewWithConfig(
 		cfg.BotToken,
@@ -131,6 +132,9 @@ func main() {
 	digestService.SetDelivery(telegramBot)
 	if err := sched.Start(); err != nil {
 		log.Fatalf("failed to start scheduler: %v", err)
+	}
+	if err := srv.ReconcileGroupScheduler(context.Background()); err != nil {
+		log.Printf("pending WebApp group scheduler reconciliation incomplete: %v", err)
 	}
 	if err := reconcilePendingSettings(context.Background(), store, sched); err != nil {
 		log.Printf("pending WebApp settings reconciliation incomplete: %v", err)

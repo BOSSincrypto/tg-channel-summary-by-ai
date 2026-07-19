@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
@@ -141,6 +142,113 @@ func (r *GroupRepository) Delete(id int64) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// DeleteOptimistic removes a group only when the supplied positive version is
+// still current. The caller is responsible for coordinating external runtime
+// state, such as the live scheduler, before invoking this durable mutation.
+func (r *GroupRepository) DeleteOptimistic(id, version int64) error {
+	if version <= 0 {
+		return ErrConflict
+	}
+	result, err := r.db.Conn().Exec(
+		`DELETE FROM groups WHERE id = ? AND version = ?`,
+		id, version,
+	)
+	if err != nil {
+		return fmt.Errorf("delete group optimistically: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("delete group rows affected: %w", err)
+	}
+	if affected == 0 {
+		if _, err := r.GetByID(id); errors.Is(err, ErrNotFound) {
+			return ErrNotFound
+		} else if err != nil {
+			return fmt.Errorf("inspect group after optimistic delete: %w", err)
+		}
+		return ErrConflict
+	}
+	return nil
+}
+
+const groupSchedulerSyncKeyPrefix = "webapp_group_scheduler_sync:"
+
+// GroupSchedulerSyncKey returns the durable reconciliation key for a group.
+func GroupSchedulerSyncKey(groupID int64) string {
+	return fmt.Sprintf("%s%d", groupSchedulerSyncKeyPrefix, groupID)
+}
+
+// RecordSchedulerSync records that an active group's scheduler registration
+// must be retried after a runtime failure.
+func (r *GroupRepository) RecordSchedulerSync(groupID int64) error {
+	if groupID <= 0 {
+		return errors.New("record scheduler sync: group ID must be positive")
+	}
+	if err := r.db.Config.Set(GroupSchedulerSyncKey(groupID), "register"); err != nil {
+		return fmt.Errorf("record group scheduler sync: %w", err)
+	}
+	return nil
+}
+
+// RecordSchedulerRemoval records that a deleted group's scheduler job must
+// be removed after a late persistence failure.
+func (r *GroupRepository) RecordSchedulerRemoval(groupID int64) error {
+	if groupID <= 0 {
+		return errors.New("record scheduler removal: group ID must be positive")
+	}
+	if err := r.db.Config.Set(GroupSchedulerSyncKey(groupID), "remove"); err != nil {
+		return fmt.Errorf("record group scheduler removal: %w", err)
+	}
+	return nil
+}
+
+// SchedulerSyncKind returns the desired reconciliation action for a group.
+func (r *GroupRepository) SchedulerSyncKind(groupID int64) (string, error) {
+	if groupID <= 0 {
+		return "", errors.New("get scheduler sync: group ID must be positive")
+	}
+	kind, err := r.db.Config.Get(GroupSchedulerSyncKey(groupID))
+	if err != nil {
+		return "", fmt.Errorf("get group scheduler sync: %w", err)
+	}
+	if kind != "register" && kind != "remove" {
+		return "", fmt.Errorf("get group scheduler sync: invalid action %q", kind)
+	}
+	return kind, nil
+}
+
+// ClearSchedulerSync removes a converged group scheduler reconciliation entry.
+func (r *GroupRepository) ClearSchedulerSync(groupID int64) error {
+	if groupID <= 0 {
+		return errors.New("clear scheduler sync: group ID must be positive")
+	}
+	if err := r.db.Config.Delete(GroupSchedulerSyncKey(groupID)); err != nil {
+		return fmt.Errorf("clear group scheduler sync: %w", err)
+	}
+	return nil
+}
+
+// ListPendingSchedulerSync returns group IDs whose live scheduler
+// registration still needs reconciliation.
+func (r *GroupRepository) ListPendingSchedulerSync() ([]int64, error) {
+	entries, err := r.db.Config.GetAll()
+	if err != nil {
+		return nil, fmt.Errorf("list group scheduler sync: %w", err)
+	}
+	pending := make([]int64, 0)
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Key, groupSchedulerSyncKeyPrefix) {
+			continue
+		}
+		groupID, err := strconv.ParseInt(strings.TrimPrefix(entry.Key, groupSchedulerSyncKeyPrefix), 10, 64)
+		if err != nil || groupID <= 0 {
+			return nil, fmt.Errorf("list group scheduler sync: invalid key %q", entry.Key)
+		}
+		pending = append(pending, groupID)
+	}
+	return pending, nil
 }
 
 // AssignChannel links a channel to a group with optional topic.

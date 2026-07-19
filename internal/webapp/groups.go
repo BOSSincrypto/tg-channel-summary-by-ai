@@ -134,6 +134,10 @@ type dbGroupRepository interface {
 	UnassignChannel(int64, int64) error
 }
 
+type optimisticGroupRepository interface {
+	DeleteOptimistic(int64, int64) error
+}
+
 type forumTopicStateLookup interface {
 	GetForumTopic(int64, int64) (*model.ForumTopic, error)
 }
@@ -285,6 +289,26 @@ func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
 			writeGroupError(w, err)
 			return
 		}
+		if s.groupScheduler != nil && isForumGroup(*group) {
+			repository, ok := s.groupService.repository.(groupSchedulerRepository)
+			if !ok {
+				writeGroupError(w, errors.New("group scheduler persistence is not configured"))
+				return
+			}
+			if err := s.groupScheduler.RestoreGroup(group.ID); err != nil {
+				if recordErr := repository.RecordSchedulerSync(group.ID); recordErr != nil {
+					err = fmt.Errorf("register group scheduler: %w; record recovery: %v", err, recordErr)
+				} else {
+					err = fmt.Errorf("register group scheduler: %w", err)
+				}
+				writeGroupError(w, err)
+				return
+			}
+			if err := repository.ClearSchedulerSync(group.ID); err != nil {
+				writeGroupError(w, fmt.Errorf("clear group scheduler recovery: %w", err))
+				return
+			}
+		}
 		writeJSON(w, http.StatusCreated, groupJSON(*group, []map[string]any{}))
 	default:
 		w.Header().Set("Allow", "GET, POST")
@@ -312,9 +336,77 @@ func (s *Server) handleGroupByID(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, groupJSON(*group, assignments))
 	case http.MethodDelete:
-		if err := s.groupService.repository.Delete(id); err != nil {
+		var input versionInput
+		if err := decodeJSON(r, w, &input); err != nil {
+			return
+		}
+		if input.Version <= 0 {
+			writeGroupError(w, db.ErrConflict)
+			return
+		}
+		strict, ok := s.groupService.repository.(optimisticGroupRepository)
+		if !ok {
+			writeGroupError(w, errors.New("group deletion locking is not configured"))
+			return
+		}
+		s.groupLifecycleMu.Lock()
+		defer s.groupLifecycleMu.Unlock()
+		group, err := s.groupService.repository.GetByID(id)
+		if err != nil {
 			writeGroupError(w, err)
 			return
+		}
+		if group.Version != input.Version {
+			writeGroupError(w, db.ErrConflict)
+			return
+		}
+		if s.groupScheduler != nil {
+			s.groupScheduler.RemoveGroup(id)
+		}
+		if err := strict.DeleteOptimistic(id, input.Version); err != nil {
+			groupStillExists := true
+			if _, lookupErr := s.groupService.repository.GetByID(id); errors.Is(lookupErr, db.ErrNotFound) {
+				groupStillExists = false
+			}
+			if s.groupScheduler != nil && groupStillExists && isForumGroup(*group) {
+				if restoreErr := s.groupScheduler.RestoreGroup(id); restoreErr != nil {
+					repository, repositoryOK := s.groupService.repository.(groupSchedulerRepository)
+					if repositoryOK {
+						if recordErr := repository.RecordSchedulerSync(id); recordErr != nil {
+							err = fmt.Errorf("%w; restore scheduler: %v; record recovery: %v", err, restoreErr, recordErr)
+						} else {
+							err = fmt.Errorf("%w; restore scheduler: %v", err, restoreErr)
+						}
+					} else {
+						err = fmt.Errorf("%w; restore scheduler: %v", err, restoreErr)
+					}
+				}
+			}
+			if !groupStillExists {
+				if repository, ok := s.groupService.repository.(groupSchedulerRepository); ok {
+					if clearErr := repository.ClearSchedulerSync(id); clearErr != nil {
+						if recordErr := repository.RecordSchedulerRemoval(id); recordErr != nil {
+							err = fmt.Errorf("%w; clear scheduler recovery: %v; record removal: %v", err, clearErr, recordErr)
+						} else {
+							err = fmt.Errorf("%w; clear scheduler recovery: %v", err, clearErr)
+						}
+					}
+				}
+			}
+			writeGroupError(w, err)
+			return
+		}
+		if repository, ok := s.groupService.repository.(groupSchedulerRepository); ok {
+			if err := repository.ClearSchedulerSync(id); err != nil {
+				// The group and its live job are already gone. Keep a durable
+				// removal intent so restart reconciliation can retry cleanup.
+				if recordErr := repository.RecordSchedulerRemoval(id); recordErr != nil {
+					writeGroupError(w, fmt.Errorf("clear group scheduler recovery: %w; record removal: %v", err, recordErr))
+					return
+				}
+				writeGroupError(w, fmt.Errorf("clear group scheduler recovery: %w", err))
+				return
+			}
 		}
 		w.WriteHeader(http.StatusNoContent)
 	default:
@@ -609,6 +701,8 @@ func writeGroupError(w http.ResponseWriter, err error) {
 		status, message = http.StatusBadRequest, "Chat ID должен быть числом (например, -1001234567890)"
 	case strings.Contains(strings.ToLower(err.Error()), "verification"):
 		status, message = http.StatusBadRequest, "Бот не является участником этой группы. Добавьте бота в группу и попробуйте снова."
+	case strings.Contains(strings.ToLower(err.Error()), "scheduler"):
+		status, message = http.StatusBadGateway, "Не удалось синхронизировать расписание группы"
 	case strings.Contains(strings.ToLower(err.Error()), "topic"),
 		strings.Contains(strings.ToLower(err.Error()), "telegram"):
 		status, message = http.StatusBadGateway, "Не удалось обновить топик группы"

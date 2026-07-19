@@ -15,8 +15,10 @@ import (
 	"time"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
+	"github.com/boss/tg-channel-summary-by-ai/internal/digest"
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
 	"github.com/boss/tg-channel-summary-by-ai/internal/parser"
+	"github.com/boss/tg-channel-summary-by-ai/internal/scheduler"
 )
 
 type fakeChannelVerifier struct {
@@ -1110,6 +1112,260 @@ func TestChannelDeleteCascadesAssignments(t *testing.T) {
 	if count != 0 {
 		t.Fatalf("assignment count = %d, want 0", count)
 	}
+}
+
+func TestWebAppGroupLifecycleSynchronizesLiveSchedulerAndLocksDeletion(t *testing.T) {
+	server, store := newBackendTestServer(t)
+	scheduler := &fakeGroupScheduler{}
+	server.SetGroupScheduler(scheduler)
+
+	created := doJSON(t, server.Handler(), http.MethodPost, "/api/groups", `{"chat_id":"-1002234567890999"}`)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, body=%s", created.Code, created.Body.String())
+	}
+	var group model.Group
+	if err := json.Unmarshal(created.Body.Bytes(), &struct {
+		ID      *int64 `json:"id"`
+		Version *int64 `json:"version"`
+	}{ID: &group.ID, Version: &group.Version}); err != nil {
+		t.Fatalf("decode created group: %v", err)
+	}
+	if group.ID <= 0 || group.Version != 1 {
+		t.Fatalf("created group identity = %+v", group)
+	}
+	if len(scheduler.restored) != 1 || scheduler.restored[0] != group.ID {
+		t.Fatalf("restore calls = %v, want one registration for %d", scheduler.restored, group.ID)
+	}
+	if _, err := store.Config.Get(db.GroupSchedulerSyncKey(group.ID)); !errors.Is(err, db.ErrNotFound) {
+		t.Fatalf("successful registration left pending intent: %v", err)
+	}
+
+	duplicate := doJSON(t, server.Handler(), http.MethodPost, "/api/groups", `{"chat_id":"-1002234567890999"}`)
+	if duplicate.Code != http.StatusConflict || len(scheduler.restored) != 1 {
+		t.Fatalf("duplicate create = %d %s, restore calls=%v", duplicate.Code, duplicate.Body.String(), scheduler.restored)
+	}
+
+	for name, body := range map[string]string{
+		"missing":  `{}`,
+		"zero":     `{"version":0}`,
+		"negative": `{"version":-1}`,
+		"stale":    `{"version":99}`,
+	} {
+		response := doJSON(t, server.Handler(), http.MethodDelete,
+			"/api/groups/"+jsonNumber(group.ID), body)
+		if response.Code != http.StatusConflict {
+			t.Fatalf("%s delete status = %d, body=%s", name, response.Code, response.Body.String())
+		}
+	}
+	malformed := doJSON(t, server.Handler(), http.MethodDelete,
+		"/api/groups/"+jsonNumber(group.ID), `{"version":"1"}`)
+	if malformed.Code != http.StatusBadRequest {
+		t.Fatalf("malformed delete status = %d, body=%s", malformed.Code, malformed.Body.String())
+	}
+	if len(scheduler.removed) != 0 {
+		t.Fatalf("rejected deletes removed scheduler jobs: %v", scheduler.removed)
+	}
+	if _, err := store.Groups.GetByID(group.ID); err != nil {
+		t.Fatalf("rejected delete removed group: %v", err)
+	}
+
+	deleted := doJSON(t, server.Handler(), http.MethodDelete,
+		"/api/groups/"+jsonNumber(group.ID), `{"version":1}`)
+	if deleted.Code != http.StatusNoContent {
+		t.Fatalf("current delete status = %d, body=%s", deleted.Code, deleted.Body.String())
+	}
+	if len(scheduler.removed) != 1 || scheduler.removed[0] != group.ID {
+		t.Fatalf("remove calls = %v, want one removal for %d", scheduler.removed, group.ID)
+	}
+	if _, err := store.Groups.GetByID(group.ID); !errors.Is(err, db.ErrNotFound) {
+		t.Fatalf("deleted group lookup = %v, want not found", err)
+	}
+}
+
+func TestWebAppGroupCreationFailureRecordsPendingSchedulerSyncAndReconciles(t *testing.T) {
+	server, store := newBackendTestServer(t)
+	scheduler := &fakeGroupScheduler{restoreErr: errors.New("injected scheduler registration failure")}
+	server.SetGroupScheduler(scheduler)
+
+	response := doJSON(t, server.Handler(), http.MethodPost, "/api/groups", `{"chat_id":"-1002234567890888"}`)
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("failed create status = %d, body=%s", response.Code, response.Body.String())
+	}
+	var group struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &group); err == nil && group.ID != 0 {
+		t.Fatalf("failed create unexpectedly returned group: %#v", group)
+	}
+	stored, err := store.Groups.GetByChatID(-1002234567890888)
+	if err != nil {
+		t.Fatalf("failed create did not retain durable group: %v", err)
+	}
+	if _, err := store.Config.Get(db.GroupSchedulerSyncKey(stored.ID)); err != nil {
+		t.Fatalf("pending scheduler intent missing: %v", err)
+	}
+
+	scheduler.restoreErr = nil
+	if err := server.ReconcileGroupScheduler(context.Background()); err != nil {
+		t.Fatalf("reconcile scheduler intent: %v", err)
+	}
+	if len(scheduler.restored) != 2 {
+		t.Fatalf("restore calls after reconciliation = %v, want failed attempt plus retry", scheduler.restored)
+	}
+	if _, err := store.Config.Get(db.GroupSchedulerSyncKey(stored.ID)); !errors.Is(err, db.ErrNotFound) {
+		t.Fatalf("pending scheduler intent after reconciliation = %v", err)
+	}
+}
+
+func TestWebAppGroupDeleteRestoresSchedulerAfterDurableFailure(t *testing.T) {
+	server, store := newBackendTestServer(t)
+	scheduler := &fakeGroupScheduler{}
+	server.SetGroupScheduler(scheduler)
+	created := doJSON(t, server.Handler(), http.MethodPost, "/api/groups", `{"chat_id":"-1002234567890777"}`)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, body=%s", created.Code, created.Body.String())
+	}
+	var group struct {
+		ID      int64 `json:"id"`
+		Version int64 `json:"version"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &group); err != nil {
+		t.Fatalf("decode group: %v", err)
+	}
+
+	server.groupService.repository = failingDeleteGroupRepository{
+		GroupRepository: store.Groups,
+		err:             errors.New("injected database delete failure"),
+	}
+	response := doJSON(t, server.Handler(), http.MethodDelete,
+		"/api/groups/"+jsonNumber(group.ID), `{"version":1}`)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("failed delete status = %d, body=%s", response.Code, response.Body.String())
+	}
+	if len(scheduler.removed) != 1 || len(scheduler.restored) != 2 {
+		t.Fatalf("scheduler compensation calls = removed:%v restored:%v", scheduler.removed, scheduler.restored)
+	}
+	if _, err := store.Groups.GetByID(group.ID); err != nil {
+		t.Fatalf("database failure lost group: %v", err)
+	}
+	if _, err := store.Config.Get(db.GroupSchedulerSyncKey(group.ID)); !errors.Is(err, db.ErrNotFound) {
+		t.Fatalf("successful scheduler compensation left pending intent: %v", err)
+	}
+}
+
+type groupLifecycleDigestRunner struct{}
+
+func (groupLifecycleDigestRunner) Generate(int64) (*digest.Digest, error) {
+	return &digest.Digest{}, nil
+}
+
+func TestWebAppGroupLifecycleUsesRunningProductionScheduler(t *testing.T) {
+	server, store := newBackendTestServer(t)
+	liveScheduler := scheduler.New(groupLifecycleDigestRunner{}, scheduler.WithGroupSource(store.Groups))
+	if err := liveScheduler.Start(); err != nil {
+		t.Fatalf("start live scheduler: %v", err)
+	}
+	t.Cleanup(liveScheduler.Stop)
+	server.SetGroupScheduler(liveScheduler)
+
+	created := doJSON(t, server.Handler(), http.MethodPost, "/api/groups", `{"chat_id":"-1002234567890666"}`)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, body=%s", created.Code, created.Body.String())
+	}
+	var group struct {
+		ID      int64 `json:"id"`
+		Version int64 `json:"version"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &group); err != nil {
+		t.Fatalf("decode group: %v", err)
+	}
+	if _, ok := liveScheduler.ScheduleForGroup(group.ID); !ok {
+		t.Fatalf("created group %d was not registered in the running scheduler", group.ID)
+	}
+
+	retry := doJSON(t, server.Handler(), http.MethodPost, "/api/groups", `{"chat_id":"-1002234567890666"}`)
+	if retry.Code != http.StatusConflict {
+		t.Fatalf("duplicate create status = %d, body=%s", retry.Code, retry.Body.String())
+	}
+	if _, ok := liveScheduler.ScheduleForGroup(group.ID); !ok {
+		t.Fatalf("duplicate create removed the live scheduler registration")
+	}
+
+	deleted := doJSON(t, server.Handler(), http.MethodDelete,
+		"/api/groups/"+jsonNumber(group.ID), `{"version":`+jsonNumber(group.Version)+`}`)
+	if deleted.Code != http.StatusNoContent {
+		t.Fatalf("delete status = %d, body=%s", deleted.Code, deleted.Body.String())
+	}
+	if _, ok := liveScheduler.ScheduleForGroup(group.ID); ok {
+		t.Fatalf("deleted group retained a live scheduler registration")
+	}
+}
+
+func TestWebAppGroupDeleteFailureDurablyReconcilesWhenSchedulerRestoreFails(t *testing.T) {
+	server, store := newBackendTestServer(t)
+	scheduler := &fakeGroupScheduler{}
+	server.SetGroupScheduler(scheduler)
+	created := doJSON(t, server.Handler(), http.MethodPost, "/api/groups", `{"chat_id":"-1002234567890555"}`)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, body=%s", created.Code, created.Body.String())
+	}
+	var group struct {
+		ID      int64 `json:"id"`
+		Version int64 `json:"version"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &group); err != nil {
+		t.Fatalf("decode group: %v", err)
+	}
+	scheduler.restoreErr = errors.New("restore unavailable")
+	server.groupService.repository = failingDeleteGroupRepository{
+		GroupRepository: store.Groups,
+		err:             errors.New("injected database delete failure"),
+	}
+
+	response := doJSON(t, server.Handler(), http.MethodDelete,
+		"/api/groups/"+jsonNumber(group.ID), `{"version":`+jsonNumber(group.Version)+`}`)
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("failed delete status = %d, body=%s", response.Code, response.Body.String())
+	}
+	if _, err := store.Config.Get(db.GroupSchedulerSyncKey(group.ID)); err != nil {
+		t.Fatalf("durable restore intent missing: %v", err)
+	}
+	if _, err := store.Groups.GetByID(group.ID); err != nil {
+		t.Fatalf("database failure lost group: %v", err)
+	}
+
+	scheduler.restoreErr = nil
+	server.groupService.repository = store.Groups
+	if err := server.ReconcileGroupScheduler(context.Background()); err != nil {
+		t.Fatalf("reconcile durable restore intent: %v", err)
+	}
+	if _, err := store.Config.Get(db.GroupSchedulerSyncKey(group.ID)); !errors.Is(err, db.ErrNotFound) {
+		t.Fatalf("durable restore intent after reconciliation = %v", err)
+	}
+}
+
+type fakeGroupScheduler struct {
+	restored   []int64
+	removed    []int64
+	restoreErr error
+}
+
+func (s *fakeGroupScheduler) RestoreGroup(groupID int64) error {
+	s.restored = append(s.restored, groupID)
+	return s.restoreErr
+}
+
+func (s *fakeGroupScheduler) RemoveGroup(groupID int64) {
+	s.removed = append(s.removed, groupID)
+}
+
+type failingDeleteGroupRepository struct {
+	*db.GroupRepository
+	err error
+}
+
+func (r failingDeleteGroupRepository) DeleteOptimistic(int64, int64) error {
+	return r.err
 }
 
 func jsonNumber(value int64) string {

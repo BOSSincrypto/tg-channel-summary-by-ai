@@ -517,6 +517,22 @@ func (s *Scheduler) RunGroupWithWindow(groupID int64, windowID string) (*digest.
 	if s == nil || s.runner == nil {
 		return nil, errors.New("run group: digest runner is not configured")
 	}
+	if s.groups != nil {
+		groups, err := s.groups.List()
+		if err != nil {
+			return nil, fmt.Errorf("run group %d: verify group: %w", groupID, err)
+		}
+		active := false
+		for _, group := range groups {
+			if group.ID == groupID {
+				active = group.Status == "" || group.Status == model.GroupStatusActive
+				break
+			}
+		}
+		if !active {
+			return nil, fmt.Errorf("run group %d: group is not active", groupID)
+		}
+	}
 	var (
 		result *digest.Digest
 		err    error

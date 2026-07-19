@@ -7,11 +7,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"sync"
 	"time"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
+	"github.com/boss/tg-channel-summary-by-ai/internal/model"
 	"github.com/boss/tg-channel-summary-by-ai/internal/parser"
 	staticwebapp "github.com/boss/tg-channel-summary-by-ai/webapp"
 	"github.com/go-chi/chi/v5"
@@ -19,19 +21,21 @@ import (
 
 // Server handles HTTP requests for the health check and WebApp.
 type Server struct {
-	router          chi.Router
-	apiRouter       chi.Router
-	srv             *http.Server
-	providerService *ProviderService
-	database        *db.DB
-	channelService  *ChannelService
-	groupService    *GroupService
-	digestRunner    DigestRunner
-	settingsApplier SettingsApplier
-	digestJobs      *digestJobStore
-	terminalMu      sync.RWMutex
-	terminalReason  error
-	onTokenRevoked  func(error)
+	router           chi.Router
+	apiRouter        chi.Router
+	srv              *http.Server
+	providerService  *ProviderService
+	database         *db.DB
+	channelService   *ChannelService
+	groupService     *GroupService
+	groupScheduler   GroupScheduler
+	groupLifecycleMu sync.Mutex
+	digestRunner     DigestRunner
+	settingsApplier  SettingsApplier
+	digestJobs       *digestJobStore
+	terminalMu       sync.RWMutex
+	terminalReason   error
+	onTokenRevoked   func(error)
 }
 
 // SettingsMutation is the validated settings payload shared by authenticated
@@ -47,6 +51,22 @@ type SettingsMutation struct {
 // SettingsApplier persists a settings mutation and refreshes its downstream
 // runtime dependencies. The returned version is the persisted config version.
 type SettingsApplier func(context.Context, SettingsMutation) (int64, error)
+
+// GroupScheduler is the live scheduler boundary used by WebApp group CRUD.
+// RestoreGroup and RemoveGroup are idempotent, allowing request retries and
+// restart reconciliation to converge without duplicate jobs.
+type GroupScheduler interface {
+	RestoreGroup(int64) error
+	RemoveGroup(int64)
+}
+
+type groupSchedulerRepository interface {
+	RecordSchedulerSync(int64) error
+	RecordSchedulerRemoval(int64) error
+	SchedulerSyncKind(int64) (string, error)
+	ClearSchedulerSync(int64) error
+	ListPendingSchedulerSync() ([]int64, error)
+}
 
 type tokenRevocationConfigurer interface {
 	SetTokenRevocationHandler(func(error))
@@ -151,6 +171,85 @@ func (s *Server) SetSettingsApplier(applier SettingsApplier) {
 	if s != nil {
 		s.settingsApplier = applier
 	}
+}
+
+// SetGroupScheduler connects the WebApp group lifecycle to the shared live
+// scheduler instance used by production scheduled digests.
+func (s *Server) SetGroupScheduler(scheduler GroupScheduler) {
+	if s != nil {
+		s.groupScheduler = scheduler
+	}
+}
+
+// ReconcileGroupScheduler retries durable group scheduler intents left by a
+// failed create/delete operation. Missing groups are treated as converged
+// deletes, and each successful retry clears its intent.
+func (s *Server) ReconcileGroupScheduler(ctx context.Context) error {
+	if s == nil || s.groupService == nil {
+		return errors.New("reconcile group scheduler: group service is not configured")
+	}
+	if s.groupScheduler == nil {
+		return errors.New("reconcile group scheduler: scheduler is not configured")
+	}
+	repository, ok := s.groupService.repository.(groupSchedulerRepository)
+	if !ok {
+		return errors.New("reconcile group scheduler: repository does not support durable intents")
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("reconcile group scheduler: %w", err)
+	}
+	pending, err := repository.ListPendingSchedulerSync()
+	if err != nil {
+		return fmt.Errorf("reconcile group scheduler: list intents: %w", err)
+	}
+	var firstErr error
+	for _, groupID := range pending {
+		kind, kindErr := repository.SchedulerSyncKind(groupID)
+		if kindErr != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("load scheduler intent for group %d: %w", groupID, kindErr)
+			}
+			continue
+		}
+		if kind == "remove" {
+			s.groupScheduler.RemoveGroup(groupID)
+			if clearErr := repository.ClearSchedulerSync(groupID); clearErr != nil && firstErr == nil {
+				firstErr = fmt.Errorf("clear removed group %d scheduler intent: %w", groupID, clearErr)
+			}
+			continue
+		}
+		group, getErr := s.groupService.repository.GetByID(groupID)
+		if errors.Is(getErr, db.ErrNotFound) {
+			s.groupScheduler.RemoveGroup(groupID)
+			if clearErr := repository.ClearSchedulerSync(groupID); clearErr != nil && firstErr == nil {
+				firstErr = fmt.Errorf("clear deleted group %d scheduler intent: %w", groupID, clearErr)
+			}
+			continue
+		}
+		if getErr != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("load group %d for scheduler reconciliation: %w", groupID, getErr)
+			}
+			continue
+		}
+		if group.Status != "" && group.Status != model.GroupStatusActive {
+			s.groupScheduler.RemoveGroup(groupID)
+			if clearErr := repository.ClearSchedulerSync(groupID); clearErr != nil && firstErr == nil {
+				firstErr = fmt.Errorf("clear inactive group %d scheduler intent: %w", groupID, clearErr)
+			}
+			continue
+		}
+		if restoreErr := s.groupScheduler.RestoreGroup(groupID); restoreErr != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("restore group %d scheduler job: %w", groupID, restoreErr)
+			}
+			continue
+		}
+		if clearErr := repository.ClearSchedulerSync(groupID); clearErr != nil && firstErr == nil {
+			firstErr = fmt.Errorf("clear group %d scheduler intent: %w", groupID, clearErr)
+		}
+	}
+	return firstErr
 }
 
 // SetChannelVerifier replaces the t.me/s verifier, primarily for deterministic

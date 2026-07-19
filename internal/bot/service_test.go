@@ -13,24 +13,29 @@ import (
 )
 
 type fakeTelegramClient struct {
-	me            *telego.User
-	meErrors      []error
-	getMeCalls    int
-	updates       chan telego.Update
-	commands      *telego.SetMyCommandsParams
-	callbacks     []string
-	messages      []*telego.SendMessageParams
-	chats         map[int64]*telego.ChatFullInfo
-	getChatCalls  int
-	topics        []*telego.CreateForumTopicParams
-	closedTopics  []*telego.CloseForumTopicParams
-	editedTopics  []*telego.EditForumTopicParams
-	deletedTopics []*telego.DeleteForumTopicParams
-	forumTopic    *telego.ForumTopic
-	closeErr      error
-	apiErr        error
-	pollerErr     error
-	deleteErr     error
+	me                   *telego.User
+	meErrors             []error
+	getMeCalls           int
+	updates              chan telego.Update
+	commands             *telego.SetMyCommandsParams
+	callbacks            []string
+	messages             []*telego.SendMessageParams
+	chats                map[int64]*telego.ChatFullInfo
+	getChatCalls         int
+	chatMember           telego.ChatMember
+	chatMembers          []telego.ChatMember
+	chatMemberErrs       []error
+	permissionConfigured bool
+	getChatMemberCalls   int
+	topics               []*telego.CreateForumTopicParams
+	closedTopics         []*telego.CloseForumTopicParams
+	editedTopics         []*telego.EditForumTopicParams
+	deletedTopics        []*telego.DeleteForumTopicParams
+	forumTopic           *telego.ForumTopic
+	closeErr             error
+	apiErr               error
+	pollerErr            error
+	deleteErr            error
 }
 
 func (f *fakeTelegramClient) GetMe(context.Context) (*telego.User, error) {
@@ -66,6 +71,21 @@ func (f *fakeTelegramClient) GetChat(_ context.Context, params *telego.GetChatPa
 		return nil, f.apiErr
 	}
 	return f.chats[params.ChatID.ID], nil
+}
+
+func (f *fakeTelegramClient) GetChatMember(_ context.Context, _ *telego.GetChatMemberParams) (telego.ChatMember, error) {
+	index := f.getChatMemberCalls
+	f.getChatMemberCalls++
+	if index < len(f.chatMemberErrs) && f.chatMemberErrs[index] != nil {
+		return nil, f.chatMemberErrs[index]
+	}
+	if f.apiErr != nil {
+		return nil, f.apiErr
+	}
+	if index < len(f.chatMembers) {
+		return f.chatMembers[index], nil
+	}
+	return f.chatMember, nil
 }
 
 func (f *fakeTelegramClient) CreateForumTopic(_ context.Context, params *telego.CreateForumTopicParams) (*telego.ForumTopic, error) {
@@ -754,6 +774,18 @@ func TestServiceTopicRemovalKeepsSharedTopicOpen(t *testing.T) {
 }
 
 func newServiceForTest(api telegramClient, poller updatePoller) *Service {
+	if fake, ok := api.(*fakeTelegramClient); ok {
+		if fake.me == nil {
+			fake.me = &telego.User{ID: 123, Username: "DigestBot"}
+		}
+		if !fake.permissionConfigured && fake.chatMember == nil {
+			fake.chatMember = &telego.ChatMemberAdministrator{
+				Status:          telego.MemberStatusAdministrator,
+				User:            telego.User{ID: 123},
+				CanManageTopics: true,
+			}
+		}
+	}
 	return &Service{
 		api:    api,
 		poller: poller,

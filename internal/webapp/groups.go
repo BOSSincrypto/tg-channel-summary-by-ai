@@ -36,6 +36,10 @@ type TopicLifecycle interface {
 	RemoveChannelTopic(context.Context, int64, int64) error
 }
 
+type topicPermissionChecker interface {
+	CheckTopicPermission(context.Context, int64) error
+}
+
 // Topic describes a selectable forum topic. MessageThreadID is always
 // positive; the WebApp never exposes the general topic as a placeholder ID.
 type Topic struct {
@@ -393,6 +397,14 @@ func (s *Server) handleGroupChannels(w http.ResponseWriter, r *http.Request) {
 		if !found {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "topic_thread_id не найден в каталоге группы"})
 			return
+		}
+	}
+	if topic == nil && s.groupService.topics != nil && forum {
+		if checker, ok := s.groupService.topics.(topicPermissionChecker); ok {
+			if err := checker.CheckTopicPermission(r.Context(), groupID); err != nil {
+				writeGroupError(w, err)
+				return
+			}
 		}
 	}
 	if err := s.groupService.repository.AssignChannel(groupID, channelID, topic); err != nil {

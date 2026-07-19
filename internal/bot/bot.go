@@ -30,6 +30,7 @@ type logger interface {
 
 type telegramClient interface {
 	GetMe(context.Context) (*telego.User, error)
+	GetChatMember(context.Context, *telego.GetChatMemberParams) (telego.ChatMember, error)
 	SetMyCommands(context.Context, *telego.SetMyCommandsParams) error
 	AnswerCallbackQuery(context.Context, *telego.AnswerCallbackQueryParams) error
 	SendMessage(context.Context, *telego.SendMessageParams) (*telego.Message, error)
@@ -39,6 +40,8 @@ type telegramClient interface {
 	DeleteForumTopic(context.Context, *telego.DeleteForumTopicParams) error
 	EditForumTopic(context.Context, *telego.EditForumTopicParams) error
 }
+
+var ErrTopicPermissionDenied = errors.New("bot lacks can_manage_topics permission")
 
 type updatePoller interface {
 	UpdatesViaLongPolling(context.Context, *telego.GetUpdatesParams, ...telego.LongPollingOption) (<-chan telego.Update, error)
@@ -766,6 +769,9 @@ func (s *Service) CreateChannelTopic(ctx context.Context, groupID, channelID int
 		name = "@" + channel.Username
 	}
 	name = truncateRunes(name, 128)
+	if err := s.ensureTopicPermission(ctx, group.TelegramChatID); err != nil {
+		return fmt.Errorf("check topic permission before create: %w", err)
+	}
 	topic, err := s.api.CreateForumTopic(ctx, &telego.CreateForumTopicParams{
 		ChatID: groupTelegramChatID(group.TelegramChatID),
 		Name:   name,
@@ -777,6 +783,9 @@ func (s *Service) CreateChannelTopic(ctx context.Context, groupID, channelID int
 		return errors.New("create topic returned an invalid message thread id")
 	}
 	if err := s.groups.UpdateChannelTopic(groupID, channelID, int64(topic.MessageThreadID)); err != nil {
+		if permissionErr := s.ensureTopicPermission(ctx, group.TelegramChatID); permissionErr != nil {
+			return fmt.Errorf("check topic permission before delete compensation: %w", permissionErr)
+		}
 		cleanupErr := s.api.DeleteForumTopic(ctx, &telego.DeleteForumTopicParams{
 			ChatID:          groupTelegramChatID(group.TelegramChatID),
 			MessageThreadID: int(topic.MessageThreadID),
@@ -789,6 +798,9 @@ func (s *Service) CreateChannelTopic(ctx context.Context, groupID, channelID int
 	}
 	if s.topicRegistry != nil {
 		if err := s.topicRegistry.PersistOwned(groupID, int64(topic.MessageThreadID), name); err != nil {
+			if permissionErr := s.ensureTopicPermission(ctx, group.TelegramChatID); permissionErr != nil {
+				return fmt.Errorf("check topic permission before delete compensation: %w", permissionErr)
+			}
 			rollbackErr := s.groups.UnassignChannel(groupID, channelID)
 			cleanupErr := s.api.DeleteForumTopic(ctx, &telego.DeleteForumTopicParams{
 				ChatID:          groupTelegramChatID(group.TelegramChatID),
@@ -822,6 +834,9 @@ func (s *Service) RenameChannelTopic(ctx context.Context, groupID, channelID int
 	if name == "" {
 		return errors.New("topic name is required")
 	}
+	if err := s.ensureTopicPermission(ctx, chatID); err != nil {
+		return fmt.Errorf("check topic permission before rename: %w", err)
+	}
 	if err := s.api.EditForumTopic(ctx, &telego.EditForumTopicParams{
 		ChatID:          groupTelegramChatID(chatID),
 		MessageThreadID: int(threadID),
@@ -840,6 +855,13 @@ func (s *Service) RemoveChannelTopic(ctx context.Context, groupID, channelID int
 	}
 	if s.groups == nil {
 		return errors.New("group repository is not configured")
+	}
+	group, err := s.groups.GetByID(groupID)
+	if err != nil {
+		return fmt.Errorf("load group: %w", err)
+	}
+	if err := s.ensureTopicPermission(ctx, group.TelegramChatID); err != nil {
+		return fmt.Errorf("check topic permission before removal: %w", err)
 	}
 	s.topicMu.Lock()
 	defer s.topicMu.Unlock()
@@ -872,6 +894,11 @@ func (s *Service) RemoveChannelTopic(ctx context.Context, groupID, channelID int
 	closeCoordinator, coordinated := s.topicRegistry.(forumTopicCloseCoordinator)
 	if registeredTopic != nil && registeredTopic.Closed {
 		return s.groups.UnassignChannel(groupID, channelID)
+	}
+	if registeredTopic == nil || registeredTopic.LifecycleOwned {
+		if err := s.ensureTopicPermission(ctx, chatID); err != nil {
+			return fmt.Errorf("check topic permission before close: %w", err)
+		}
 	}
 	// The initial shared-assignment check deliberately happens before close
 	// intent. A shared removal still continues through the guarded close path
@@ -914,6 +941,9 @@ func (s *Service) RemoveChannelTopic(ctx context.Context, groupID, channelID int
 			}
 		}
 		return nil
+	}
+	if err := s.ensureTopicPermission(ctx, chatID); err != nil {
+		return fmt.Errorf("check topic permission before close: %w", err)
 	}
 	if err := s.api.CloseForumTopic(ctx, &telego.CloseForumTopicParams{
 		ChatID:          groupTelegramChatID(chatID),
@@ -971,6 +1001,10 @@ func (s *Service) ReconcilePendingTopicClosures(ctx context.Context) error {
 			reconcileErr = errors.Join(reconcileErr, fmt.Errorf("load pending topic group %d: %w", topic.GroupID, err))
 			continue
 		}
+		if err := s.ensureTopicPermission(ctx, group.TelegramChatID); err != nil {
+			reconcileErr = errors.Join(reconcileErr, fmt.Errorf("check pending topic permission %d: %w", topic.MessageThreadID, err))
+			continue
+		}
 		assignments, err := s.groups.GetChannelAssignments(topic.GroupID)
 		if err != nil {
 			reconcileErr = errors.Join(reconcileErr, fmt.Errorf("recheck pending topic assignments %d: %w", topic.MessageThreadID, err))
@@ -981,6 +1015,10 @@ func (s *Service) ReconcilePendingTopicClosures(ctx context.Context) error {
 				!errors.Is(err, db.ErrNotFound) {
 				reconcileErr = errors.Join(reconcileErr, fmt.Errorf("cancel pending topic close %d: %w", topic.MessageThreadID, err))
 			}
+			continue
+		}
+		if err := s.ensureTopicPermission(ctx, group.TelegramChatID); err != nil {
+			reconcileErr = errors.Join(reconcileErr, fmt.Errorf("check pending topic permission %d: %w", topic.MessageThreadID, err))
 			continue
 		}
 		if err := s.api.CloseForumTopic(ctx, &telego.CloseForumTopicParams{
@@ -1040,6 +1078,64 @@ func (s *Service) topicAssignment(groupID, channelID int64) (threadID, chatID in
 		}
 	}
 	return 0, 0, db.ErrNotFound
+}
+
+func (s *Service) ensureTopicPermission(ctx context.Context, chatID int64) error {
+	if s == nil || s.api == nil {
+		return errors.New("Telegram permission client is not configured")
+	}
+	if chatID == 0 {
+		return errors.New("forum chat id is invalid")
+	}
+	me, err := s.api.GetMe(ctx)
+	if err != nil {
+		return fmt.Errorf("get bot identity: %w", s.classifyTelegramError(err))
+	}
+	if me == nil || me.ID <= 0 {
+		return errors.New("Telegram bot identity is unknown")
+	}
+	member, err := s.api.GetChatMember(ctx, &telego.GetChatMemberParams{
+		ChatID: groupTelegramChatID(chatID),
+		UserID: me.ID,
+	})
+	if err != nil {
+		return fmt.Errorf("get bot chat member: %w", s.classifyTelegramError(err))
+	}
+	if member == nil {
+		return errors.New("Telegram bot chat member is unknown")
+	}
+	switch typed := member.(type) {
+	case *telego.ChatMemberOwner:
+		if typed.Status == telego.MemberStatusCreator {
+			return nil
+		}
+	case *telego.ChatMemberAdministrator:
+		if typed.Status == telego.MemberStatusAdministrator {
+			if typed.CanManageTopics {
+				return nil
+			}
+			return ErrTopicPermissionDenied
+		}
+	default:
+		return ErrTopicPermissionDenied
+	}
+	return ErrTopicPermissionDenied
+}
+
+// CheckTopicPermission validates the bot's current forum-topic administrator
+// permission for a configured group before the WebApp creates an assignment.
+func (s *Service) CheckTopicPermission(ctx context.Context, groupID int64) error {
+	if s == nil || s.groups == nil {
+		return errors.New("group repository is not configured")
+	}
+	group, err := s.groups.GetByID(groupID)
+	if err != nil {
+		return fmt.Errorf("load group for topic permission: %w", err)
+	}
+	if err := s.ensureTopicPermission(ctx, group.TelegramChatID); err != nil {
+		return fmt.Errorf("check topic permission: %w", err)
+	}
+	return nil
 }
 
 func groupTelegramChatID(id int64) telego.ChatID {

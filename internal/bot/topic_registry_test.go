@@ -73,6 +73,74 @@ func TestProductionTelegramTopicUpdatePersistsUnassignedObservedTopic(t *testing
 	}
 }
 
+func TestProductionTelegramEditedUnknownTopicSeedsObservedRegistry(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+	groupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: -100307,
+		Title:          "Edited topic forum",
+		Status:         model.GroupStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	api := &fakeTelegramClient{}
+	service := newServiceForTest(api, nil)
+	service.groups = store.Groups
+	service.SetForumTopicRegistry(store.ForumTopics)
+
+	update := telego.Update{Message: &telego.Message{
+		MessageID:        1702,
+		MessageThreadID:  1702,
+		Chat:             telego.Chat{ID: -100307, Type: telego.ChatTypeSupergroup},
+		ForumTopicEdited: &telego.ForumTopicEdited{Name: "Edited unknown"},
+	}}
+	if err := service.HandleUpdate(context.Background(), &update); err != nil {
+		t.Fatalf("handle edited topic update: %v", err)
+	}
+	if err := service.HandleUpdate(context.Background(), &update); err != nil {
+		t.Fatalf("handle duplicate edited topic update: %v", err)
+	}
+
+	topic, err := store.ForumTopics.Get(groupID, 1702)
+	if err != nil {
+		t.Fatalf("load observed edited topic: %v", err)
+	}
+	if topic.Name != "Edited unknown" || topic.Status != model.ForumTopicStatusObserved ||
+		topic.LifecycleOwned || topic.Closed || topic.ClosePending {
+		t.Fatalf("observed edited topic = %#v", topic)
+	}
+	var count int
+	if err := store.Conn().QueryRow(
+		`SELECT COUNT(*) FROM forum_topics WHERE group_id = ? AND message_thread_id = ?`,
+		groupID, 1702,
+	).Scan(&count); err != nil {
+		t.Fatalf("count observed edited topics: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("observed edited topic count = %d, want one", count)
+	}
+	catalog := webapp.NewWithProvidersForTesting(store, 0, http.DefaultClient)
+	catalogRequest := httptest.NewRequest(http.MethodGet,
+		"/api/groups/"+strconv.FormatInt(groupID, 10)+"/topics", nil)
+	catalogResponse := httptest.NewRecorder()
+	catalog.Handler().ServeHTTP(catalogResponse, catalogRequest)
+	if catalogResponse.Code != http.StatusOK {
+		t.Fatalf("topic catalog status = %d, body=%s", catalogResponse.Code, catalogResponse.Body.String())
+	}
+	if !strings.Contains(catalogResponse.Body.String(), `"message_thread_id":1702`) ||
+		!strings.Contains(catalogResponse.Body.String(), `"name":"Edited unknown"`) {
+		t.Fatalf("topic catalog = %s, want observed edited topic", catalogResponse.Body.String())
+	}
+	if len(api.topics) != 0 || len(api.closedTopics) != 0 || len(api.deletedTopics) != 0 {
+		t.Fatalf("edited topic lifecycle calls = created:%d closed:%d deleted:%d, want none",
+			len(api.topics), len(api.closedTopics), len(api.deletedTopics))
+	}
+}
+
 func TestOnlyLifecycleOwnedTopicIsClosedOnUnassignment(t *testing.T) {
 	store, err := db.Open(":memory:")
 	if err != nil {

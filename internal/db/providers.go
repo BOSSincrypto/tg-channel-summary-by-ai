@@ -25,13 +25,19 @@ func (r *ProviderRepository) Insert(ap *model.AIProvider) (int64, error) {
 		return 0, fmt.Errorf("encrypt provider API key: %w", err)
 	}
 
+	tx, err := conn.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("begin provider insert: %w", err)
+	}
+	defer tx.Rollback()
+
 	if ap.IsDefault {
-		if _, err := conn.Exec(`UPDATE ai_providers SET is_default = 0`); err != nil {
+		if _, err := tx.Exec(`UPDATE ai_providers SET is_default = 0`); err != nil {
 			return 0, fmt.Errorf("clear existing defaults: %w", err)
 		}
 	}
 
-	result, err := conn.Exec(
+	result, err := tx.Exec(
 		`INSERT INTO ai_providers (name, base_url, api_key, default_model, is_default, version)
 		 VALUES (?, ?, ?, ?, ?, 1)`,
 		ap.Name, ap.BaseURL, encryptedKey, ap.DefaultModel, boolToInt(ap.IsDefault),
@@ -45,6 +51,9 @@ func (r *ProviderRepository) Insert(ap *model.AIProvider) (int64, error) {
 	id, err := result.LastInsertId()
 	if err != nil {
 		return 0, fmt.Errorf("last insert id: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit provider insert: %w", err)
 	}
 	return id, nil
 }

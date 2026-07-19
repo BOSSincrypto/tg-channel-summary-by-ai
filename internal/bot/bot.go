@@ -391,12 +391,18 @@ func (s *Service) observeForumTopicMessage(message *telego.Message) error {
 		}
 		return s.topicRegistry.Observe(group.ID, threadID, name)
 	case message.ForumTopicEdited != nil:
-		if strings.TrimSpace(message.ForumTopicEdited.Name) == "" {
+		name := strings.TrimSpace(message.ForumTopicEdited.Name)
+		if name == "" {
 			return nil
 		}
-		if err := s.topicRegistry.MarkEdited(group.ID, threadID, message.ForumTopicEdited.Name); err != nil &&
-			!errors.Is(err, db.ErrNotFound) {
-			return err
+		if err := s.topicRegistry.MarkEdited(group.ID, threadID, name); err != nil {
+			if !errors.Is(err, db.ErrNotFound) {
+				return err
+			}
+			// Telegram can deliver an edit for a topic observed before the
+			// bot joined or before its registry was initialized. Preserve the
+			// real positive ID and name rather than dropping that catalog item.
+			return s.topicRegistry.Observe(group.ID, threadID, name)
 		}
 	case message.ForumTopicClosed != nil:
 		if err := s.topicRegistry.MarkClosed(group.ID, threadID); err != nil &&
@@ -483,7 +489,7 @@ func (s *Service) accessDeniedMessage() string {
 }
 
 func escapeMarkdownV2(value string) string {
-	const special = `_*[]()~` + "`" + `>#+-=|{}.!`
+	const special = `\_*[]()~` + "`" + `>#+-=|{}.!`
 	var escaped strings.Builder
 	escaped.Grow(len(value))
 	for _, char := range value {

@@ -433,6 +433,60 @@ func TestProviderDefaultTransitionInvalidatesPreviousVersionAtHTTPBoundary(t *te
 	}
 }
 
+func TestProviderDefaultReplacementRollsBackWhenInsertFailsAtHTTPBoundary(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+
+	validation := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer validation.Close()
+
+	server := NewWithProvidersForTesting(store, time.Second, validation.Client())
+	first := doJSON(t, server.Handler(), http.MethodPost, "/api/providers",
+		`{"name":"Stable","base_url":"`+validation.URL+`","api_key":"unit-provider-stable","default_model":"model","is_default":true}`)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("initial provider status = %d, body=%s", first.Code, first.Body.String())
+	}
+
+	if _, err := store.Conn().Exec(`
+		CREATE TRIGGER reject_default_provider_insert
+		BEFORE INSERT ON ai_providers
+		WHEN NEW.is_default = 1
+		BEGIN
+			SELECT RAISE(ABORT, 'injected provider insertion failure');
+		END`); err != nil {
+		t.Fatalf("create insertion failure trigger: %v", err)
+	}
+
+	failed := doJSON(t, server.Handler(), http.MethodPost, "/api/providers",
+		`{"name":"Replacement","base_url":"`+validation.URL+`","api_key":"unit-provider-replacement","default_model":"model","is_default":true}`)
+	if failed.Code != http.StatusBadRequest {
+		t.Fatalf("failed replacement status = %d, want 400, body=%s", failed.Code, failed.Body.String())
+	}
+
+	var defaults, providers int
+	if err := store.Conn().QueryRow(`SELECT COUNT(*) FROM ai_providers WHERE is_default = 1`).Scan(&defaults); err != nil {
+		t.Fatalf("count defaults after failed replacement: %v", err)
+	}
+	if err := store.Conn().QueryRow(`SELECT COUNT(*) FROM ai_providers`).Scan(&providers); err != nil {
+		t.Fatalf("count providers after failed replacement: %v", err)
+	}
+	if defaults != 1 || providers != 1 {
+		t.Fatalf("provider state after failed replacement = providers:%d defaults:%d, want one stable default", providers, defaults)
+	}
+	current, err := store.Providers.GetDefault()
+	if err != nil {
+		t.Fatalf("load default after failed replacement: %v", err)
+	}
+	if current.Name != "Stable" || current.APIKey != "unit-provider-stable" || current.Version != 1 {
+		t.Fatalf("default after failed replacement = %#v, want original provider", current)
+	}
+}
+
 func TestProviderHTTPDuplicateNameIdentifiesNameField(t *testing.T) {
 	store, err := db.Open(":memory:")
 	if err != nil {

@@ -191,7 +191,7 @@ func TestServiceAdminCommandsAuthorizeOwnerAndSendWebAppButton(t *testing.T) {
 
 	message := &telego.Message{
 		Chat: telego.Chat{ID: 123},
-		From: &telego.User{ID: 123, FirstName: "Owner_[test]"},
+		From: &telego.User{ID: 123, FirstName: "Owner_\\[test]"},
 	}
 	for _, command := range []string{"start", "settings"} {
 		service.commands[command](context.Background(), message, "")
@@ -216,7 +216,8 @@ func TestServiceAdminCommandsAuthorizeOwnerAndSendWebAppButton(t *testing.T) {
 		}
 	}
 	if !strings.Contains(api.messages[0].Text, `\_`) ||
-		!strings.Contains(api.messages[0].Text, `\[`) {
+		!strings.Contains(api.messages[0].Text, `\[`) ||
+		!strings.Contains(api.messages[0].Text, `\\`) {
 		t.Fatalf("welcome text did not escape MarkdownV2 dynamic content: %q", api.messages[0].Text)
 	}
 	if api.messages[0].ParseMode != "MarkdownV2" {

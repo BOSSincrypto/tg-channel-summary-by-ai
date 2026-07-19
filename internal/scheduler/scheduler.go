@@ -25,6 +25,10 @@ type windowedDigestRunner interface {
 	GenerateWithWindow(groupID int64, windowID string) (*digest.Digest, error)
 }
 
+// ErrStaleSettingsRefresh reports that a prepared scheduler plan was created
+// against a live registration set that changed before it was applied.
+var ErrStaleSettingsRefresh = errors.New("settings refresh plan is stale")
+
 // GroupSource loads groups and their scheduling configuration.
 type GroupSource interface {
 	List() ([]model.Group, error)
@@ -80,6 +84,16 @@ func WithRefreshFailureHook(hook func() error) Option {
 	}
 }
 
+// WithLifecycleHooks injects deterministic hooks around the shared scheduler
+// lifecycle boundary. Hooks are intended for production-boundary race tests
+// and must not mutate scheduler state.
+func WithLifecycleHooks(before, after func()) Option {
+	return func(s *Scheduler) {
+		s.lifecycleBefore = before
+		s.lifecycleAfter = after
+	}
+}
+
 func withCronEngine(engine cronEngine) Option {
 	return func(s *Scheduler) {
 		s.engine = engine
@@ -93,11 +107,15 @@ type Scheduler struct {
 	engine cronEngine
 
 	mu                 sync.Mutex
+	lifecycleMu        sync.Mutex
 	started            bool
+	generation         uint64
 	jobIDs             map[int64]cron.EntryID
 	jobSpecs           map[int64]string
 	windows            map[string]*scheduledWindow
 	refreshFailureHook func() error
+	lifecycleBefore    func()
+	lifecycleAfter     func()
 }
 
 type scheduledWindow struct {
@@ -110,10 +128,11 @@ type scheduledWindow struct {
 // schedules have been validated, and compensates with the previous schedules
 // if a new registration fails.
 type SettingsRefreshPlan struct {
-	scheduler *Scheduler
-	targets   map[int64]string
-	previous  map[int64]string
-	applied   bool
+	scheduler  *Scheduler
+	targets    map[int64]string
+	previous   map[int64]string
+	generation uint64
+	applied    bool
 }
 
 // New creates a scheduler that can register production digest jobs.
@@ -129,6 +148,30 @@ func New(runner DigestRunner, options ...Option) *Scheduler {
 		option(s)
 	}
 	return s
+}
+
+// WithLifecycle serializes scheduler registration changes and digest starts
+// with group create/delete and settings refresh operations. The lock is held
+// for the complete callback, so a successful deletion can fence a runner
+// before it reaches the injected digest service.
+func (s *Scheduler) WithLifecycle(fn func() error) error {
+	if s == nil {
+		return errors.New("scheduler lifecycle: scheduler is not configured")
+	}
+	if fn == nil {
+		return errors.New("scheduler lifecycle: callback is required")
+	}
+	s.lifecycleMu.Lock()
+	if s.lifecycleBefore != nil {
+		s.lifecycleBefore()
+	}
+	defer func() {
+		if s.lifecycleAfter != nil {
+			s.lifecycleAfter()
+		}
+		s.lifecycleMu.Unlock()
+	}()
+	return fn()
 }
 
 // Start loads configured groups, registers their cron jobs, and starts the
@@ -193,6 +236,7 @@ func (s *Scheduler) Start() error {
 
 	s.jobIDs = registered
 	s.jobSpecs = specByGroup
+	s.generation++
 	s.engine.Start()
 	s.started = true
 	return nil
@@ -262,6 +306,7 @@ func (s *Scheduler) RefreshGroup(groupID int64) error {
 	}
 	s.jobIDs[groupID] = entryID
 	s.jobSpecs[groupID] = spec
+	s.generation++
 	s.mu.Unlock()
 	return nil
 }
@@ -292,9 +337,10 @@ func (s *Scheduler) PrepareSettingsRefresh(settings map[int64]*model.GroupSettin
 		previous[groupID] = spec
 	}
 	return &SettingsRefreshPlan{
-		scheduler: s,
-		targets:   targets,
-		previous:  previous,
+		scheduler:  s,
+		targets:    targets,
+		previous:   previous,
+		generation: s.generation,
 	}, nil
 }
 
@@ -315,6 +361,9 @@ func (p *SettingsRefreshPlan) Apply() error {
 		p.applied = true
 		return nil
 	}
+	if p.generation != s.generation {
+		return fmt.Errorf("apply settings refresh: %w", ErrStaleSettingsRefresh)
+	}
 	if s.refreshFailureHook != nil {
 		if err := s.refreshFailureHook(); err != nil {
 			return fmt.Errorf("apply settings refresh: injected failure: %w", err)
@@ -333,6 +382,8 @@ func (p *SettingsRefreshPlan) Apply() error {
 	if err == nil {
 		s.jobIDs = registered
 		s.jobSpecs = cloneScheduleSpecs(p.targets)
+		s.generation++
+		p.generation = s.generation
 		p.applied = true
 		return nil
 	}
@@ -344,6 +395,7 @@ func (p *SettingsRefreshPlan) Apply() error {
 	if restoreErr == nil {
 		s.jobIDs = restored
 		s.jobSpecs = cloneScheduleSpecs(p.previous)
+		s.generation++
 	}
 	if restoreErr != nil {
 		return fmt.Errorf("apply settings refresh: %w; restore previous schedules: %v", err, restoreErr)
@@ -363,6 +415,9 @@ func (p *SettingsRefreshPlan) Rollback() error {
 	if !p.applied || !s.started {
 		return nil
 	}
+	if p.generation != s.generation {
+		return fmt.Errorf("rollback settings refresh: %w", ErrStaleSettingsRefresh)
+	}
 	for _, jobID := range s.jobIDs {
 		s.engine.Remove(jobID)
 	}
@@ -372,6 +427,8 @@ func (p *SettingsRefreshPlan) Rollback() error {
 	}
 	s.jobIDs = registered
 	s.jobSpecs = cloneScheduleSpecs(p.previous)
+	s.generation++
+	p.generation = s.generation
 	p.applied = false
 	return nil
 }
@@ -423,14 +480,36 @@ func (s *Scheduler) ScheduleForGroup(groupID int64) (string, bool) {
 // eligible to receive messages. Its persisted configuration is untouched so a
 // later re-add can restore the previous assignments.
 func (s *Scheduler) RemoveGroup(groupID int64) {
+	if s == nil {
+		return
+	}
+	_ = s.WithLifecycle(func() error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.removeGroupLocked(groupID)
+		return nil
+	})
+}
+
+// RemoveGroupWithinLifecycle removes a job while the shared lifecycle
+// boundary is already held by the caller.
+func (s *Scheduler) RemoveGroupWithinLifecycle(groupID int64) {
+	if s == nil {
+		return
+	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.removeGroupLocked(groupID)
+}
+
+func (s *Scheduler) removeGroupLocked(groupID int64) {
 	jobID, ok := s.jobIDs[groupID]
 	if ok {
 		delete(s.jobIDs, groupID)
 		delete(s.jobSpecs, groupID)
+		s.generation++
 	}
 	engine := s.engine
-	s.mu.Unlock()
 	if ok {
 		engine.Remove(jobID)
 	}
@@ -443,25 +522,36 @@ func (s *Scheduler) RestoreGroup(groupID int64) error {
 	if s == nil {
 		return errors.New("restore group: scheduler is not configured")
 	}
+	return s.WithLifecycle(func() error {
+		return s.restoreGroupWithinLifecycle(groupID)
+	})
+}
 
+// RestoreGroupWithinLifecycle registers a job while the shared lifecycle
+// boundary is already held by the caller.
+func (s *Scheduler) RestoreGroupWithinLifecycle(groupID int64) error {
+	if s == nil {
+		return errors.New("restore group: scheduler is not configured")
+	}
+	return s.restoreGroupWithinLifecycle(groupID)
+}
+
+func (s *Scheduler) restoreGroupWithinLifecycle(groupID int64) error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.started {
-		s.mu.Unlock()
 		return nil
 	}
 	if _, exists := s.jobIDs[groupID]; exists {
-		s.mu.Unlock()
 		return nil
 	}
 	source := s.groups
 	engine := s.engine
 	if source == nil || engine == nil {
-		s.mu.Unlock()
 		return errors.New("restore group: scheduler dependencies are not configured")
 	}
 	group, err := source.List()
 	if err != nil {
-		s.mu.Unlock()
 		return fmt.Errorf("restore group: list groups: %w", err)
 	}
 	var target *model.Group
@@ -472,21 +562,17 @@ func (s *Scheduler) RestoreGroup(groupID int64) error {
 		}
 	}
 	if target == nil {
-		s.mu.Unlock()
 		return fmt.Errorf("restore group %d: group not found", groupID)
 	}
 	if target.Status != "" && target.Status != model.GroupStatusActive {
-		s.mu.Unlock()
 		return fmt.Errorf("restore group %d: group is not active", groupID)
 	}
 	settings, err := source.GetGroupSettings(groupID)
 	if err != nil {
-		s.mu.Unlock()
 		return fmt.Errorf("restore group: load settings for group %d: %w", groupID, err)
 	}
 	spec, err := scheduleSpec(settings)
 	if err != nil {
-		s.mu.Unlock()
 		return fmt.Errorf("restore group: build schedule for group %d: %w", groupID, err)
 	}
 	entryID, err := engine.AddFunc(spec, func() {
@@ -496,12 +582,11 @@ func (s *Scheduler) RestoreGroup(groupID int64) error {
 		}
 	})
 	if err != nil {
-		s.mu.Unlock()
 		return fmt.Errorf("restore group: register group %d schedule %q: %w", groupID, spec, err)
 	}
 	s.jobIDs[groupID] = entryID
 	s.jobSpecs[groupID] = spec
-	s.mu.Unlock()
+	s.generation++
 	return nil
 }
 
@@ -517,6 +602,20 @@ func (s *Scheduler) RunGroupWithWindow(groupID int64, windowID string) (*digest.
 	if s == nil || s.runner == nil {
 		return nil, errors.New("run group: digest runner is not configured")
 	}
+	var (
+		result *digest.Digest
+		err    error
+	)
+	if lifecycleErr := s.WithLifecycle(func() error {
+		result, err = s.runGroupWithWindow(groupID, windowID)
+		return err
+	}); lifecycleErr != nil {
+		return nil, lifecycleErr
+	}
+	return result, err
+}
+
+func (s *Scheduler) runGroupWithWindow(groupID int64, windowID string) (*digest.Digest, error) {
 	if s.groups != nil {
 		groups, err := s.groups.List()
 		if err != nil {
@@ -533,10 +632,8 @@ func (s *Scheduler) RunGroupWithWindow(groupID int64, windowID string) (*digest.
 			return nil, fmt.Errorf("run group %d: group is not active", groupID)
 		}
 	}
-	var (
-		result *digest.Digest
-		err    error
-	)
+	var result *digest.Digest
+	var err error
 	if runner, ok := s.runner.(windowedDigestRunner); ok {
 		result, err = runner.GenerateWithWindow(groupID, windowID)
 	} else {

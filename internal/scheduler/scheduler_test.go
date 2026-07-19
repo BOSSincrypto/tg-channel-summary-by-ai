@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
 	"github.com/boss/tg-channel-summary-by-ai/internal/digest"
@@ -28,6 +29,25 @@ type windowRecordingRunner struct {
 		groupID  int64
 		windowID string
 	}
+}
+
+type blockingRunner struct {
+	started chan struct{}
+	release chan struct{}
+	calls   chan int64
+}
+
+func (r *blockingRunner) Generate(groupID int64) (*digest.Digest, error) {
+	select {
+	case r.started <- struct{}{}:
+	default:
+	}
+	<-r.release
+	select {
+	case r.calls <- groupID:
+	default:
+	}
+	return &digest.Digest{GroupID: groupID}, nil
 }
 
 func (r *windowRecordingRunner) Generate(groupID int64) (*digest.Digest, error) {
@@ -278,6 +298,112 @@ func TestSchedulerSettingsRefreshCompensatesLateRegistrationFailure(t *testing.T
 	}
 	if len(engine.entries) != 1 {
 		t.Fatalf("entries after compensated failure = %d, want one", len(engine.entries))
+	}
+}
+
+func TestSchedulerRejectsStaleSettingsPlanAfterConcurrentGroupLifecycleMutation(t *testing.T) {
+	engine := newFakeCronEngine()
+	source := &fakeGroupSource{
+		groups: []model.Group{{ID: 1, Status: model.GroupStatusActive}},
+		settings: map[int64]*model.GroupSettings{
+			1: {GroupID: 1, DigestTime: "21:00", Timezone: "UTC"},
+			2: {GroupID: 2, DigestTime: "09:00", Timezone: "UTC"},
+		},
+	}
+	s := New(&fakeRunner{}, WithGroupSource(source), withCronEngine(engine))
+	if err := s.Start(); err != nil {
+		t.Fatalf("start scheduler: %v", err)
+	}
+	defer s.Stop()
+
+	plan, err := s.PrepareSettingsRefresh(map[int64]*model.GroupSettings{
+		1: source.settings[1],
+	})
+	if err != nil {
+		t.Fatalf("prepare settings refresh: %v", err)
+	}
+	source.groups = append(source.groups, model.Group{ID: 2, Status: model.GroupStatusActive})
+	if err := s.RestoreGroup(2); err != nil {
+		t.Fatalf("restore concurrently created group: %v", err)
+	}
+	if err := plan.Apply(); !errors.Is(err, ErrStaleSettingsRefresh) {
+		t.Fatalf("stale plan error = %v, want ErrStaleSettingsRefresh", err)
+	}
+	if _, ok := s.ScheduleForGroup(2); !ok {
+		t.Fatal("stale settings plan removed concurrently created group job")
+	}
+
+	delete(source.settings, 1)
+	source.groups = []model.Group{{ID: 2, Status: model.GroupStatusActive}}
+	s.RemoveGroup(1)
+	if _, ok := s.ScheduleForGroup(1); ok {
+		t.Fatal("deleted group still has a scheduler job")
+	}
+}
+
+func TestSchedulerLifecycleFencesRunAgainstGroupDeletion(t *testing.T) {
+	engine := newFakeCronEngine()
+	runner := &blockingRunner{
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+		calls:   make(chan int64, 1),
+	}
+	source := &fakeGroupSource{
+		groups: []model.Group{{ID: 9, Status: model.GroupStatusActive}},
+		settings: map[int64]*model.GroupSettings{
+			9: {GroupID: 9, DigestTime: "21:00", Timezone: "UTC"},
+		},
+	}
+	s := New(runner, WithGroupSource(source), withCronEngine(engine))
+	if err := s.Start(); err != nil {
+		t.Fatalf("start scheduler: %v", err)
+	}
+	defer s.Stop()
+
+	runDone := make(chan error, 1)
+	go func() {
+		_, err := s.RunGroupWithWindow(9, "delete-fence")
+		runDone <- err
+	}()
+	<-runner.started
+
+	deleteDone := make(chan error, 1)
+	go func() {
+		deleteDone <- s.WithLifecycle(func() error {
+			source.groups = nil
+			s.RemoveGroupWithinLifecycle(9)
+			return nil
+		})
+	}()
+	select {
+	case err := <-deleteDone:
+		t.Fatalf("deletion crossed in-flight runner fence: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(runner.release)
+	if err := <-runDone; err != nil {
+		t.Fatalf("in-flight run: %v", err)
+	}
+	if err := <-deleteDone; err != nil {
+		t.Fatalf("delete lifecycle: %v", err)
+	}
+	select {
+	case groupID := <-runner.calls:
+		if groupID != 9 {
+			t.Fatalf("runner group ID = %d, want 9", groupID)
+		}
+	default:
+		t.Fatal("in-flight runner did not reach runner")
+	}
+
+	if _, err := s.RunGroupWithWindow(9, "after-delete"); err == nil {
+		t.Fatal("run after successful deletion unexpectedly reached runner")
+	}
+	select {
+	case <-runner.calls:
+		t.Fatal("runner invoked after successful deletion")
+	default:
 	}
 }
 

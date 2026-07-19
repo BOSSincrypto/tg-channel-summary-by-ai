@@ -297,30 +297,33 @@ func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Некорректный JSON"})
 			return
 		}
-		group, err := s.groupService.Create(input.ChatID)
+		var group *model.Group
+		err := s.withGroupSchedulerLifecycle(func() error {
+			var err error
+			group, err = s.groupService.Create(input.ChatID)
+			if err != nil {
+				return err
+			}
+			if s.groupScheduler != nil && isForumGroup(*group) {
+				repository, ok := s.groupService.repository.(groupSchedulerRepository)
+				if !ok {
+					return errors.New("group scheduler persistence is not configured")
+				}
+				if err := restoreScheduledGroup(s.groupScheduler, group.ID); err != nil {
+					if recordErr := repository.RecordSchedulerSync(group.ID); recordErr != nil {
+						return fmt.Errorf("register group scheduler: %w; record recovery: %v", err, recordErr)
+					}
+					return fmt.Errorf("register group scheduler: %w", err)
+				}
+				if err := repository.ClearSchedulerSync(group.ID); err != nil {
+					return fmt.Errorf("clear group scheduler recovery: %w", err)
+				}
+			}
+			return nil
+		})
 		if err != nil {
 			writeGroupError(w, err)
 			return
-		}
-		if s.groupScheduler != nil && isForumGroup(*group) {
-			repository, ok := s.groupService.repository.(groupSchedulerRepository)
-			if !ok {
-				writeGroupError(w, errors.New("group scheduler persistence is not configured"))
-				return
-			}
-			if err := s.groupScheduler.RestoreGroup(group.ID); err != nil {
-				if recordErr := repository.RecordSchedulerSync(group.ID); recordErr != nil {
-					err = fmt.Errorf("register group scheduler: %w; record recovery: %v", err, recordErr)
-				} else {
-					err = fmt.Errorf("register group scheduler: %w", err)
-				}
-				writeGroupError(w, err)
-				return
-			}
-			if err := repository.ClearSchedulerSync(group.ID); err != nil {
-				writeGroupError(w, fmt.Errorf("clear group scheduler recovery: %w", err))
-				return
-			}
 		}
 		writeJSON(w, http.StatusCreated, groupJSON(*group, []map[string]any{}))
 	default:
@@ -362,64 +365,64 @@ func (s *Server) handleGroupByID(w http.ResponseWriter, r *http.Request) {
 			writeGroupError(w, errors.New("group deletion locking is not configured"))
 			return
 		}
-		s.groupLifecycleMu.Lock()
-		defer s.groupLifecycleMu.Unlock()
-		group, err := s.groupService.repository.GetByID(id)
-		if err != nil {
-			writeGroupError(w, err)
-			return
-		}
-		if group.Version != input.Version {
-			writeGroupError(w, db.ErrConflict)
-			return
-		}
-		if s.groupScheduler != nil {
-			s.groupScheduler.RemoveGroup(id)
-		}
-		if err := strict.DeleteOptimistic(id, input.Version); err != nil {
-			groupStillExists := true
-			if _, lookupErr := s.groupService.repository.GetByID(id); errors.Is(lookupErr, db.ErrNotFound) {
-				groupStillExists = false
+		err := s.withGroupSchedulerLifecycle(func() error {
+			group, err := s.groupService.repository.GetByID(id)
+			if err != nil {
+				return err
 			}
-			if s.groupScheduler != nil && groupStillExists && isForumGroup(*group) {
-				if restoreErr := s.groupScheduler.RestoreGroup(id); restoreErr != nil {
-					repository, repositoryOK := s.groupService.repository.(groupSchedulerRepository)
-					if repositoryOK {
-						if recordErr := repository.RecordSchedulerSync(id); recordErr != nil {
-							err = fmt.Errorf("%w; restore scheduler: %v; record recovery: %v", err, restoreErr, recordErr)
+			if group.Version != input.Version {
+				return db.ErrConflict
+			}
+			if s.groupScheduler != nil {
+				removeScheduledGroup(s.groupScheduler, id)
+			}
+			if err := strict.DeleteOptimistic(id, input.Version); err != nil {
+				groupStillExists := true
+				if _, lookupErr := s.groupService.repository.GetByID(id); errors.Is(lookupErr, db.ErrNotFound) {
+					groupStillExists = false
+				}
+				if s.groupScheduler != nil && groupStillExists && isForumGroup(*group) {
+					if restoreErr := restoreScheduledGroup(s.groupScheduler, id); restoreErr != nil {
+						repository, repositoryOK := s.groupService.repository.(groupSchedulerRepository)
+						if repositoryOK {
+							if recordErr := repository.RecordSchedulerSync(id); recordErr != nil {
+								err = fmt.Errorf("%w; restore scheduler: %v; record recovery: %v", err, restoreErr, recordErr)
+							} else {
+								err = fmt.Errorf("%w; restore scheduler: %v", err, restoreErr)
+							}
 						} else {
 							err = fmt.Errorf("%w; restore scheduler: %v", err, restoreErr)
 						}
-					} else {
-						err = fmt.Errorf("%w; restore scheduler: %v", err, restoreErr)
 					}
 				}
-			}
-			if !groupStillExists {
-				if repository, ok := s.groupService.repository.(groupSchedulerRepository); ok {
-					if clearErr := repository.ClearSchedulerSync(id); clearErr != nil {
-						if recordErr := repository.RecordSchedulerRemoval(id); recordErr != nil {
-							err = fmt.Errorf("%w; clear scheduler recovery: %v; record removal: %v", err, clearErr, recordErr)
-						} else {
-							err = fmt.Errorf("%w; clear scheduler recovery: %v", err, clearErr)
+				if !groupStillExists {
+					if repository, ok := s.groupService.repository.(groupSchedulerRepository); ok {
+						if clearErr := repository.ClearSchedulerSync(id); clearErr != nil {
+							if recordErr := repository.RecordSchedulerRemoval(id); recordErr != nil {
+								err = fmt.Errorf("%w; clear scheduler recovery: %v; record removal: %v", err, clearErr, recordErr)
+							} else {
+								err = fmt.Errorf("%w; clear scheduler recovery: %v", err, clearErr)
+							}
 						}
 					}
 				}
+				return err
 			}
+			if repository, ok := s.groupService.repository.(groupSchedulerRepository); ok {
+				if err := repository.ClearSchedulerSync(id); err != nil {
+					// The group and its live job are already gone. Keep a durable
+					// removal intent so restart reconciliation can retry cleanup.
+					if recordErr := repository.RecordSchedulerRemoval(id); recordErr != nil {
+						return fmt.Errorf("clear group scheduler recovery: %w; record removal: %v", err, recordErr)
+					}
+					return fmt.Errorf("clear group scheduler recovery: %w", err)
+				}
+			}
+			return nil
+		})
+		if err != nil {
 			writeGroupError(w, err)
 			return
-		}
-		if repository, ok := s.groupService.repository.(groupSchedulerRepository); ok {
-			if err := repository.ClearSchedulerSync(id); err != nil {
-				// The group and its live job are already gone. Keep a durable
-				// removal intent so restart reconciliation can retry cleanup.
-				if recordErr := repository.RecordSchedulerRemoval(id); recordErr != nil {
-					writeGroupError(w, fmt.Errorf("clear group scheduler recovery: %w; record removal: %v", err, recordErr))
-					return
-				}
-				writeGroupError(w, fmt.Errorf("clear group scheduler recovery: %w", err))
-				return
-			}
 		}
 		w.WriteHeader(http.StatusNoContent)
 	default:

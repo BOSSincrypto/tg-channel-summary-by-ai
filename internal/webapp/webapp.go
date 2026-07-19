@@ -60,6 +60,30 @@ type GroupScheduler interface {
 	RemoveGroup(int64)
 }
 
+type groupSchedulerLifecycle interface {
+	WithLifecycle(func() error) error
+}
+
+type groupSchedulerLifecycleMutations interface {
+	RestoreGroupWithinLifecycle(int64) error
+	RemoveGroupWithinLifecycle(int64)
+}
+
+func removeScheduledGroup(scheduler GroupScheduler, groupID int64) {
+	if lifecycle, ok := scheduler.(groupSchedulerLifecycleMutations); ok {
+		lifecycle.RemoveGroupWithinLifecycle(groupID)
+		return
+	}
+	scheduler.RemoveGroup(groupID)
+}
+
+func restoreScheduledGroup(scheduler GroupScheduler, groupID int64) error {
+	if lifecycle, ok := scheduler.(groupSchedulerLifecycleMutations); ok {
+		return lifecycle.RestoreGroupWithinLifecycle(groupID)
+	}
+	return scheduler.RestoreGroup(groupID)
+}
+
 type groupSchedulerRepository interface {
 	RecordSchedulerSync(int64) error
 	RecordSchedulerRemoval(int64) error
@@ -181,6 +205,18 @@ func (s *Server) SetGroupScheduler(scheduler GroupScheduler) {
 	}
 }
 
+func (s *Server) withGroupSchedulerLifecycle(fn func() error) error {
+	if s == nil {
+		return errors.New("group scheduler lifecycle: server is not configured")
+	}
+	if boundary, ok := s.groupScheduler.(groupSchedulerLifecycle); ok {
+		return boundary.WithLifecycle(fn)
+	}
+	s.groupLifecycleMu.Lock()
+	defer s.groupLifecycleMu.Unlock()
+	return fn()
+}
+
 // ReconcileGroupScheduler retries durable group scheduler intents left by a
 // failed create/delete operation. Missing groups are treated as converged
 // deletes, and each successful retry clears its intent.
@@ -191,6 +227,12 @@ func (s *Server) ReconcileGroupScheduler(ctx context.Context) error {
 	if s.groupScheduler == nil {
 		return errors.New("reconcile group scheduler: scheduler is not configured")
 	}
+	return s.withGroupSchedulerLifecycle(func() error {
+		return s.reconcileGroupSchedulerLocked(ctx)
+	})
+}
+
+func (s *Server) reconcileGroupSchedulerLocked(ctx context.Context) error {
 	repository, ok := s.groupService.repository.(groupSchedulerRepository)
 	if !ok {
 		return errors.New("reconcile group scheduler: repository does not support durable intents")
@@ -212,7 +254,7 @@ func (s *Server) ReconcileGroupScheduler(ctx context.Context) error {
 			continue
 		}
 		if kind == "remove" {
-			s.groupScheduler.RemoveGroup(groupID)
+			removeScheduledGroup(s.groupScheduler, groupID)
 			if clearErr := repository.ClearSchedulerSync(groupID); clearErr != nil && firstErr == nil {
 				firstErr = fmt.Errorf("clear removed group %d scheduler intent: %w", groupID, clearErr)
 			}
@@ -220,7 +262,7 @@ func (s *Server) ReconcileGroupScheduler(ctx context.Context) error {
 		}
 		group, getErr := s.groupService.repository.GetByID(groupID)
 		if errors.Is(getErr, db.ErrNotFound) {
-			s.groupScheduler.RemoveGroup(groupID)
+			removeScheduledGroup(s.groupScheduler, groupID)
 			if clearErr := repository.ClearSchedulerSync(groupID); clearErr != nil && firstErr == nil {
 				firstErr = fmt.Errorf("clear deleted group %d scheduler intent: %w", groupID, clearErr)
 			}
@@ -233,13 +275,13 @@ func (s *Server) ReconcileGroupScheduler(ctx context.Context) error {
 			continue
 		}
 		if group.Status != "" && group.Status != model.GroupStatusActive {
-			s.groupScheduler.RemoveGroup(groupID)
+			removeScheduledGroup(s.groupScheduler, groupID)
 			if clearErr := repository.ClearSchedulerSync(groupID); clearErr != nil && firstErr == nil {
 				firstErr = fmt.Errorf("clear inactive group %d scheduler intent: %w", groupID, clearErr)
 			}
 			continue
 		}
-		if restoreErr := s.groupScheduler.RestoreGroup(groupID); restoreErr != nil {
+		if restoreErr := restoreScheduledGroup(s.groupScheduler, groupID); restoreErr != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("restore group %d scheduler job: %w", groupID, restoreErr)
 			}

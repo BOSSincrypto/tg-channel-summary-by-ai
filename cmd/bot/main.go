@@ -212,6 +212,12 @@ func reconcilePendingSettings(ctx context.Context, store *db.DB, sched *schedule
 	}
 	productionSettingsMu.Lock()
 	defer productionSettingsMu.Unlock()
+	return sched.WithLifecycle(func() error {
+		return reconcilePendingSettingsLocked(ctx, store, sched)
+	})
+}
+
+func reconcilePendingSettingsLocked(ctx context.Context, store *db.DB, sched *scheduler.Scheduler) error {
 	pending, err := store.Config.Get(pendingSettingsSyncKey)
 	if errors.Is(err, db.ErrNotFound) {
 		return nil
@@ -265,6 +271,16 @@ func applyProductionSettingsMutation(ctx context.Context, store *db.DB, sched *s
 	}
 	productionSettingsMu.Lock()
 	defer productionSettingsMu.Unlock()
+	var version int64
+	err := sched.WithLifecycle(func() error {
+		var applyErr error
+		version, applyErr = applyProductionSettingsMutationLocked(ctx, store, sched, mutation)
+		return applyErr
+	})
+	return version, err
+}
+
+func applyProductionSettingsMutationLocked(ctx context.Context, store *db.DB, sched *scheduler.Scheduler, mutation webapp.SettingsMutation) (int64, error) {
 	if mutation.Version <= 0 {
 		return 0, db.ErrConflict
 	}

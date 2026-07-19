@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -354,10 +355,197 @@ func TestProductionSettingsBoundarySerializesConcurrentMutations(t *testing.T) {
 	}
 }
 
+func TestProductionSettingsRefreshSerializesConcurrentGroupCreate(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+	groupID, err := store.Groups.Insert(&model.Group{TelegramChatID: -100701, Title: "Existing"})
+	if err != nil {
+		t.Fatalf("insert existing group: %v", err)
+	}
+	if err := store.Groups.UpdateGroupSettings(&model.GroupSettings{GroupID: groupID, DigestTime: "21:00", Timezone: "UTC"}); err != nil {
+		t.Fatalf("seed existing settings: %v", err)
+	}
+	if err := store.Config.Set("webapp_settings", `{"digest_time":"21:00","timezone":"UTC","default_model":"model"}`); err != nil {
+		t.Fatalf("seed WebApp settings: %v", err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	sched := scheduler.New(&testDigestRunner{}, scheduler.WithGroupSource(store.Groups),
+		scheduler.WithLifecycleHooks(func() {
+			once.Do(func() {
+				close(entered)
+				<-release
+			})
+		}, nil))
+	if err := sched.Start(); err != nil {
+		t.Fatalf("start scheduler: %v", err)
+	}
+	defer sched.Stop()
+
+	auth, err := webapp.NewWebAppAuth("unit-bot-token", "715602446")
+	if err != nil {
+		t.Fatalf("create WebApp auth: %v", err)
+	}
+	server := webapp.NewWithProvidersAuthenticated(store, time.Second, http.DefaultClient, auth)
+	server.SetGroupScheduler(sched)
+	server.SetGroupVerifier(productionGroupVerifier{})
+	server.SetSettingsApplier(func(ctx context.Context, mutation webapp.SettingsMutation) (int64, error) {
+		return applyProductionSettingsMutation(ctx, store, sched, mutation)
+	})
+	authHeader := "tma " + signedInitDataForProductionTest("unit-bot-token", "715602446", time.Now())
+
+	putDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		request := httptest.NewRequest(http.MethodPut, "/api/settings",
+			strings.NewReader(`{"digest_time":"09:30","timezone":"UTC","default_model":"model","version":1}`))
+		request.Header.Set("Authorization", authHeader)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, request)
+		putDone <- response
+	}()
+	<-entered
+
+	createDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		request := httptest.NewRequest(http.MethodPost, "/api/groups", strings.NewReader(`{"chat_id":"-100702"}`))
+		request.Header.Set("Authorization", authHeader)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, request)
+		createDone <- response
+	}()
+	select {
+	case response := <-createDone:
+		t.Fatalf("group create crossed settings lifecycle boundary: status=%d body=%s", response.Code, response.Body.String())
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(release)
+	if response := <-putDone; response.Code != http.StatusOK {
+		t.Fatalf("settings PUT status = %d, body=%s", response.Code, response.Body.String())
+	}
+	response := <-createDone
+	if response.Code != http.StatusCreated {
+		t.Fatalf("group create status = %d, body=%s", response.Code, response.Body.String())
+	}
+	created, err := store.Groups.GetByChatID(-100702)
+	if err != nil {
+		t.Fatalf("load concurrently created group: %v", err)
+	}
+	if _, ok := sched.ScheduleForGroup(created.ID); !ok {
+		t.Fatal("concurrently created group has no live scheduler job")
+	}
+	if got, ok := sched.ScheduleForGroup(groupID); !ok || got != "CRON_TZ=UTC 30 9 * * *" {
+		t.Fatalf("existing group schedule = %q, registered=%v", got, ok)
+	}
+}
+
+func TestProductionSettingsRefreshSerializesConcurrentGroupDelete(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+	keepID, err := store.Groups.Insert(&model.Group{TelegramChatID: -100703, Title: "Keep"})
+	if err != nil {
+		t.Fatalf("insert keep group: %v", err)
+	}
+	deleteID, err := store.Groups.Insert(&model.Group{TelegramChatID: -100704, Title: "Delete"})
+	if err != nil {
+		t.Fatalf("insert delete group: %v", err)
+	}
+	for _, groupID := range []int64{keepID, deleteID} {
+		if err := store.Groups.UpdateGroupSettings(&model.GroupSettings{GroupID: groupID, DigestTime: "21:00", Timezone: "UTC"}); err != nil {
+			t.Fatalf("seed group %d settings: %v", groupID, err)
+		}
+	}
+	if err := store.Config.Set("webapp_settings", `{"digest_time":"21:00","timezone":"UTC","default_model":"model"}`); err != nil {
+		t.Fatalf("seed WebApp settings: %v", err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	sched := scheduler.New(&testDigestRunner{}, scheduler.WithGroupSource(store.Groups),
+		scheduler.WithLifecycleHooks(func() {
+			once.Do(func() {
+				close(entered)
+				<-release
+			})
+		}, nil))
+	if err := sched.Start(); err != nil {
+		t.Fatalf("start scheduler: %v", err)
+	}
+	defer sched.Stop()
+	auth, err := webapp.NewWebAppAuth("unit-bot-token", "715602446")
+	if err != nil {
+		t.Fatalf("create WebApp auth: %v", err)
+	}
+	server := webapp.NewWithProvidersAuthenticated(store, time.Second, http.DefaultClient, auth)
+	server.SetGroupScheduler(sched)
+	server.SetGroupVerifier(productionGroupVerifier{})
+	server.SetSettingsApplier(func(ctx context.Context, mutation webapp.SettingsMutation) (int64, error) {
+		return applyProductionSettingsMutation(ctx, store, sched, mutation)
+	})
+	authHeader := "tma " + signedInitDataForProductionTest("unit-bot-token", "715602446", time.Now())
+	putDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		request := httptest.NewRequest(http.MethodPut, "/api/settings",
+			strings.NewReader(`{"digest_time":"10:15","timezone":"UTC","default_model":"model","version":1}`))
+		request.Header.Set("Authorization", authHeader)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, request)
+		putDone <- response
+	}()
+	<-entered
+	deleteDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		request := httptest.NewRequest(http.MethodDelete, "/api/groups/"+strconv.FormatInt(deleteID, 10),
+			strings.NewReader(`{"version":1}`))
+		request.Header.Set("Authorization", authHeader)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, request)
+		deleteDone <- response
+	}()
+	select {
+	case response := <-deleteDone:
+		t.Fatalf("group delete crossed settings lifecycle boundary: status=%d body=%s", response.Code, response.Body.String())
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(release)
+	if response := <-putDone; response.Code != http.StatusOK {
+		t.Fatalf("settings PUT status = %d, body=%s", response.Code, response.Body.String())
+	}
+	if response := <-deleteDone; response.Code != http.StatusNoContent {
+		t.Fatalf("group delete status = %d, body=%s", response.Code, response.Body.String())
+	}
+	if _, err := store.Groups.GetByID(deleteID); !errors.Is(err, db.ErrNotFound) {
+		t.Fatalf("deleted group lookup = %v, want not found", err)
+	}
+	if _, ok := sched.ScheduleForGroup(deleteID); ok {
+		t.Fatal("concurrently deleted group was resurrected by settings refresh")
+	}
+	if got, ok := sched.ScheduleForGroup(keepID); !ok || got != "CRON_TZ=UTC 15 10 * * *" {
+		t.Fatalf("kept group schedule = %q, registered=%v", got, ok)
+	}
+}
+
 type testDigestRunner struct{}
 
 func (*testDigestRunner) Generate(int64) (*digest.Digest, error) {
 	return &digest.Digest{}, nil
+}
+
+type productionGroupVerifier struct{}
+
+func (productionGroupVerifier) Verify(chatID int64) (string, error) {
+	return strconv.FormatInt(chatID, 10), nil
 }
 
 func containsJSONValue(value, expected string) bool {

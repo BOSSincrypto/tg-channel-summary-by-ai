@@ -1035,6 +1035,7 @@
     var selected = field("Группа", "digest-group", "", "select", { choices: choices, required: true });
     form.appendChild(selected.wrap);
     var run = button("Запустить тестовый дайджест", "primary");
+    run.type = "submit";
     var digestActions = el("div", "actions");
     digestActions.appendChild(run);
     form.appendChild(digestActions);

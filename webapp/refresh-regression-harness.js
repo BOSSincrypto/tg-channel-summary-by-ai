@@ -60,6 +60,12 @@ class Element {
     return this.attributes[name];
   }
 
+  removeAttribute(name) {
+    delete this.attributes[name];
+    if (name === "id") this.id = "";
+    if (name === "class") this.className = "";
+  }
+
   addEventListener(type, listener) {
     (this.listeners[type] || (this.listeners[type] = [])).push(listener);
   }
@@ -72,7 +78,12 @@ class Element {
   }
 
   click() {
-    if (!this.disabled) this.dispatchEvent({ type: "click" });
+    if (this.disabled) return;
+    this.dispatchEvent({ type: "click" });
+    if (this.type === "submit") {
+      const form = this.closest("form");
+      if (form) form.requestSubmit();
+    }
   }
 
   focus() {
@@ -439,12 +450,101 @@ async function testTimezoneFocusShowsCatalogAndTypingFilters() {
   assert(timezoneDropdown.hidden, "Timezone catalog stayed open after selection");
 }
 
+async function testDigestRunButtonSubmitsAndPollsTypedOutcomes() {
+  const app = makeApp();
+  const channels = app.findPending("/api/channels");
+  app.resolve(channels, []);
+  await settle();
+
+  const digestTab = app.document.querySelectorAll("button").find((button) =>
+    button.children.some((child) => child.textContent === "Тест дайджеста")
+  );
+  assert(digestTab, "Test Digest tab was not rendered");
+  digestTab.click();
+  const groups = app.findPending("/api/groups?with_channels=true");
+  app.resolve(groups, [{
+    id: 7,
+    version: 1,
+    telegram_chat_id: "-1007",
+    title: "Forum",
+    is_forum: true,
+    assignments: [{ channel_id: 11, username: "alpha" }]
+  }]);
+  await settle();
+
+  const run = app.document.querySelectorAll("button").find((button) =>
+    button.textContent === "Запустить тестовый дайджест"
+  );
+  const groupSelect = app.document.querySelector("#digest-group");
+  assert(run && groupSelect, "Digest form controls were not rendered");
+  run.click();
+  const validation = app.document.querySelector("#digest-group-error");
+  assert(validation && validation.textContent === "Выберите группу.", "Missing group was not validated visibly");
+  assert(groupSelect.getAttribute("aria-invalid") === "true", "Missing group did not set aria-invalid");
+  assert(!app.document.querySelector('[role="dialog"]'), "Confirmation opened before selecting a group");
+
+  groupSelect.value = "7";
+  run.click();
+  const confirmation = app.document.querySelector('[role="dialog"]');
+  assert(confirmation, "Digest confirmation did not open from the visible button click");
+  const confirmButton = confirmation.querySelectorAll("button").find((button) => button.textContent === "Запустить");
+  assert(confirmButton, "Digest confirmation action was not rendered");
+  confirmButton.click();
+
+  const submission = app.findPending("/api/digest/test", "POST");
+  assert(submission.body.group_id === "7", "Digest submission did not send the selected group ID");
+  app.resolve(submission, { job_id: "job-1" }, 202);
+  await settle();
+  const status = app.findPending("/api/digest/status?id=job-1");
+  app.resolve(status, {
+    stage: "completed",
+    outcome: "partial",
+    post_count: 2,
+    channel_count: 1,
+    failed_channels: ["beta"],
+    failure_details: ["beta недоступен"]
+  });
+  await settle();
+  assert(app.document.querySelector(".digest-result").textContent.includes("Дайджест отправлен частично"), "Polling did not render the typed partial outcome");
+
+  const outcomes = [
+    ["succeeded", "Дайджест отправлен!"],
+    ["no_posts", "Нет новых постов"],
+    ["partial", "Дайджест отправлен частично"],
+    ["all_channels_failed", "Не удалось собрать посты"],
+    ["ai_failed", "Ошибка суммаризации"],
+    ["delivery_failed", "Ошибка отправки"]
+  ];
+  for (const [outcome, expectedText] of outcomes) {
+    run.click();
+    const modal = app.document.querySelector('[role="dialog"]');
+    assert(modal, `Confirmation did not open for ${outcome}`);
+    modal.querySelectorAll("button").find((button) => button.textContent === "Запустить").click();
+    const request = app.findPending("/api/digest/test", "POST");
+    app.resolve(request, { job_id: `job-${outcome}` }, 202);
+    await settle();
+    const result = app.findPending(`/api/digest/status?id=job-${outcome}`);
+    app.resolve(result, {
+      stage: "completed",
+      outcome,
+      post_count: outcome === "no_posts" ? 0 : 2,
+      channel_count: 1,
+      failed_channels: outcome === "partial" || outcome === "all_channels_failed" ? ["alpha"] : [],
+      failure_details: outcome === "partial" ? ["alpha недоступен"] : [],
+      detail: outcome === "ai_failed" ? "Провайдер недоступен" : outcome === "delivery_failed" ? "Telegram отказал" : ""
+    });
+    await settle();
+    assert(app.document.querySelector(".digest-result").textContent.includes(expectedText), `Typed ${outcome} outcome was not rendered`);
+  }
+}
+
 async function run() {
   await testChannelToggleUsesStableID();
   await testGroupRefreshSuppressesStaleGeneration();
   await testAssignmentReusesNewestGroupVersion();
   await testTimezoneFocusShowsCatalogAndTypingFilters();
-  console.log("WebApp refresh regression harness passed: stable IDs, stale generations, newest optimistic versions, timezone focus catalog.");
+  await testDigestRunButtonSubmitsAndPollsTypedOutcomes();
+  console.log("WebApp regression harness passed: stable IDs, stale generations, newest optimistic versions, timezone catalog, digest click and typed outcomes.");
 }
 
 run().catch((error) => {

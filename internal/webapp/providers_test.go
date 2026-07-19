@@ -3,6 +3,7 @@ package webapp
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +13,129 @@ import (
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
 )
+
+type providerValidationTransport struct {
+	requests []*http.Request
+	status   int
+}
+
+func (t *providerValidationTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	t.requests = append(t.requests, request.Clone(request.Context()))
+	status := t.status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	body := `{"choices":[{"message":{"content":"ok"}}]}`
+	if status != http.StatusOK {
+		body = `{"error":{"message":"invalid API key"}}`
+	}
+	return &http.Response{
+		StatusCode: status,
+		Status:     http.StatusText(status),
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    request,
+	}, nil
+}
+
+func TestAuthenticatedProviderAPIRequiresHTTPSBeforeTransportAndPersistsHTTPSProvider(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+
+	transport := &providerValidationTransport{}
+	client := &http.Client{Transport: transport}
+	auth, err := NewWebAppAuth("unit-bot-token", "715602446")
+	if err != nil {
+		t.Fatalf("create auth: %v", err)
+	}
+	server := NewWithProvidersAuthenticated(store, time.Second, client, auth)
+	postProvider := func(baseURL, key string) *httptest.ResponseRecorder {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodPost, "/api/providers", strings.NewReader(
+			`{"name":"Injected-`+key+`","base_url":"`+baseURL+`","api_key":"`+key+`","default_model":"model"}`,
+		))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set(initDataHeader, signedInitData("unit-bot-token", "715602446", time.Now()))
+		recorder := httptest.NewRecorder()
+		server.Handler().ServeHTTP(recorder, request)
+		return recorder
+	}
+
+	insecure := postProvider("http://provider.example.test/v1", "cleartext-key")
+	if insecure.Code != http.StatusBadRequest {
+		t.Fatalf("HTTP provider status = %d, want 400, body=%s", insecure.Code, insecure.Body.String())
+	}
+	if len(transport.requests) != 0 {
+		t.Fatalf("HTTP provider validation made %d transport requests, want zero", len(transport.requests))
+	}
+	var count int
+	if err := store.Conn().QueryRow(`SELECT COUNT(*) FROM ai_providers`).Scan(&count); err != nil {
+		t.Fatalf("count providers after HTTP rejection: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("provider count after HTTP rejection = %d, want zero", count)
+	}
+
+	secure := postProvider("https://provider.example.test/v1", "https-key")
+	if secure.Code != http.StatusCreated {
+		t.Fatalf("HTTPS provider status = %d, want 201, body=%s", secure.Code, secure.Body.String())
+	}
+	if len(transport.requests) != 1 {
+		t.Fatalf("HTTPS provider validation made %d transport requests, want one", len(transport.requests))
+	}
+	request := transport.requests[0]
+	if request.URL.Scheme != "https" {
+		t.Fatalf("validated request scheme = %q, want https", request.URL.Scheme)
+	}
+	if got := request.Header.Get("Authorization"); got != "Bearer https-key" {
+		t.Fatalf("HTTPS authorization header = %q, want HTTPS key", got)
+	}
+	if err := store.Conn().QueryRow(`SELECT COUNT(*) FROM ai_providers`).Scan(&count); err != nil {
+		t.Fatalf("count providers after HTTPS validation: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("provider count after HTTPS validation = %d, want one", count)
+	}
+
+	updateRequest := httptest.NewRequest(http.MethodPatch, "/api/providers/1", strings.NewReader(
+		`{"name":"Updated","base_url":"http://provider.example.test/v1","api_key":"update-key","default_model":"model","version":1}`,
+	))
+	updateRequest.Header.Set("Content-Type", "application/json")
+	updateRequest.Header.Set(initDataHeader, signedInitData("unit-bot-token", "715602446", time.Now()))
+	updateRecorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(updateRecorder, updateRequest)
+	if updateRecorder.Code != http.StatusBadRequest {
+		t.Fatalf("HTTP provider update status = %d, want 400, body=%s", updateRecorder.Code, updateRecorder.Body.String())
+	}
+	if len(transport.requests) != 1 {
+		t.Fatalf("HTTP provider update made %d total transport requests, want one", len(transport.requests))
+	}
+	current, err := store.Providers.GetByID(1)
+	if err != nil {
+		t.Fatalf("load provider after HTTP update rejection: %v", err)
+	}
+	if current.Name != "Injected-https-key" || current.APIKey != "https-key" {
+		t.Fatalf("HTTP provider update changed persisted provider: %#v", current)
+	}
+
+	transport.status = http.StatusUnauthorized
+	failed := postProvider("https://provider.example.test/v1", "failed-key")
+	if failed.Code != http.StatusBadRequest {
+		t.Fatalf("failed HTTPS provider status = %d, want 400, body=%s", failed.Code, failed.Body.String())
+	}
+	if len(transport.requests) != 2 {
+		t.Fatalf("failed HTTPS validation made %d total transport requests, want two", len(transport.requests))
+	}
+	if err := store.Conn().QueryRow(`SELECT COUNT(*) FROM ai_providers`).Scan(&count); err != nil {
+		t.Fatalf("count providers after failed HTTPS validation: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("provider count after failed HTTPS validation = %d, want one", count)
+	}
+}
 
 func TestProviderServiceCreateMasksAPIKeyAndPersistsEncryptedSecret(t *testing.T) {
 	store, err := db.Open(":memory:")

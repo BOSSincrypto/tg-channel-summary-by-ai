@@ -55,7 +55,7 @@ type strictProviderRepository interface {
 	DeleteOptimistic(int64, int64) error
 }
 
-// NewProviderService creates a provider service using a bounded test request.
+// NewProviderService creates a provider service using a bounded validation request.
 func NewProviderService(repository providerRepository, client *http.Client) *ProviderService {
 	if client == nil {
 		client = &http.Client{}
@@ -67,8 +67,9 @@ func NewProviderService(repository providerRepository, client *http.Client) *Pro
 	}
 }
 
-// NewProviderServiceForTesting permits loopback httptest endpoints. Production
-// handlers must use NewProviderService so provider validation remains SSRF-safe.
+// NewProviderServiceForTesting permits loopback HTTP test endpoints. Production
+// handlers must use NewProviderService so provider validation remains HTTPS-only
+// and SSRF-safe.
 func NewProviderServiceForTesting(repository providerRepository, client *http.Client) *ProviderService {
 	service := NewProviderService(repository, client)
 	service.allowPrivateHosts = true
@@ -79,7 +80,7 @@ func (s *ProviderService) Create(ctx context.Context, input ProviderInput) (*mod
 	if s == nil || s.repository == nil {
 		return nil, errors.New("provider service is not configured")
 	}
-	if err := validateProviderInput(input); err != nil {
+	if err := validateProviderInput(input, s.allowPrivateHosts); err != nil {
 		return nil, err
 	}
 	if err := s.ensureUniqueName(input.Name, 0); err != nil {
@@ -110,7 +111,7 @@ func (s *ProviderService) Update(ctx context.Context, id int64, input ProviderIn
 	if input.Version <= 0 {
 		return nil, fmt.Errorf("provider version: %w", db.ErrConflict)
 	}
-	if err := validateProviderInput(input); err != nil {
+	if err := validateProviderInput(input, s.allowPrivateHosts); err != nil {
 		return nil, err
 	}
 	existing, err := s.repository.GetByID(id)
@@ -233,7 +234,7 @@ func providerJSON(provider model.AIProvider) map[string]any {
 	}
 }
 
-func validateProviderInput(input ProviderInput) error {
+func validateProviderInput(input ProviderInput, allowInsecureHTTP ...bool) error {
 	if strings.TrimSpace(input.Name) == "" {
 		return errors.New("provider name is required")
 	}
@@ -241,8 +242,10 @@ func validateProviderInput(input ProviderInput) error {
 		return errors.New("provider name is too long")
 	}
 	parsed, err := url.Parse(strings.TrimSpace(input.BaseURL))
-	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-		return errors.New("provider base_url must be a valid http or https URL")
+	allowHTTP := len(allowInsecureHTTP) > 0 && allowInsecureHTTP[0]
+	if err != nil || parsed.Host == "" || parsed.User != nil ||
+		(parsed.Scheme != "https" && !(allowHTTP && parsed.Scheme == "http")) {
+		return errors.New("provider base_url must be a valid HTTPS URL")
 	}
 	if providerModel(input) == "" {
 		return errors.New("provider model is required")

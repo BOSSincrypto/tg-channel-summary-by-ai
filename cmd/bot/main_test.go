@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -98,6 +99,9 @@ func TestProductionSettingsBoundaryPersistsAndRefreshesForTelegramAndHTTP(t *tes
 	}); err != nil {
 		t.Fatalf("update group settings: %v", err)
 	}
+	if err := store.Config.Set("webapp_settings", `{"digest_time":"21:00","timezone":"Europe/Moscow","default_model":"openai/gpt-oss-120b"}`); err != nil {
+		t.Fatalf("seed WebApp settings: %v", err)
+	}
 
 	runner := &testDigestRunner{}
 	sched := scheduler.New(runner, scheduler.WithGroupSource(store.Groups))
@@ -106,7 +110,7 @@ func TestProductionSettingsBoundaryPersistsAndRefreshesForTelegramAndHTTP(t *tes
 	}
 	defer sched.Stop()
 
-	settings := bot.BotSettings{DigestTime: "09:30", Channels: []string{"@news"}}
+	settings := bot.BotSettings{DigestTime: "09:30", Channels: []string{"@news"}, Version: 1}
 	if err := applyProductionSettings(context.Background(), store, sched, settings); err != nil {
 		t.Fatalf("apply production settings: %v", err)
 	}
@@ -177,6 +181,176 @@ func TestProductionSettingsBoundaryPersistsAndRefreshesForTelegramAndHTTP(t *tes
 	}
 	if got, ok := sched.ScheduleForGroup(groupID); !ok || got != "CRON_TZ=Asia/Tokyo 45 10 * * *" {
 		t.Fatalf("HTTP-updated scheduler schedule = %q, registered=%v", got, ok)
+	}
+}
+
+func TestProductionSettingsBoundaryReconcilesLateSchedulerFailureAfterRestart(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+
+	groupID, err := store.Groups.Insert(&model.Group{TelegramChatID: -1005, Title: "Recovery group"})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	if err := store.Groups.UpdateGroupSettings(&model.GroupSettings{
+		GroupID: groupID, DigestTime: "21:00", Timezone: "UTC",
+	}); err != nil {
+		t.Fatalf("seed group settings: %v", err)
+	}
+	if err := store.Config.Set("webapp_settings", `{"digest_time":"21:00","timezone":"UTC","default_model":"model"}`); err != nil {
+		t.Fatalf("seed WebApp settings: %v", err)
+	}
+	failRefresh := true
+	sched := scheduler.New(&testDigestRunner{}, scheduler.WithGroupSource(store.Groups),
+		scheduler.WithRefreshFailureHook(func() error {
+			if failRefresh {
+				return errors.New("late scheduler failure")
+			}
+			return nil
+		}))
+	if err := sched.Start(); err != nil {
+		t.Fatalf("start scheduler: %v", err)
+	}
+	defer sched.Stop()
+
+	if _, err := applyProductionSettingsMutation(context.Background(), store, sched, webapp.SettingsMutation{
+		DigestTime: "09:30", Timezone: "UTC", DefaultModel: "model", Version: 1,
+	}); err == nil {
+		t.Fatal("settings update succeeded despite late scheduler failure")
+	}
+	if got, ok := sched.ScheduleForGroup(groupID); !ok || got != "CRON_TZ=UTC 0 21 * * *" {
+		t.Fatalf("scheduler after failed update = %q, registered=%v, want old schedule", got, ok)
+	}
+	if _, err := store.Config.Get("webapp_settings_sync_pending"); err != nil {
+		t.Fatalf("pending settings intent missing: %v", err)
+	}
+	value, version, err := store.Config.GetWithVersion("webapp_settings")
+	if err != nil {
+		t.Fatalf("load committed settings: %v", err)
+	}
+	if !containsJSONValue(value, "09:30") || version != 2 {
+		t.Fatalf("committed settings = %q version %d, want new value version 2", value, version)
+	}
+
+	failRefresh = false
+	if err := reconcilePendingSettings(context.Background(), store, sched); err != nil {
+		t.Fatalf("reconcile pending settings: %v", err)
+	}
+	if got, ok := sched.ScheduleForGroup(groupID); !ok || got != "CRON_TZ=UTC 30 9 * * *" {
+		t.Fatalf("scheduler after reconciliation = %q, registered=%v, want new schedule", got, ok)
+	}
+	if _, err := store.Config.Get("webapp_settings_sync_pending"); !errors.Is(err, db.ErrNotFound) {
+		t.Fatalf("pending settings after reconciliation = %v, want not found", err)
+	}
+}
+
+func TestProductionSettingsBoundaryRejectsMissingVersionWithoutSideEffects(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+	groupID, err := store.Groups.Insert(&model.Group{TelegramChatID: -1006, Title: "Version group"})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	if err := store.Groups.UpdateGroupSettings(&model.GroupSettings{
+		GroupID: groupID, DigestTime: "21:00", Timezone: "UTC",
+	}); err != nil {
+		t.Fatalf("seed group settings: %v", err)
+	}
+	if err := store.Config.Set("webapp_settings", `{"digest_time":"21:00","timezone":"UTC","default_model":"model"}`); err != nil {
+		t.Fatalf("seed WebApp settings: %v", err)
+	}
+	sched := scheduler.New(&testDigestRunner{}, scheduler.WithGroupSource(store.Groups))
+	if err := sched.Start(); err != nil {
+		t.Fatalf("start scheduler: %v", err)
+	}
+	defer sched.Stop()
+
+	if _, err := applyProductionSettingsMutation(context.Background(), store, sched, webapp.SettingsMutation{
+		DigestTime: "09:30", Timezone: "UTC", DefaultModel: "model",
+	}); !errors.Is(err, db.ErrConflict) {
+		t.Fatalf("missing version error = %v, want conflict", err)
+	}
+	value, version, err := store.Config.GetWithVersion("webapp_settings")
+	if err != nil {
+		t.Fatalf("load settings after rejected version: %v", err)
+	}
+	if !containsJSONValue(value, "21:00") || version != 1 {
+		t.Fatalf("settings after rejected version = %q version %d", value, version)
+	}
+	if _, err := store.Config.Get(pendingSettingsSyncKey); !errors.Is(err, db.ErrNotFound) {
+		t.Fatalf("pending sync after rejected version = %v", err)
+	}
+	if got, ok := sched.ScheduleForGroup(groupID); !ok || got != "CRON_TZ=UTC 0 21 * * *" {
+		t.Fatalf("scheduler after rejected version = %q, registered=%v", got, ok)
+	}
+}
+
+func TestProductionSettingsBoundarySerializesConcurrentMutations(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+	groupID, err := store.Groups.Insert(&model.Group{TelegramChatID: -1007, Title: "Concurrent group"})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	if err := store.Groups.UpdateGroupSettings(&model.GroupSettings{
+		GroupID: groupID, DigestTime: "21:00", Timezone: "UTC",
+	}); err != nil {
+		t.Fatalf("seed group settings: %v", err)
+	}
+	if err := store.Config.Set("webapp_settings", `{"digest_time":"21:00","timezone":"UTC","default_model":"model"}`); err != nil {
+		t.Fatalf("seed WebApp settings: %v", err)
+	}
+	sched := scheduler.New(&testDigestRunner{}, scheduler.WithGroupSource(store.Groups))
+	if err := sched.Start(); err != nil {
+		t.Fatalf("start scheduler: %v", err)
+	}
+	defer sched.Stop()
+
+	results := make(chan error, 2)
+	for _, digestTime := range []string{"09:00", "10:00"} {
+		go func(digestTime string) {
+			_, applyErr := applyProductionSettingsMutation(context.Background(), store, sched, webapp.SettingsMutation{
+				DigestTime: digestTime, Timezone: "UTC", DefaultModel: "model", Version: 1,
+			})
+			results <- applyErr
+		}(digestTime)
+	}
+	var succeeded, conflicts int
+	for range 2 {
+		switch applyErr := <-results; {
+		case applyErr == nil:
+			succeeded++
+		case errors.Is(applyErr, db.ErrConflict):
+			conflicts++
+		default:
+			t.Fatalf("concurrent settings error = %v", applyErr)
+		}
+	}
+	if succeeded != 1 || conflicts != 1 {
+		t.Fatalf("concurrent results = succeeded:%d conflicts:%d, want one each", succeeded, conflicts)
+	}
+	_, version, err := store.Config.GetWithVersion("webapp_settings")
+	if err != nil {
+		t.Fatalf("load concurrent settings: %v", err)
+	}
+	if version != 2 {
+		t.Fatalf("concurrent settings version = %d, want 2", version)
+	}
+	if _, err := store.Config.Get(pendingSettingsSyncKey); !errors.Is(err, db.ErrNotFound) {
+		t.Fatalf("concurrent pending sync = %v, want not found", err)
+	}
+	schedule, ok := sched.ScheduleForGroup(groupID)
+	if !ok || (schedule != "CRON_TZ=UTC 0 9 * * *" && schedule != "CRON_TZ=UTC 0 10 * * *") {
+		t.Fatalf("concurrent scheduler schedule = %q, registered=%v", schedule, ok)
 	}
 }
 

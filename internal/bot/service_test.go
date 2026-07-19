@@ -385,7 +385,7 @@ func TestServiceHandlesWebAppDataValidation(t *testing.T) {
 	api.updates <- telego.Update{Message: &telego.Message{
 		Chat:       telego.Chat{ID: 123},
 		From:       &telego.User{ID: 123},
-		WebAppData: &telego.WebAppData{Data: `{"digest_time":"21:00","channels":[]}`},
+		WebAppData: &telego.WebAppData{Data: `{"digest_time":"21:00","channels":[],"version":1}`},
 	}}
 	close(api.updates)
 

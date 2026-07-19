@@ -72,6 +72,14 @@ func WithGroupSource(source GroupSource) Option {
 	}
 }
 
+// WithRefreshFailureHook injects a refresh failure before live registrations
+// are changed. It is intended for production-boundary failure tests.
+func WithRefreshFailureHook(hook func() error) Option {
+	return func(s *Scheduler) {
+		s.refreshFailureHook = hook
+	}
+}
+
 func withCronEngine(engine cronEngine) Option {
 	return func(s *Scheduler) {
 		s.engine = engine
@@ -84,16 +92,28 @@ type Scheduler struct {
 	groups GroupSource
 	engine cronEngine
 
-	mu       sync.Mutex
-	started  bool
-	jobIDs   map[int64]cron.EntryID
-	jobSpecs map[int64]string
-	windows  map[string]*scheduledWindow
+	mu                 sync.Mutex
+	started            bool
+	jobIDs             map[int64]cron.EntryID
+	jobSpecs           map[int64]string
+	windows            map[string]*scheduledWindow
+	refreshFailureHook func() error
 }
 
 type scheduledWindow struct {
 	id        string
 	remaining int
+}
+
+// SettingsRefreshPlan is a prepared replacement for the live scheduler
+// registrations. Apply removes the old registrations only after all target
+// schedules have been validated, and compensates with the previous schedules
+// if a new registration fails.
+type SettingsRefreshPlan struct {
+	scheduler *Scheduler
+	targets   map[int64]string
+	previous  map[int64]string
+	applied   bool
 }
 
 // New creates a scheduler that can register production digest jobs.
@@ -244,6 +264,146 @@ func (s *Scheduler) RefreshGroup(groupID int64) error {
 	s.jobSpecs[groupID] = spec
 	s.mu.Unlock()
 	return nil
+}
+
+// PrepareSettingsRefresh validates the complete desired active-group schedule
+// set without changing the live scheduler. The returned plan can be applied
+// after a database transaction commits.
+func (s *Scheduler) PrepareSettingsRefresh(settings map[int64]*model.GroupSettings) (*SettingsRefreshPlan, error) {
+	if s == nil {
+		return nil, errors.New("prepare settings refresh: scheduler is not configured")
+	}
+	targets := make(map[int64]string, len(settings))
+	for groupID, groupSettings := range settings {
+		if groupID <= 0 {
+			return nil, errors.New("prepare settings refresh: group ID must be positive")
+		}
+		spec, err := scheduleSpec(groupSettings)
+		if err != nil {
+			return nil, fmt.Errorf("prepare settings refresh: group %d: %w", groupID, err)
+		}
+		targets[groupID] = spec
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous := make(map[int64]string, len(s.jobSpecs))
+	for groupID, spec := range s.jobSpecs {
+		previous[groupID] = spec
+	}
+	return &SettingsRefreshPlan{
+		scheduler: s,
+		targets:   targets,
+		previous:  previous,
+	}, nil
+}
+
+// Apply replaces the live registrations represented by a prepared settings
+// plan. If registration fails, it restores the previous schedule set when
+// possible and returns the original failure.
+func (p *SettingsRefreshPlan) Apply() error {
+	if p == nil || p.scheduler == nil {
+		return errors.New("apply settings refresh: plan is not configured")
+	}
+	s := p.scheduler
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if p.applied {
+		return nil
+	}
+	if !s.started {
+		p.applied = true
+		return nil
+	}
+	if s.refreshFailureHook != nil {
+		if err := s.refreshFailureHook(); err != nil {
+			return fmt.Errorf("apply settings refresh: injected failure: %w", err)
+		}
+	}
+
+	removed := make([]cron.EntryID, 0, len(s.jobIDs))
+	for _, jobID := range s.jobIDs {
+		removed = append(removed, jobID)
+		s.engine.Remove(jobID)
+	}
+	s.jobIDs = make(map[int64]cron.EntryID)
+	s.jobSpecs = make(map[int64]string)
+
+	registered, err := s.addSchedulesLocked(p.targets)
+	if err == nil {
+		s.jobIDs = registered
+		s.jobSpecs = cloneScheduleSpecs(p.targets)
+		p.applied = true
+		return nil
+	}
+
+	for _, jobID := range registered {
+		s.engine.Remove(jobID)
+	}
+	restored, restoreErr := s.addSchedulesLocked(p.previous)
+	if restoreErr == nil {
+		s.jobIDs = restored
+		s.jobSpecs = cloneScheduleSpecs(p.previous)
+	}
+	if restoreErr != nil {
+		return fmt.Errorf("apply settings refresh: %w; restore previous schedules: %v", err, restoreErr)
+	}
+	return fmt.Errorf("apply settings refresh: %w", err)
+}
+
+// Rollback restores the schedule set captured before Apply. It is idempotent
+// and gives callers an explicit compensation seam for late failures.
+func (p *SettingsRefreshPlan) Rollback() error {
+	if p == nil || p.scheduler == nil {
+		return errors.New("rollback settings refresh: plan is not configured")
+	}
+	s := p.scheduler
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !p.applied || !s.started {
+		return nil
+	}
+	for _, jobID := range s.jobIDs {
+		s.engine.Remove(jobID)
+	}
+	registered, err := s.addSchedulesLocked(p.previous)
+	if err != nil {
+		return fmt.Errorf("rollback settings refresh: %w", err)
+	}
+	s.jobIDs = registered
+	s.jobSpecs = cloneScheduleSpecs(p.previous)
+	p.applied = false
+	return nil
+}
+
+func (s *Scheduler) addSchedulesLocked(specs map[int64]string) (map[int64]cron.EntryID, error) {
+	bySpec := make(map[string]int)
+	for _, spec := range specs {
+		bySpec[spec]++
+	}
+	registered := make(map[int64]cron.EntryID, len(specs))
+	for groupID, spec := range specs {
+		id := groupID
+		entryID, err := s.engine.AddFunc(spec, func() {
+			windowID := s.nextScheduledWindow(spec, bySpec[spec])
+			if _, runErr := s.RunGroupWithWindow(id, windowID); runErr != nil {
+				log.Printf("scheduler group %d failed: %v", id, runErr)
+			}
+		})
+		if err != nil {
+			return registered, fmt.Errorf("register group %d schedule %q: %w", groupID, spec, err)
+		}
+		registered[groupID] = entryID
+	}
+	return registered, nil
+}
+
+func cloneScheduleSpecs(specs map[int64]string) map[int64]string {
+	cloned := make(map[int64]string, len(specs))
+	for groupID, spec := range specs {
+		cloned[groupID] = spec
+	}
+	return cloned
 }
 
 // ScheduleForGroup exposes the active cron specification for integration

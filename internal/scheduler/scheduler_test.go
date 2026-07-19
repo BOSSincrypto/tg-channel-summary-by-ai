@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -92,6 +93,7 @@ type fakeCronEngine struct {
 	nextID   cron.EntryID
 	startCnt int
 	stopCnt  int
+	addErr   error
 }
 
 func newFakeCronEngine() *fakeCronEngine {
@@ -99,6 +101,11 @@ func newFakeCronEngine() *fakeCronEngine {
 }
 
 func (f *fakeCronEngine) AddFunc(spec string, cmd func()) (cron.EntryID, error) {
+	if f.addErr != nil {
+		err := f.addErr
+		f.addErr = nil
+		return 0, err
+	}
 	f.nextID++
 	f.entries[f.nextID] = fakeCronEntry{spec: spec, cmd: cmd}
 	return f.nextID, nil
@@ -239,6 +246,38 @@ func TestSchedulerRefreshGroupReplacesScheduleInSharedInstance(t *testing.T) {
 	}
 	if got, ok := s.ScheduleForGroup(8); !ok || got != "CRON_TZ=UTC 30 9 * * *" {
 		t.Fatalf("refreshed schedule = %q, registered=%v", got, ok)
+	}
+}
+
+func TestSchedulerSettingsRefreshCompensatesLateRegistrationFailure(t *testing.T) {
+	engine := newFakeCronEngine()
+	runner := &fakeRunner{}
+	source := fakeGroupSource{
+		groups: []model.Group{{ID: 8, Status: model.GroupStatusActive}},
+		settings: map[int64]*model.GroupSettings{
+			8: {GroupID: 8, DigestTime: "21:00", Timezone: "UTC"},
+		},
+	}
+	s := New(runner, WithGroupSource(source), withCronEngine(engine))
+	if err := s.Start(); err != nil {
+		t.Fatalf("start scheduler: %v", err)
+	}
+	defer s.Stop()
+	plan, err := s.PrepareSettingsRefresh(map[int64]*model.GroupSettings{
+		8: {GroupID: 8, DigestTime: "09:30", Timezone: "UTC"},
+	})
+	if err != nil {
+		t.Fatalf("prepare settings refresh: %v", err)
+	}
+	engine.addErr = errors.New("injected scheduler registration failure")
+	if err := plan.Apply(); err == nil {
+		t.Fatal("settings refresh succeeded despite injected registration failure")
+	}
+	if got, ok := s.ScheduleForGroup(8); !ok || got != "CRON_TZ=UTC 0 21 * * *" {
+		t.Fatalf("schedule after compensated failure = %q, registered=%v, want previous schedule", got, ok)
+	}
+	if len(engine.entries) != 1 {
+		t.Fatalf("entries after compensated failure = %d, want one", len(engine.entries))
 	}
 }
 

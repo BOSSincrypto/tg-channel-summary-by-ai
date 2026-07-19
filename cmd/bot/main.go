@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -29,6 +30,8 @@ import (
 	"github.com/boss/tg-channel-summary-by-ai/internal/webapp"
 	"github.com/mymmrac/telego"
 )
+
+var productionSettingsMu sync.Mutex
 
 func main() {
 	log.Println("tg-channel-summary-by-ai starting...")
@@ -129,6 +132,9 @@ func main() {
 	if err := sched.Start(); err != nil {
 		log.Fatalf("failed to start scheduler: %v", err)
 	}
+	if err := reconcilePendingSettings(context.Background(), store, sched); err != nil {
+		log.Printf("pending WebApp settings reconciliation incomplete: %v", err)
+	}
 	if terminal, _ := appLifecycle.Terminal(); terminal {
 		<-appLifecycle.Done()
 		return
@@ -175,8 +181,11 @@ func main() {
 // while refreshing the already-running shared scheduler instance.
 func applyProductionSettings(ctx context.Context, store *db.DB, sched *scheduler.Scheduler, settings bot.BotSettings) error {
 	_, err := applyProductionSettingsMutation(ctx, store, sched, webapp.SettingsMutation{
-		DigestTime: settings.DigestTime,
-		Channels:   settings.Channels,
+		DigestTime:   settings.DigestTime,
+		Timezone:     settings.Timezone,
+		DefaultModel: settings.DefaultModel,
+		Channels:     settings.Channels,
+		Version:      settings.Version,
 	})
 	return err
 }
@@ -188,12 +197,72 @@ type persistedWebAppSettings struct {
 	Channels     []string `json:"channels"`
 }
 
+const pendingSettingsSyncKey = "webapp_settings_sync_pending"
+
+func reconcilePendingSettings(ctx context.Context, store *db.DB, sched *scheduler.Scheduler) error {
+	if store == nil || sched == nil {
+		return errors.New("reconcile settings: dependencies are not configured")
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("reconcile settings: %w", err)
+	}
+	productionSettingsMu.Lock()
+	defer productionSettingsMu.Unlock()
+	pending, err := store.Config.Get(pendingSettingsSyncKey)
+	if errors.Is(err, db.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("load pending settings sync: %w", err)
+	}
+	var intent struct {
+		Version int64 `json:"version"`
+	}
+	if err := json.Unmarshal([]byte(pending), &intent); err != nil || intent.Version <= 0 {
+		if err == nil {
+			err = errors.New("pending settings intent has no positive version")
+		}
+		return fmt.Errorf("decode pending settings sync: %w", err)
+	}
+	groups, err := store.Groups.List()
+	if err != nil {
+		return fmt.Errorf("list groups for pending settings sync: %w", err)
+	}
+	activeSettings := make(map[int64]*model.GroupSettings, len(groups))
+	for _, group := range groups {
+		if group.Status != "" && group.Status != model.GroupStatusActive {
+			continue
+		}
+		settings, err := store.Groups.GetGroupSettings(group.ID)
+		if err != nil {
+			return fmt.Errorf("load group %d for pending settings sync: %w", group.ID, err)
+		}
+		activeSettings[group.ID] = settings
+	}
+	plan, err := sched.PrepareSettingsRefresh(activeSettings)
+	if err != nil {
+		return fmt.Errorf("prepare pending settings sync: %w", err)
+	}
+	if err := plan.Apply(); err != nil {
+		return fmt.Errorf("apply pending settings sync version %d: %w", intent.Version, err)
+	}
+	if err := store.ClearSettingsSyncPending(pendingSettingsSyncKey); err != nil {
+		return fmt.Errorf("clear pending settings sync: %w", err)
+	}
+	return nil
+}
+
 func applyProductionSettingsMutation(ctx context.Context, store *db.DB, sched *scheduler.Scheduler, mutation webapp.SettingsMutation) (int64, error) {
 	if store == nil || sched == nil {
 		return 0, errors.New("production settings dependencies are not configured")
 	}
 	if err := ctx.Err(); err != nil {
 		return 0, fmt.Errorf("apply production settings: %w", err)
+	}
+	productionSettingsMu.Lock()
+	defer productionSettingsMu.Unlock()
+	if mutation.Version <= 0 {
+		return 0, db.ErrConflict
 	}
 	digestTime := strings.TrimSpace(mutation.DigestTime)
 	parsed, err := time.Parse("15:04", digestTime)
@@ -232,15 +301,12 @@ func applyProductionSettingsMutation(ctx context.Context, store *db.DB, sched *s
 	if err != nil {
 		return 0, fmt.Errorf("encode WebApp settings: %w", err)
 	}
-	version, err := store.Config.SetOptimistic("webapp_settings", string(encoded), mutation.Version)
-	if err != nil {
-		return 0, fmt.Errorf("persist WebApp settings: %w", err)
-	}
 
 	groups, err := store.Groups.List()
 	if err != nil {
 		return 0, fmt.Errorf("list groups for WebApp settings: %w", err)
 	}
+	groupSettingsByID := make(map[int64]*model.GroupSettings, len(groups))
 	for _, group := range groups {
 		groupSettings, err := store.Groups.GetGroupSettings(group.ID)
 		if err != nil {
@@ -252,14 +318,56 @@ func applyProductionSettingsMutation(ctx context.Context, store *db.DB, sched *s
 		} else if strings.TrimSpace(groupSettings.Timezone) == "" {
 			groupSettings.Timezone = current.Timezone
 		}
-		if err := store.Groups.UpdateGroupSettings(groupSettings); err != nil {
-			return 0, fmt.Errorf("persist settings for group %d: %w", group.ID, err)
-		}
+		groupSettingsByID[group.ID] = groupSettings
+	}
+	activeGroupSettings := make(map[int64]*model.GroupSettings, len(groups))
+	allGroupSettings := make([]*model.GroupSettings, 0, len(groups))
+	for _, group := range groups {
+		allGroupSettings = append(allGroupSettings, groupSettingsByID[group.ID])
 		if group.Status == "" || group.Status == model.GroupStatusActive {
-			if err := sched.RefreshGroup(group.ID); err != nil {
-				return 0, fmt.Errorf("refresh scheduler for group %d: %w", group.ID, err)
-			}
+			activeGroupSettings[group.ID] = groupSettingsByID[group.ID]
 		}
+	}
+	plan, err := sched.PrepareSettingsRefresh(activeGroupSettings)
+	if err != nil {
+		return 0, fmt.Errorf("prepare scheduler settings refresh: %w", err)
+	}
+
+	pendingValue, err := json.Marshal(struct {
+		Version      int64                          `json:"version"`
+		DigestTime   string                         `json:"digest_time"`
+		Timezone     string                         `json:"timezone"`
+		DefaultModel string                         `json:"default_model"`
+		Groups       map[int64]*model.GroupSettings `json:"groups"`
+	}{
+		Version:      mutation.Version + 1,
+		DigestTime:   current.DigestTime,
+		Timezone:     current.Timezone,
+		DefaultModel: current.DefaultModel,
+		Groups:       groupSettingsByID,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("encode scheduler settings intent: %w", err)
+	}
+	version, err := store.ApplySettingsTransaction(db.SettingsUpdate{
+		ConfigKey:       "webapp_settings",
+		ConfigValue:     string(encoded),
+		ExpectedVersion: mutation.Version,
+		GroupSettings:   allGroupSettings,
+		PendingKey:      pendingSettingsSyncKey,
+		PendingValue:    string(pendingValue),
+	})
+	if err != nil {
+		return 0, fmt.Errorf("persist WebApp settings transaction: %w", err)
+	}
+	if err := plan.Apply(); err != nil {
+		// The committed intent remains durable and is reconciled on restart.
+		return 0, fmt.Errorf("apply scheduler settings refresh: %w", err)
+	}
+	if err := store.ClearSettingsSyncPending(pendingSettingsSyncKey); err != nil {
+		// The database and scheduler are already converged. Keeping the intent
+		// makes this cleanup failure safely retryable after restart.
+		return version, fmt.Errorf("clear scheduler settings intent: %w", err)
 	}
 	return version, nil
 }

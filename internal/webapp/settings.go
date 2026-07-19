@@ -78,22 +78,34 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, settings)
 	case http.MethodPut:
-		if _, err := s.loadSettings(); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Не удалось загрузить настройки"})
-			return
-		}
 		var input settingsPayload
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&input); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Некорректный JSON"})
+			return
+		}
+		if input.Version <= 0 {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "Для сохранения настроек требуется текущая положительная версия."})
 			return
 		}
 		if err := validateSettings(input); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
+		_, currentVersion, err := s.settingsRepository().GetWithVersion(settingsConfigKey)
+		if errors.Is(err, db.ErrNotFound) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "Сначала загрузите текущую версию настроек."})
+			return
+		}
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Не удалось проверить версию настроек"})
+			return
+		}
+		if currentVersion != input.Version {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "Configuration was modified by another session. Please reload and try again."})
+			return
+		}
 		var (
 			version int64
-			err     error
 		)
 		if s.settingsApplier != nil {
 			version, err = s.settingsApplier(r.Context(), SettingsMutation{

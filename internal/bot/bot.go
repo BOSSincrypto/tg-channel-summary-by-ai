@@ -527,8 +527,11 @@ func ParseCommand(text, botName string) (command, argument string, ok bool) {
 
 // BotSettings is the safe subset accepted from Telegram WebApp sendData.
 type BotSettings struct {
-	DigestTime string   `json:"digest_time"`
-	Channels   []string `json:"channels"`
+	DigestTime   string   `json:"digest_time"`
+	Timezone     string   `json:"timezone"`
+	DefaultModel string   `json:"default_model"`
+	Channels     []string `json:"channels"`
+	Version      int64    `json:"version"`
 }
 
 func (s *Service) handleWebAppData(ctx context.Context, message *telego.Message) error {
@@ -565,6 +568,9 @@ func decodeAndValidateSettings(data string, settings *BotSettings) error {
 	}
 	if settings.Channels == nil {
 		return errors.New("channels is required")
+	}
+	if settings.Version <= 0 {
+		return errors.New("version must be a positive current settings version")
 	}
 	return nil
 }

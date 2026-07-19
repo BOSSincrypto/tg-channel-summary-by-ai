@@ -1019,8 +1019,50 @@ func TestSettingsAPIUsesOptimisticLocking(t *testing.T) {
 	}
 }
 
+func TestSettingsAPIRejectsInvalidVersionsBeforeRepositoryMutation(t *testing.T) {
+	server, store := newBackendTestServer(t)
+	valid := `{"digest_time":"09:00","timezone":"UTC","default_model":"gpt-4o","version":1}`
+	for name, body := range map[string]string{
+		"missing":   `{"digest_time":"09:00","timezone":"UTC","default_model":"gpt-4o"}`,
+		"zero":      `{"digest_time":"09:00","timezone":"UTC","default_model":"gpt-4o","version":0}`,
+		"negative":  `{"digest_time":"09:00","timezone":"UTC","default_model":"gpt-4o","version":-1}`,
+		"malformed": `{"digest_time":"09:00","timezone":"UTC","default_model":"gpt-4o","version":"1"}`,
+	} {
+		response := doJSON(t, server.Handler(), http.MethodPut, "/api/settings", body)
+		if response.Code != http.StatusConflict && !(name == "malformed" && response.Code == http.StatusBadRequest) {
+			t.Fatalf("%s version status = %d, body=%s", name, response.Code, response.Body.String())
+		}
+	}
+	if _, err := store.Config.Get("webapp_settings"); !errors.Is(err, db.ErrNotFound) {
+		t.Fatalf("invalid versions mutated settings: %v", err)
+	}
+
+	if err := store.Config.Set("webapp_settings", `{"digest_time":"21:00","timezone":"Europe/Moscow","default_model":"old"}`); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	current := doJSON(t, server.Handler(), http.MethodPut, "/api/settings", valid)
+	if current.Code != http.StatusOK {
+		t.Fatalf("current version status = %d, body=%s", current.Code, current.Body.String())
+	}
+	stale := doJSON(t, server.Handler(), http.MethodPut, "/api/settings", valid)
+	if stale.Code != http.StatusConflict {
+		t.Fatalf("stale version status = %d, body=%s", stale.Code, stale.Body.String())
+	}
+	value, version, err := store.Config.GetWithVersion("webapp_settings")
+	if err != nil {
+		t.Fatalf("load settings after stale version: %v", err)
+	}
+	if value != `{"digest_time":"09:00","timezone":"UTC","default_model":"gpt-4o","version":0}` || version != 2 {
+		t.Fatalf("stale version mutated settings = %q version %d", value, version)
+	}
+}
+
 func TestSettingsAPIUsesConfiguredProductionApplier(t *testing.T) {
 	server, _ := newBackendTestServer(t)
+	initial := doJSON(t, server.Handler(), http.MethodGet, "/api/settings", "")
+	if initial.Code != http.StatusOK {
+		t.Fatalf("initial settings status = %d, body=%s", initial.Code, initial.Body.String())
+	}
 	var got SettingsMutation
 	server.SetSettingsApplier(func(_ context.Context, mutation SettingsMutation) (int64, error) {
 		got = mutation

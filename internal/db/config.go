@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
@@ -57,27 +58,12 @@ func (r *ConfigRepository) Set(key, value string) error {
 	return nil
 }
 
-// SetOptimistic updates a config key only when expectedVersion matches. A
-// missing key is inserted with version one when expectedVersion is zero.
+// SetOptimistic updates a config key only when the supplied positive version
+// matches. Missing versions are rejected so authenticated mutations cannot
+// bypass optimistic locking.
 func (r *ConfigRepository) SetOptimistic(key, value string, expectedVersion int64) (int64, error) {
 	if expectedVersion <= 0 {
-		result, err := r.db.Conn().Exec(
-			`INSERT INTO config (key, value, version) VALUES (?, ?, 1)
-			 ON CONFLICT(key) DO NOTHING`, key, value,
-		)
-		if err != nil {
-			return 0, fmt.Errorf("insert config optimistically: %w", err)
-		}
-		if affected, err := result.RowsAffected(); err != nil {
-			return 0, fmt.Errorf("insert config rows affected: %w", err)
-		} else if affected > 0 {
-			return 1, nil
-		}
-		_, currentVersion, err := r.GetWithVersion(key)
-		if err != nil {
-			return 0, err
-		}
-		expectedVersion = currentVersion
+		return 0, ErrConflict
 	}
 	result, err := r.db.Conn().Exec(
 		`UPDATE config SET value = ?, version = version + 1 WHERE key = ? AND version = ?`,
@@ -91,7 +77,9 @@ func (r *ConfigRepository) SetOptimistic(key, value string, expectedVersion int6
 		return 0, fmt.Errorf("update config rows affected: %w", err)
 	}
 	if affected == 0 {
-		if _, _, err := r.GetWithVersion(key); err != nil {
+		if _, _, err := r.GetWithVersion(key); errors.Is(err, ErrNotFound) {
+			return 0, ErrConflict
+		} else if err != nil {
 			return 0, err
 		}
 		return 0, ErrConflict

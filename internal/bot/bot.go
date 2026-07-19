@@ -422,10 +422,14 @@ func (s *Service) observeForumTopicMessage(message *telego.Message) error {
 				return nil
 			}
 			if resolver, ok := interface{}(s.groups).(forumTopicUnknownOutcomeResolver); ok {
-				if _, _, err := resolver.ResolveUnknownTopicCreationObservation(
+				bound, _, err := resolver.ResolveUnknownTopicCreationObservation(
 					message.Chat.ID, threadID, name,
-				); err != nil {
+				)
+				if err != nil {
 					return fmt.Errorf("resolve unknown forum topic creation: %w", err)
+				}
+				if bound {
+					return nil
 				}
 			}
 			return s.topicRegistry.Observe(group.ID, threadID, name)
@@ -435,10 +439,14 @@ func (s *Service) observeForumTopicMessage(message *telego.Message) error {
 				return nil
 			}
 			if resolver, ok := interface{}(s.groups).(forumTopicUnknownOutcomeResolver); ok {
-				if _, _, err := resolver.ResolveUnknownTopicCreationObservation(
+				bound, _, err := resolver.ResolveUnknownTopicCreationObservation(
 					message.Chat.ID, threadID, name,
-				); err != nil {
+				)
+				if err != nil {
 					return fmt.Errorf("resolve unknown edited forum topic creation: %w", err)
+				}
+				if bound {
+					return nil
 				}
 			}
 			if err := s.topicRegistry.MarkEdited(group.ID, threadID, name); err != nil {

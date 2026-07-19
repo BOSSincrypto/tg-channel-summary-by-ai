@@ -1081,6 +1081,211 @@ func TestUnknownTopicCreateOutcomeObservationRemainsAmbiguous(t *testing.T) {
 	}
 }
 
+func TestBoundUnknownTopicStaysHiddenAndUnassignableUntilReconciliation(t *testing.T) {
+	for _, eventName := range []string{"created", "edited"} {
+		t.Run(eventName, func(t *testing.T) {
+			store, err := db.Open(":memory:")
+			if err != nil {
+				t.Fatalf("open database: %v", err)
+			}
+			defer store.Close()
+			const chatID = int64(-100327)
+			groupID, err := store.Groups.Insert(&model.Group{
+				TelegramChatID: chatID,
+				Status:         model.GroupStatusActive,
+			})
+			if err != nil {
+				t.Fatalf("insert group: %v", err)
+			}
+			channelID, err := store.Channels.Insert(&model.Channel{
+				Username: "bound_" + eventName,
+				Title:    "Bound topic",
+			})
+			if err != nil {
+				t.Fatalf("insert channel: %v", err)
+			}
+			intentID, err := store.ForumTopics.BeginCreationIntent(
+				groupID, channelID, chatID, 1, "Bound topic",
+			)
+			if err != nil {
+				t.Fatalf("begin creation intent: %v", err)
+			}
+			if err := store.ForumTopics.MarkUnknownOutcome(intentID); err != nil {
+				t.Fatalf("mark unknown outcome: %v", err)
+			}
+
+			api := &fakeTelegramClient{}
+			service := newServiceForTest(api, nil)
+			service.groups = store.Groups
+			service.channels = store.Channels
+			service.SetForumTopicRegistry(store.ForumTopics)
+			threadID := int64(2027)
+			message := &telego.Message{
+				MessageID:       int(threadID),
+				MessageThreadID: int(threadID),
+				Chat:            telego.Chat{ID: chatID, Type: telego.ChatTypeSupergroup},
+			}
+			if eventName == "created" {
+				message.ForumTopicCreated = &telego.ForumTopicCreated{Name: "Bound topic"}
+			} else {
+				message.ForumTopicEdited = &telego.ForumTopicEdited{Name: "Bound topic"}
+			}
+			if err := service.HandleUpdate(context.Background(), &telego.Update{Message: message}); err != nil {
+				t.Fatalf("handle %s topic observation: %v", eventName, err)
+			}
+
+			recoveries, err := store.Groups.ListPendingTopicCreationRecoveries()
+			if err != nil {
+				t.Fatalf("list bound recovery: %v", err)
+			}
+			if len(recoveries) != 1 || recoveries[0].MessageThreadID != threadID ||
+				recoveries[0].State != "pending_cleanup" {
+				t.Fatalf("bound recoveries = %#v", recoveries)
+			}
+			topic, err := store.ForumTopics.Get(groupID, threadID)
+			if err != nil {
+				t.Fatalf("get bound topic: %v", err)
+			}
+			if !topic.LifecycleOwned || !topic.ClosePending || topic.Closed {
+				t.Fatalf("bound topic = %#v, want owned close-pending topic", topic)
+			}
+			open, err := store.ForumTopics.ListOpen(groupID)
+			if err != nil {
+				t.Fatalf("list bound open topics: %v", err)
+			}
+			if len(open) != 0 {
+				t.Fatalf("bound open topics = %#v, want hidden", open)
+			}
+
+			server := webapp.NewWithProvidersForTesting(store, 0, http.DefaultClient)
+			server.SetTopicLifecycle(service)
+			catalog := httptest.NewRecorder()
+			server.Handler().ServeHTTP(catalog, httptest.NewRequest(
+				http.MethodGet,
+				"/api/groups/"+strconv.FormatInt(groupID, 10)+"/topics",
+				nil,
+			))
+			if catalog.Code != http.StatusOK || strings.Contains(catalog.Body.String(), strconv.FormatInt(threadID, 10)) {
+				t.Fatalf("bound catalog status=%d body=%s, want hidden topic", catalog.Code, catalog.Body.String())
+			}
+			assignment := httptest.NewRecorder()
+			request := httptest.NewRequest(
+				http.MethodPost,
+				"/api/groups/"+strconv.FormatInt(groupID, 10)+"/channels",
+				strings.NewReader(`{"channel_id":"`+strconv.FormatInt(channelID, 10)+
+					`","topic_thread_id":`+strconv.FormatInt(threadID, 10)+`,"version":1}`),
+			)
+			request.Header.Set("Content-Type", "application/json")
+			server.Handler().ServeHTTP(assignment, request)
+			if assignment.Code != http.StatusConflict {
+				t.Fatalf("bound assignment status=%d body=%s, want conflict", assignment.Code, assignment.Body.String())
+			}
+			if err := service.ReconcilePendingTopicCreations(context.Background()); err != nil {
+				t.Fatalf("reconcile bound topic: %v", err)
+			}
+			recoveries, err = store.Groups.ListPendingTopicCreationRecoveries()
+			if err != nil {
+				t.Fatalf("list reconciled recovery: %v", err)
+			}
+			if len(recoveries) != 0 {
+				t.Fatalf("reconciled recoveries = %#v, want none", recoveries)
+			}
+			topic, err = store.ForumTopics.Get(groupID, threadID)
+			if err != nil {
+				t.Fatalf("get tombstoned topic: %v", err)
+			}
+			if !topic.LifecycleOwned || !topic.Closed || topic.ClosePending {
+				t.Fatalf("reconciled topic = %#v, want closed tombstone", topic)
+			}
+			if len(api.deletedTopics) != 1 {
+				t.Fatalf("delete calls after reconciliation = %d, want one", len(api.deletedTopics))
+			}
+			if err := service.ReconcilePendingTopicCreations(context.Background()); err != nil {
+				t.Fatalf("repeat reconciliation: %v", err)
+			}
+			if len(api.deletedTopics) != 1 {
+				t.Fatalf("delete calls after repeat reconciliation = %d, want one", len(api.deletedTopics))
+			}
+		})
+	}
+}
+
+func TestAmbiguousAndNonmatchingUnknownObservationsRemainOrdinaryTopics(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+	const chatID = int64(-100328)
+	groupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: chatID,
+		Status:         model.GroupStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	for index := 0; index < 2; index++ {
+		channelID, insertErr := store.Channels.Insert(&model.Channel{
+			Username: "ambiguous_" + strconv.Itoa(index),
+			Title:    "Same topic",
+		})
+		if insertErr != nil {
+			t.Fatalf("insert channel %d: %v", index, insertErr)
+		}
+		intentID, beginErr := store.ForumTopics.BeginCreationIntent(
+			groupID, channelID, chatID, 1, "Same topic",
+		)
+		if beginErr != nil {
+			t.Fatalf("begin intent %d: %v", index, beginErr)
+		}
+		if markErr := store.ForumTopics.MarkUnknownOutcome(intentID); markErr != nil {
+			t.Fatalf("mark intent %d unknown: %v", index, markErr)
+		}
+	}
+	service := newServiceForTest(&fakeTelegramClient{}, nil)
+	service.groups = store.Groups
+	service.SetForumTopicRegistry(store.ForumTopics)
+	for _, message := range []*telego.Message{
+		{
+			MessageID: 2028, MessageThreadID: 2028,
+			Chat:              telego.Chat{ID: chatID, Type: telego.ChatTypeSupergroup},
+			ForumTopicCreated: &telego.ForumTopicCreated{Name: "Same topic"},
+		},
+		{
+			MessageID: 2029, MessageThreadID: 2029,
+			Chat:             telego.Chat{ID: chatID, Type: telego.ChatTypeSupergroup},
+			ForumTopicEdited: &telego.ForumTopicEdited{Name: "Unrelated topic"},
+		},
+	} {
+		if err := service.HandleUpdate(context.Background(), &telego.Update{Message: message}); err != nil {
+			t.Fatalf("handle ordinary observation: %v", err)
+		}
+	}
+	for _, threadID := range []int64{2028, 2029} {
+		topic, err := store.ForumTopics.Get(groupID, threadID)
+		if err != nil {
+			t.Fatalf("get ordinary topic %d: %v", threadID, err)
+		}
+		if topic.LifecycleOwned || topic.Closed || topic.ClosePending {
+			t.Fatalf("ordinary topic %d = %#v, want open observed", threadID, topic)
+		}
+	}
+	open, err := store.ForumTopics.ListOpen(groupID)
+	if err != nil {
+		t.Fatalf("list ordinary topics: %v", err)
+	}
+	if len(open) != 2 {
+		t.Fatalf("ordinary open topics = %#v, want both observations", open)
+	}
+	recoveries, err := store.Groups.ListPendingTopicCreationRecoveries()
+	if err != nil {
+		t.Fatalf("list unresolved ambiguous recoveries: %v", err)
+	}
+	if len(recoveries) != 2 {
+		t.Fatalf("ambiguous recoveries = %#v, want both unresolved", recoveries)
+	}
+}
+
 func TestProductionWebAppRejectsTombstonedTopicAfterGroupRecreation(t *testing.T) {
 	store, err := db.Open(":memory:")
 	if err != nil {

@@ -142,8 +142,13 @@ func (r *ForumTopicRepository) ResolveUnknownCreationObservation(
 	if chatID == 0 || threadID <= 0 || strings.TrimSpace(name) == "" {
 		return false, false, errors.New("unknown forum topic observation identifiers are invalid")
 	}
+	tx, err := r.db.Conn().Begin()
+	if err != nil {
+		return false, false, fmt.Errorf("begin bind unknown forum topic outcome: %w", err)
+	}
+	defer tx.Rollback()
 	var count int
-	if err := r.db.Conn().QueryRow(`
+	if err := tx.QueryRow(`
 		SELECT COUNT(*)
 		FROM forum_topic_creation_intents
 		WHERE chat_id = ? AND message_thread_id = 0
@@ -158,8 +163,21 @@ func (r *ForumTopicRepository) ResolveUnknownCreationObservation(
 	if count != 1 {
 		return false, true, nil
 	}
+	var groupID int64
+	if err := tx.QueryRow(`
+		SELECT group_id
+		FROM forum_topic_creation_intents
+		WHERE chat_id = ? AND message_thread_id = 0
+			AND state = 'unknown_outcome'
+			AND lower(trim(name)) = lower(trim(?))`,
+		chatID, name).Scan(&groupID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, false, nil
+		}
+		return false, false, fmt.Errorf("load unknown forum topic outcome: %w", err)
+	}
 	var tombstone int
-	if err := r.db.Conn().QueryRow(`
+	if err := tx.QueryRow(`
 		SELECT EXISTS(
 			SELECT 1 FROM forum_topic_tombstones
 			WHERE chat_id = ? AND message_thread_id = ?
@@ -169,7 +187,21 @@ func (r *ForumTopicRepository) ResolveUnknownCreationObservation(
 	if tombstone == 1 {
 		return false, false, nil
 	}
-	result, err := r.db.Conn().Exec(`
+	if _, err := tx.Exec(`
+		INSERT INTO forum_topics
+			(group_id, message_thread_id, name, status, lifecycle_owned, closed, close_pending, updated_at)
+		VALUES (?, ?, ?, 'persisted', 1, 0, 1, datetime('now'))
+		ON CONFLICT(group_id, message_thread_id) DO UPDATE SET
+			name = excluded.name,
+			status = 'persisted',
+			lifecycle_owned = 1,
+			closed = 0,
+			close_pending = 1,
+			updated_at = datetime('now')`,
+		groupID, threadID, strings.TrimSpace(name)); err != nil {
+		return false, false, fmt.Errorf("promote bound forum topic: %w", err)
+	}
+	result, err := tx.Exec(`
 		UPDATE forum_topic_creation_intents
 		SET message_thread_id = ?, state = 'pending_cleanup', updated_at = datetime('now')
 		WHERE chat_id = ? AND message_thread_id = 0
@@ -183,7 +215,13 @@ func (r *ForumTopicRepository) ResolveUnknownCreationObservation(
 	if err != nil {
 		return false, false, fmt.Errorf("bind unknown forum topic rows affected: %w", err)
 	}
-	return affected == 1, false, nil
+	if affected != 1 {
+		return false, false, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return false, false, fmt.Errorf("commit bound forum topic outcome: %w", err)
+	}
+	return true, false, nil
 }
 
 // CompleteCreationIntent removes an intent after assignment finalization or

@@ -471,6 +471,48 @@ func TestProductionTopicLifecycleFailureLeavesAssignmentUnchanged(t *testing.T) 
 	}
 }
 
+func TestProductionWebAppTopicCreationRequiresLifecyclePermission(t *testing.T) {
+	server, store := newBackendTestServer(t)
+	lifecycle := &fakeTopicLifecycle{
+		store:         store,
+		permissionErr: errors.New("bot lacks can_manage_topics permission"),
+	}
+	server.SetTopicLifecycle(lifecycle)
+
+	channelID, err := store.Channels.Insert(&model.Channel{Username: "topic_permission", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	groupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: -1012,
+		Title:          "Forum",
+		Status:         model.GroupStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+
+	response := doJSON(t, server.Handler(), http.MethodPost,
+		"/api/groups/"+jsonNumber(groupID)+"/channels",
+		`{"channel_id":"`+jsonNumber(channelID)+`"}`)
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("permission status = %d, body=%s, want 502", response.Code, response.Body.String())
+	}
+	if lifecycle.permissionChecks != 1 {
+		t.Fatalf("permission checks = %d, want one", lifecycle.permissionChecks)
+	}
+	if len(lifecycle.created) != 0 {
+		t.Fatalf("create lifecycle calls = %#v, want none", lifecycle.created)
+	}
+	assignments, err := store.Groups.GetChannelAssignments(groupID)
+	if err != nil {
+		t.Fatalf("load assignments after denied permission: %v", err)
+	}
+	if len(assignments) != 0 {
+		t.Fatalf("assignments after denied permission = %#v, want none", assignments)
+	}
+}
+
 func TestProductionWebAppTopicCloseFailureLeavesDurablePendingState(t *testing.T) {
 	server, store := newBackendTestServer(t)
 	lifecycle := &failureRecoverableTopicLifecycle{store: store, failMarkClosed: true}
@@ -843,10 +885,12 @@ func TestZeroTopicIDIsRejectedWithoutAssignmentMutation(t *testing.T) {
 }
 
 type fakeTopicLifecycle struct {
-	store   *db.DB
-	err     error
-	created [][2]int64
-	removed [][2]int64
+	store            *db.DB
+	err              error
+	permissionErr    error
+	permissionChecks int
+	created          [][2]int64
+	removed          [][2]int64
 }
 
 type failureRecoverableTopicLifecycle struct {
@@ -854,6 +898,10 @@ type failureRecoverableTopicLifecycle struct {
 	threadID             int64
 	failMarkClosed       bool
 	closeForumTopicCalls [][2]int64
+}
+
+func (f *failureRecoverableTopicLifecycle) CheckTopicPermission(context.Context, int64) error {
+	return nil
 }
 
 func (f *failureRecoverableTopicLifecycle) CreateChannelTopic(_ context.Context, groupID, channelID int64) error {
@@ -934,6 +982,11 @@ func (f *fakeTopicLifecycle) CreateChannelTopic(_ context.Context, groupID, chan
 	f.created = append(f.created, [2]int64{groupID, channelID})
 	threadID := int64(700 + len(f.created))
 	return f.store.Groups.UpdateChannelTopic(groupID, channelID, threadID)
+}
+
+func (f *fakeTopicLifecycle) CheckTopicPermission(context.Context, int64) error {
+	f.permissionChecks++
+	return f.permissionErr
 }
 
 func (f *fakeTopicLifecycle) RemoveChannelTopic(_ context.Context, groupID, channelID int64) error {

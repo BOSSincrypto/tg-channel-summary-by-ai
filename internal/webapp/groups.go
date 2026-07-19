@@ -34,9 +34,6 @@ type forumGroupVerifier interface {
 type TopicLifecycle interface {
 	CreateChannelTopic(context.Context, int64, int64) error
 	RemoveChannelTopic(context.Context, int64, int64) error
-}
-
-type topicPermissionChecker interface {
 	CheckTopicPermission(context.Context, int64) error
 }
 
@@ -400,11 +397,9 @@ func (s *Server) handleGroupChannels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if topic == nil && s.groupService.topics != nil && forum {
-		if checker, ok := s.groupService.topics.(topicPermissionChecker); ok {
-			if err := checker.CheckTopicPermission(r.Context(), groupID); err != nil {
-				writeGroupError(w, err)
-				return
-			}
+		if err := s.groupService.topics.CheckTopicPermission(r.Context(), groupID); err != nil {
+			writeGroupError(w, err)
+			return
 		}
 	}
 	if err := s.groupService.repository.AssignChannel(groupID, channelID, topic); err != nil {

@@ -219,6 +219,8 @@ function makeApp() {
     const entry = {
       path,
       method: options.method || "GET",
+      headers: options.headers || {},
+      rawBody: options.body || null,
       body: options.body ? JSON.parse(options.body) : null,
       resolve: null,
       reject: null
@@ -329,6 +331,122 @@ async function testGroupRefreshSuppressesStaleGeneration() {
   assert(group && group.title === "Newest" && group.version === 3, "Stale group refresh replaced the newest generation");
 }
 
+async function testGroupDeleteSendsVersionAndReconcilesConflict() {
+  const app = makeApp();
+  const channels = app.findPending("/api/channels");
+  app.resolve(channels, []);
+  await settle();
+
+  const groupsTab = app.document.querySelectorAll("button").find((button) =>
+    button.children.some((child) => child.textContent === "Группы")
+  );
+  assert(groupsTab, "Groups tab was not rendered");
+  groupsTab.click();
+  const groups = app.findPending("/api/groups?with_channels=true");
+  app.resolve(groups, [{
+    id: 7,
+    version: 7,
+    telegram_chat_id: "-1007",
+    title: "Authoritative before delete",
+    assignments: []
+  }]);
+  await settle();
+
+  const deleteButton = app.document.querySelectorAll("button").find((button) => button.textContent === "Удалить");
+  assert(deleteButton, "Group delete action was not rendered");
+  deleteButton.click();
+  const confirmation = app.document.querySelector('[role="dialog"]');
+  assert(confirmation, "Group delete confirmation did not open");
+  const confirmButton = confirmation.querySelectorAll("button").find((button) => button.textContent === "Удалить");
+  assert(confirmButton, "Group delete confirmation action was not rendered");
+  confirmButton.click();
+
+  const deletion = app.findPending("/api/groups/7", "DELETE");
+  assert(deletion.rawBody === '{"version":7}', "Group delete body did not contain the loaded positive version");
+  assert(deletion.body.version === 7, "Group delete version was not parsed as the loaded positive version");
+  assert(deletion.headers["Content-Type"] === "application/json", "Group delete did not use JSON content type");
+  assert(deletion.headers["X-Telegram-Init-Data"] === "deterministic-test-init-data", "Group delete did not include authenticated initData");
+  assert(app.hooks.findGroup("7").version === 7, "Group delete removed the group before the server response");
+
+  app.resolve(deletion, { error: "stale version" }, 409);
+  await settle();
+  const refreshed = app.findPending("/api/groups?with_channels=true");
+  app.resolve(refreshed, [{
+    id: 7,
+    version: 8,
+    telegram_chat_id: "-1007",
+    title: "Authoritative after conflict",
+    assignments: []
+  }]);
+  await settle();
+  const recovered = app.hooks.findGroup("7");
+  assert(recovered && recovered.version === 8 && recovered.title === "Authoritative after conflict", "Stale conflict did not reconcile authoritative group state");
+  assert(
+    app.document.querySelectorAll("span").some((span) => span.textContent.includes("Группа изменилась")),
+    "Stale conflict did not show a visible conflict result"
+  );
+
+  const retryButton = app.document.querySelectorAll("button").find((button) => button.textContent === "Удалить");
+  assert(retryButton, "Group delete retry action was not rendered after reconciliation");
+  retryButton.click();
+  const retryConfirmation = app.document.querySelector('[role="dialog"]');
+  retryConfirmation.querySelectorAll("button").find((button) => button.textContent === "Удалить").click();
+  const retry = app.findPending("/api/groups/7", "DELETE");
+  assert(retry.body.version === 8 && retry.rawBody === '{"version":8}', "Group delete retry reused the stale version");
+  app.resolve(retry, null, 204);
+  await settle();
+  const afterDelete = app.findPending("/api/groups?with_channels=true");
+  app.resolve(afterDelete, []);
+  await settle();
+  await settle();
+  assert(!app.hooks.findGroup("7"), "Successful retry did not remove the group after server confirmation");
+  assert(
+    app.document.querySelectorAll(".empty").some((empty) =>
+      empty.children.some((child) => child.textContent === "Нет добавленных групп")
+    ),
+    "DOM did not show the authoritative empty group state"
+  );
+}
+
+async function testGroupDeleteRefusesMissingVersion() {
+  const app = makeApp();
+  const channels = app.findPending("/api/channels");
+  app.resolve(channels, []);
+  await settle();
+
+  const groupsTab = app.document.querySelectorAll("button").find((button) =>
+    button.children.some((child) => child.textContent === "Группы")
+  );
+  groupsTab.click();
+  const groups = app.findPending("/api/groups?with_channels=true");
+  app.resolve(groups, [{
+    id: 9,
+    telegram_chat_id: "-1009",
+    title: "Missing version",
+    assignments: []
+  }]);
+  await settle();
+  app.document.querySelectorAll("button").find((button) => button.textContent === "Удалить").click();
+  const confirmation = app.document.querySelector('[role="dialog"]');
+  confirmation.querySelectorAll("button").find((button) => button.textContent === "Удалить").click();
+  await settle();
+
+  assert(
+    !app.requests.some((request) => request.path === "/api/groups/9" && request.method === "DELETE"),
+    "Group delete issued a request without a loaded positive version"
+  );
+  const refreshed = app.findPending("/api/groups?with_channels=true");
+  app.resolve(refreshed, [{
+    id: 9,
+    version: 4,
+    telegram_chat_id: "-1009",
+    title: "Recovered version",
+    assignments: []
+  }]);
+  await settle();
+  assert(app.hooks.findGroup("9").version === 4, "Missing-version delete did not refresh authoritative group data");
+}
+
 async function testAssignmentReusesNewestGroupVersion() {
   const app = makeApp();
   const channels = app.findPending("/api/channels");
@@ -382,6 +500,7 @@ async function testAssignmentReusesNewestGroupVersion() {
   const form = checkbox.closest("form");
   assert(form, "Assignment channel choice is not inside a form");
   form.requestSubmit();
+  await settle();
   const mutation = app.findPending("/api/groups/7/channels", "POST");
   assert(mutation.body.version === 5, "Assignment mutation reused a stale optimistic group version");
   app.resolve(mutation, {});
@@ -541,6 +660,8 @@ async function testDigestRunButtonSubmitsAndPollsTypedOutcomes() {
 async function run() {
   await testChannelToggleUsesStableID();
   await testGroupRefreshSuppressesStaleGeneration();
+  await testGroupDeleteSendsVersionAndReconcilesConflict();
+  await testGroupDeleteRefusesMissingVersion();
   await testAssignmentReusesNewestGroupVersion();
   await testTimezoneFocusShowsCatalogAndTypingFilters();
   await testDigestRunButtonSubmitsAndPollsTypedOutcomes();

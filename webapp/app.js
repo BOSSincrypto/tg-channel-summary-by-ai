@@ -14,6 +14,7 @@
     readonly: false,
     settingsDraft: null,
     pendingChannelToggles: {},
+    pendingGroupDeletes: {},
     loadRequests: {},
     loadGenerations: {},
     groupCollectionGeneration: 0,
@@ -140,7 +141,7 @@
     var forumValue = pick(item, ["is_forum", "IsForum"], status === "" || status === "active");
     return {
       id: idOf(item),
-      version: pick(item, ["version", "Version"], 1),
+      version: pick(item, ["version", "Version"], 0),
       chatId: String(pick(item, ["telegram_chat_id", "TelegramChatID", "chat_id", "chatId"], "")),
       title: String(pick(item, ["title", "Title"], "")),
       status: status,
@@ -739,9 +740,40 @@
   }
   function confirmDeleteGroup(group) {
     openConfirm("Удалить группу " + (group.title || group.chatId) + "?", "Все назначения каналов будут удалены.", "Удалить", function () {
-      mutation("/api/groups/" + encodeURIComponent(group.id), "DELETE").then(function () {
-        showToast("Группа удалена.", "success"); state.loadedAt.groups = 0; return loadGroups(true);
-      }).catch(function (error) { showToast(apiErrorMessage(error), "error", true); });
+      var groupKey = String(group.id);
+      if (state.pendingGroupDeletes[groupKey]) return;
+      var current = findGroup(group.id);
+      var version = groupVersion(current);
+      if (!version) {
+        showToast("Не удалось определить актуальную версию группы. Загружаем состояние заново.", "error", true);
+        state.loadedAt.groups = 0;
+        loadGroups(true);
+        return;
+      }
+      var request = { version: version };
+      state.pendingGroupDeletes[groupKey] = request;
+      render();
+      mutation("/api/groups/" + encodeURIComponent(group.id), "DELETE", { version: version }).then(function () {
+        if (state.pendingGroupDeletes[groupKey] !== request) return;
+        delete state.pendingGroupDeletes[groupKey];
+        showToast("Группа удалена.", "success");
+        state.loadedAt.groups = 0;
+        return loadGroups(true);
+      }).catch(function (error) {
+        if (state.pendingGroupDeletes[groupKey] !== request) return;
+        delete state.pendingGroupDeletes[groupKey];
+        if (error && error.status === 409) {
+          showToast("Группа изменилась в другой сессии. Загружаем актуальное состояние, удаление не выполнено.", "error", true);
+          state.loadedAt.groups = 0;
+          return loadGroups(true).then(function () {
+            if (!state.errors.groups) {
+              showToast("Состояние обновлено. Повторите удаление, если это необходимо.", "warning", true);
+            }
+          });
+        }
+        showToast(apiErrorMessage(error), "error", true);
+        render();
+      });
     });
   }
   function openAvailableGroups() {

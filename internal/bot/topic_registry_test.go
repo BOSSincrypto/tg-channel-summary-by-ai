@@ -742,3 +742,159 @@ func TestProductionWebAppUsesRealBotTopicRemovalBoundary(t *testing.T) {
 		t.Fatalf("repeat WebApp close calls = %d, want idempotent recovery", len(api.closedTopics))
 	}
 }
+
+type creationIntentBarrierClient struct {
+	*fakeTelegramClient
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (c *creationIntentBarrierClient) CreateForumTopic(ctx context.Context, params *telego.CreateForumTopicParams) (*telego.ForumTopic, error) {
+	close(c.entered)
+	<-c.release
+	return c.fakeTelegramClient.CreateForumTopic(ctx, params)
+}
+
+func TestTopicCreationIntentIsDurableBeforeTelegramCall(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+	groupID, err := store.Groups.Insert(&model.Group{TelegramChatID: -100320, Status: model.GroupStatusActive})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	channelID, err := store.Channels.Insert(&model.Channel{Username: "intent", Title: "Intent"})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	api := &creationIntentBarrierClient{
+		fakeTelegramClient: &fakeTelegramClient{
+			me:         &telego.User{ID: 123, Username: "DigestBot"},
+			chatMember: &telego.ChatMemberAdministrator{Status: telego.MemberStatusAdministrator, CanManageTopics: true},
+			forumTopic: &telego.ForumTopic{MessageThreadID: 3201, Name: "Intent"},
+		},
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	service := newServiceForTest(api, nil)
+	service.groups = store.Groups
+	service.channels = store.Channels
+	service.SetForumTopicRegistry(store.ForumTopics)
+	result := make(chan error, 1)
+	go func() {
+		_, assignErr := service.AssignChannelTopicWithVersion(context.Background(), groupID, channelID, nil, 1)
+		result <- assignErr
+	}()
+	<-api.entered
+	var count int
+	if err := store.Conn().QueryRow(`
+		SELECT COUNT(*) FROM forum_topic_creation_intents
+		WHERE group_id = ? AND channel_id = ? AND message_thread_id = 0`,
+		groupID, channelID).Scan(&count); err != nil {
+		t.Fatalf("inspect pre-create intent: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("pre-create intents = %d, want one", count)
+	}
+	close(api.release)
+	if err := <-result; err != nil {
+		t.Fatalf("assignment: %v", err)
+	}
+	if err := store.Conn().QueryRow(`
+		SELECT COUNT(*) FROM forum_topic_creation_intents
+		WHERE group_id = ? AND channel_id = ?`,
+		groupID, channelID).Scan(&count); err != nil {
+		t.Fatalf("inspect finalized intent: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("finalized intents = %d, want none", count)
+	}
+}
+
+func TestTopicCreationRecoverySurvivesGroupDeletionAndUsesChatIdentity(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+	groupID, err := store.Groups.Insert(&model.Group{TelegramChatID: -100321, Status: model.GroupStatusActive})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	if err := store.Groups.RecordTopicCreationRecovery(groupID, 3202, -100321, "Deleted group topic"); err != nil {
+		t.Fatalf("record recovery: %v", err)
+	}
+	if err := store.Groups.Delete(groupID); err != nil {
+		t.Fatalf("delete group: %v", err)
+	}
+	recoveries, err := store.Groups.ListPendingTopicCreationRecoveries()
+	if err != nil {
+		t.Fatalf("list recovery after group deletion: %v", err)
+	}
+	if len(recoveries) != 1 || recoveries[0].ChatID != -100321 {
+		t.Fatalf("recoveries after group deletion = %#v", recoveries)
+	}
+	api := &fakeTelegramClient{}
+	service := newServiceForTest(api, nil)
+	service.groups = store.Groups
+	service.SetForumTopicRegistry(store.ForumTopics)
+	if err := service.ReconcilePendingTopicCreations(context.Background()); err != nil {
+		t.Fatalf("reconcile deleted group recovery: %v", err)
+	}
+	if len(api.deletedTopics) != 1 || api.deletedTopics[0].ChatID.ID != -100321 {
+		t.Fatalf("deleted topic calls = %#v", api.deletedTopics)
+	}
+	recoveries, err = store.Groups.ListPendingTopicCreationRecoveries()
+	if err != nil {
+		t.Fatalf("list converged recovery: %v", err)
+	}
+	if len(recoveries) != 0 {
+		t.Fatalf("converged recoveries = %#v", recoveries)
+	}
+}
+
+func TestAlreadyDeletedTopicRecoveryLeavesClosedTombstoneAndIgnoresLateObservation(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+	groupID, err := store.Groups.Insert(&model.Group{TelegramChatID: -100322, Status: model.GroupStatusActive})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	if err := store.Groups.RecordTopicCreationRecovery(groupID, 3203, -100322, "Already deleted"); err != nil {
+		t.Fatalf("record recovery: %v", err)
+	}
+	api := &fakeTelegramClient{deleteErr: errors.New("Bad Request: message thread not found")}
+	service := newServiceForTest(api, nil)
+	service.groups = store.Groups
+	service.SetForumTopicRegistry(store.ForumTopics)
+	if err := service.ReconcilePendingTopicCreations(context.Background()); err != nil {
+		t.Fatalf("reconcile already deleted topic: %v", err)
+	}
+	topic, err := store.ForumTopics.Get(groupID, 3203)
+	if err != nil {
+		t.Fatalf("load compensation tombstone: %v", err)
+	}
+	if !topic.LifecycleOwned || !topic.Closed {
+		t.Fatalf("compensation topic = %#v, want closed owned tombstone", topic)
+	}
+	update := telego.Update{Message: &telego.Message{
+		MessageID: 3203, MessageThreadID: 3203,
+		Chat:              telego.Chat{ID: -100322, Type: telego.ChatTypeSupergroup},
+		ForumTopicCreated: &telego.ForumTopicCreated{Name: "Late observation"},
+	}}
+	if err := service.HandleUpdate(context.Background(), &update); err != nil {
+		t.Fatalf("late observation: %v", err)
+	}
+	openTopics, err := store.ForumTopics.ListOpen(groupID)
+	if err != nil {
+		t.Fatalf("list topics after late observation: %v", err)
+	}
+	if len(openTopics) != 0 {
+		t.Fatalf("late observation reopened tombstone: %#v", openTopics)
+	}
+}

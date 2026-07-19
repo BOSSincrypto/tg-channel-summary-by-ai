@@ -15,6 +15,88 @@ type ForumTopicRepository struct {
 	db *DB
 }
 
+// BeginCreationIntent records the durable pre-create intent before Telegram
+// is called. The row has no group foreign key so it survives group deletion.
+func (r *ForumTopicRepository) BeginCreationIntent(groupID, channelID, chatID, expectedVersion int64, name string) (int64, error) {
+	if r == nil || r.db == nil {
+		return 0, errors.New("forum topic repository is not configured")
+	}
+	if groupID <= 0 || channelID <= 0 || chatID == 0 || expectedVersion <= 0 {
+		return 0, errors.New("forum topic creation intent identifiers are invalid")
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return 0, errors.New("forum topic creation intent name is required")
+	}
+	_, err := r.db.Conn().Exec(`
+		INSERT INTO forum_topic_creation_intents
+			(group_id, channel_id, chat_id, expected_version, name, state)
+		VALUES (?, ?, ?, ?, ?, 'creating')
+		ON CONFLICT(group_id, channel_id, state) DO UPDATE SET
+			chat_id = excluded.chat_id,
+			expected_version = excluded.expected_version,
+			name = excluded.name,
+			updated_at = datetime('now')`,
+		groupID, channelID, chatID, expectedVersion, name)
+	if err != nil {
+		return 0, fmt.Errorf("begin forum topic creation intent: %w", err)
+	}
+	var existing int64
+	if err := r.db.Conn().QueryRow(`
+		SELECT id FROM forum_topic_creation_intents
+		WHERE group_id = ? AND channel_id = ? AND state = 'creating'`,
+		groupID, channelID).Scan(&existing); err != nil {
+		return 0, fmt.Errorf("load forum topic creation intent: %w", err)
+	}
+	return existing, nil
+}
+
+// JournalCreationIntent writes the real Telegram thread ID before finalization.
+func (r *ForumTopicRepository) JournalCreationIntent(intentID, threadID int64) error {
+	if r == nil || r.db == nil {
+		return errors.New("forum topic repository is not configured")
+	}
+	if intentID <= 0 || threadID <= 0 {
+		return errors.New("forum topic creation journal identifiers are invalid")
+	}
+	result, err := r.db.Conn().Exec(`
+		UPDATE forum_topic_creation_intents
+		SET message_thread_id = ?, state = 'pending_cleanup', updated_at = datetime('now')
+		WHERE id = ? AND state = 'creating'`,
+		threadID, intentID)
+	if err != nil {
+		return fmt.Errorf("journal forum topic creation: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("forum topic creation journal rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// CompleteCreationIntent removes an intent after assignment finalization or
+// successful external compensation.
+func (r *ForumTopicRepository) CompleteCreationIntent(intentID int64) error {
+	if r == nil || r.db == nil {
+		return errors.New("forum topic repository is not configured")
+	}
+	result, err := r.db.Conn().Exec(`DELETE FROM forum_topic_creation_intents WHERE id = ?`, intentID)
+	if err != nil {
+		return fmt.Errorf("complete forum topic creation intent: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("forum topic creation intent delete rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // Observe records a topic seen in an incoming Telegram update.
 func (r *ForumTopicRepository) Observe(groupID, threadID int64, name string) error {
 	return r.upsert(groupID, threadID, name, false)
@@ -23,6 +105,65 @@ func (r *ForumTopicRepository) Observe(groupID, threadID int64, name string) err
 // PersistOwned records a topic created by this bot and marks it as lifecycle-owned.
 func (r *ForumTopicRepository) PersistOwned(groupID, threadID int64, name string) error {
 	return r.upsert(groupID, threadID, name, true)
+}
+
+// PersistClosedTombstone records a lifecycle-owned topic that has already
+// been compensated. Future observation updates cannot reopen this tombstone.
+func (r *ForumTopicRepository) PersistClosedTombstone(groupID, threadID int64, name string) error {
+	if r == nil || r.db == nil {
+		return errors.New("forum topic repository is not configured")
+	}
+	name = strings.TrimSpace(name)
+	if groupID <= 0 || threadID <= 0 || name == "" {
+		return errors.New("forum topic tombstone identifiers are invalid")
+	}
+	var chatID int64
+	if err := r.db.Conn().QueryRow(`SELECT telegram_chat_id FROM groups WHERE id = ?`, groupID).Scan(&chatID); err != nil {
+		return fmt.Errorf("load forum topic tombstone chat: %w", err)
+	}
+	return r.persistClosedTombstoneIdentity(groupID, threadID, chatID, name, true)
+}
+
+// PersistClosedTombstoneByIdentity preserves a compensation tombstone after
+// the group row has been deleted.
+func (r *ForumTopicRepository) PersistClosedTombstoneByIdentity(groupID, threadID, chatID int64, name string) error {
+	if r == nil || r.db == nil {
+		return errors.New("forum topic repository is not configured")
+	}
+	return r.persistClosedTombstoneIdentity(groupID, threadID, chatID, name, false)
+}
+
+func (r *ForumTopicRepository) persistClosedTombstoneIdentity(groupID, threadID, chatID int64, name string, mirrorRegistry bool) error {
+	if groupID <= 0 || threadID <= 0 || chatID == 0 || strings.TrimSpace(name) == "" {
+		return errors.New("forum topic tombstone identifiers are invalid")
+	}
+	if _, err := r.db.Conn().Exec(`
+		INSERT INTO forum_topic_tombstones (chat_id, message_thread_id, group_id, name)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(chat_id, message_thread_id) DO UPDATE SET
+			group_id = excluded.group_id, name = excluded.name`,
+		chatID, threadID, groupID, name); err != nil {
+		return fmt.Errorf("persist forum topic tombstone: %w", err)
+	}
+	if !mirrorRegistry {
+		return nil
+	}
+	_, err := r.db.Conn().Exec(`
+		INSERT INTO forum_topics
+			(group_id, message_thread_id, name, status, lifecycle_owned, closed, close_pending, updated_at)
+		VALUES (?, ?, ?, 'persisted', 1, 1, 0, datetime('now'))
+		ON CONFLICT(group_id, message_thread_id) DO UPDATE SET
+			name = excluded.name,
+			status = 'persisted',
+			lifecycle_owned = 1,
+			closed = 1,
+			close_pending = 0,
+			updated_at = datetime('now')`,
+		groupID, threadID, name)
+	if err != nil {
+		return fmt.Errorf("persist closed forum topic tombstone: %w", err)
+	}
+	return nil
 }
 
 func (r *ForumTopicRepository) upsert(groupID, threadID int64, name string, owned bool) error {
@@ -78,7 +219,24 @@ func (r *ForumTopicRepository) Get(groupID, threadID int64) (*model.ForumTopic, 
 	).Scan(&topic.GroupID, &topic.MessageThreadID, &topic.Name, &topic.Status,
 		&owned, &closed, &pending, &topic.CreatedAt, &topic.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrNotFound
+		var tombstone model.ForumTopic
+		err = r.db.Conn().QueryRow(`
+			SELECT group_id, message_thread_id, name, 'persisted', 1, 1, 0,
+				created_at, created_at
+			FROM forum_topic_tombstones
+			WHERE group_id = ? AND message_thread_id = ?`,
+			groupID, threadID).Scan(&tombstone.GroupID, &tombstone.MessageThreadID,
+			&tombstone.Name, &tombstone.Status, &owned, &closed, &pending,
+			&tombstone.CreatedAt, &tombstone.UpdatedAt)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		if err != nil {
+			return nil, fmt.Errorf("get forum topic tombstone: %w", err)
+		}
+		tombstone.LifecycleOwned = true
+		tombstone.Closed = true
+		return &tombstone, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get forum topic: %w", err)
@@ -86,6 +244,20 @@ func (r *ForumTopicRepository) Get(groupID, threadID int64) (*model.ForumTopic, 
 	topic.LifecycleOwned = intToBool(owned)
 	topic.Closed = intToBool(closed)
 	topic.ClosePending = intToBool(pending)
+	var tombstone int
+	if err := r.db.Conn().QueryRow(`
+		SELECT EXISTS(
+			SELECT 1 FROM forum_topic_tombstones
+			WHERE group_id = ? AND message_thread_id = ?
+		)`, groupID, threadID).Scan(&tombstone); err != nil {
+		return nil, fmt.Errorf("load forum topic tombstone: %w", err)
+	}
+	if tombstone == 1 {
+		topic.LifecycleOwned = true
+		topic.Closed = true
+		topic.ClosePending = false
+		topic.Status = model.ForumTopicStatusPersisted
+	}
 	return topic, nil
 }
 
@@ -98,6 +270,11 @@ func (r *ForumTopicRepository) ListOpen(groupID int64) ([]model.ForumTopic, erro
 		SELECT group_id, message_thread_id, name, status, lifecycle_owned, closed, created_at, updated_at
 		FROM forum_topics
 		WHERE group_id = ? AND closed = 0 AND close_pending = 0
+			AND NOT EXISTS (
+				SELECT 1 FROM forum_topic_tombstones t
+				WHERE t.group_id = forum_topics.group_id
+					AND t.message_thread_id = forum_topics.message_thread_id
+			)
 		ORDER BY name COLLATE NOCASE, message_thread_id`,
 		groupID,
 	)
@@ -295,6 +472,12 @@ func (r *ForumTopicRepository) RecordCreationRecovery(groupID, threadID, chatID 
 	if err != nil {
 		return fmt.Errorf("record forum topic creation recovery: %w", err)
 	}
+	if _, err := r.db.Conn().Exec(`
+		DELETE FROM forum_topic_creation_intents
+		WHERE group_id = ? AND message_thread_id = ?`,
+		groupID, threadID); err != nil {
+		return fmt.Errorf("complete forum topic creation intent after recovery: %w", err)
+	}
 	return nil
 }
 
@@ -304,9 +487,14 @@ func (r *ForumTopicRepository) ListCreationRecoveries() ([]model.ForumTopicCreat
 		return nil, errors.New("forum topic repository is not configured")
 	}
 	rows, err := r.db.Conn().Query(`
-		SELECT group_id, message_thread_id, chat_id, name, created_at
+		SELECT 0, group_id, 0, message_thread_id, chat_id, name, 0, 'recovery', created_at
 		FROM forum_topic_creation_recovery
-		ORDER BY group_id, message_thread_id`)
+		UNION ALL
+		SELECT id, group_id, channel_id, message_thread_id, chat_id, name,
+			expected_version, state, created_at
+		FROM forum_topic_creation_intents
+		WHERE state IN ('creating', 'pending_cleanup')
+		ORDER BY 2, 4`)
 	if err != nil {
 		return nil, fmt.Errorf("list forum topic creation recoveries: %w", err)
 	}
@@ -314,8 +502,9 @@ func (r *ForumTopicRepository) ListCreationRecoveries() ([]model.ForumTopicCreat
 	var recoveries []model.ForumTopicCreationRecovery
 	for rows.Next() {
 		var recovery model.ForumTopicCreationRecovery
-		if err := rows.Scan(&recovery.GroupID, &recovery.MessageThreadID, &recovery.ChatID,
-			&recovery.Name, &recovery.CreatedAt); err != nil {
+		if err := rows.Scan(&recovery.IntentID, &recovery.GroupID, &recovery.ChannelID,
+			&recovery.MessageThreadID, &recovery.ChatID, &recovery.Name,
+			&recovery.ExpectedVersion, &recovery.State, &recovery.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan forum topic creation recovery: %w", err)
 		}
 		recoveries = append(recoveries, recovery)
@@ -342,7 +531,18 @@ func (r *ForumTopicRepository) DeleteCreationRecovery(groupID, threadID int64) e
 	if err != nil {
 		return fmt.Errorf("forum topic creation recovery rows affected: %w", err)
 	}
-	if affected == 0 {
+	intentResult, intentErr := r.db.Conn().Exec(`
+		DELETE FROM forum_topic_creation_intents
+		WHERE group_id = ? AND message_thread_id = ?`,
+		groupID, threadID)
+	if intentErr != nil {
+		return fmt.Errorf("delete forum topic creation intent: %w", intentErr)
+	}
+	intentAffected, intentErr := intentResult.RowsAffected()
+	if intentErr != nil {
+		return fmt.Errorf("forum topic creation intent rows affected: %w", intentErr)
+	}
+	if affected == 0 && intentAffected == 0 {
 		return ErrNotFound
 	}
 	return nil

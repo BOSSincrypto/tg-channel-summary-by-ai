@@ -266,8 +266,11 @@ func (r *GroupRepository) AssignChannel(groupID, channelID int64, topicThreadID 
 			SELECT 1 FROM forum_topics
 			WHERE group_id = ? AND message_thread_id = ?
 				AND (closed = 1 OR close_pending = 1)
+			UNION ALL
+			SELECT 1 FROM forum_topic_tombstones
+			WHERE group_id = ? AND message_thread_id = ?
 		 )`,
-		groupID, channelID, threadID, threadID, groupID, threadID,
+		groupID, channelID, threadID, threadID, groupID, threadID, groupID, threadID,
 	)
 	if err != nil {
 		return fmt.Errorf("assign channel: %w", err)
@@ -352,8 +355,11 @@ func (r *GroupRepository) AssignChannelOptimistic(groupID, channelID int64, topi
 			SELECT 1 FROM forum_topics
 			WHERE group_id = ? AND message_thread_id = ?
 				AND (closed = 1 OR close_pending = 1)
+			UNION ALL
+			SELECT 1 FROM forum_topic_tombstones
+			WHERE group_id = ? AND message_thread_id = ?
 		 )`,
-		groupID, channelID, threadID, threadID, groupID, threadID,
+		groupID, channelID, threadID, threadID, groupID, threadID, groupID, threadID,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("optimistic channel assignment: %w", err)
@@ -388,6 +394,14 @@ func (r *GroupRepository) AssignChannelOptimistic(groupID, channelID int64, topi
 func (r *GroupRepository) FinalizeCreatedTopicAssignment(
 	groupID, channelID, threadID, expectedVersion int64, name string,
 ) (int64, error) {
+	return r.FinalizeCreatedTopicAssignmentWithIntent(groupID, channelID, threadID, expectedVersion, name, 0)
+}
+
+// FinalizeCreatedTopicAssignmentWithIntent atomically commits the registry,
+// assignment, aggregate version, and the pre-create intent cleanup.
+func (r *GroupRepository) FinalizeCreatedTopicAssignmentWithIntent(
+	groupID, channelID, threadID, expectedVersion int64, name string, intentID int64,
+) (int64, error) {
 	if groupID <= 0 || channelID <= 0 || threadID <= 0 || expectedVersion <= 0 {
 		return 0, ErrConflict
 	}
@@ -413,6 +427,17 @@ func (r *GroupRepository) FinalizeCreatedTopicAssignment(
 	if currentVersion != expectedVersion {
 		return 0, ErrConflict
 	}
+	var tombstone int
+	if err := tx.QueryRow(`
+		SELECT EXISTS(
+			SELECT 1 FROM forum_topic_tombstones
+			WHERE group_id = ? AND message_thread_id = ?
+		)`, groupID, threadID).Scan(&tombstone); err != nil {
+		return 0, fmt.Errorf("inspect created topic tombstone: %w", err)
+	}
+	if tombstone == 1 {
+		return 0, ErrConflict
+	}
 
 	if _, err := tx.Exec(`
 		INSERT INTO forum_topics
@@ -431,6 +456,15 @@ func (r *GroupRepository) FinalizeCreatedTopicAssignment(
 			return 0, ErrDuplicate
 		}
 		return 0, fmt.Errorf("persist created topic assignment: %w", err)
+	}
+	if intentID > 0 {
+		if _, err := tx.Exec(`
+			DELETE FROM forum_topic_creation_intents
+			WHERE id = ? AND group_id = ? AND channel_id = ?
+				AND message_thread_id = ?`,
+			intentID, groupID, channelID, threadID); err != nil {
+			return 0, fmt.Errorf("complete topic creation intent: %w", err)
+		}
 	}
 	result, err := tx.Exec(`
 		UPDATE groups SET version = version + 1
@@ -673,6 +707,49 @@ func (r *GroupRepository) DeleteTopicCreationRecovery(groupID, threadID int64) e
 		return errors.New("forum topic repository is not configured")
 	}
 	return r.db.ForumTopics.DeleteCreationRecovery(groupID, threadID)
+}
+
+// BeginTopicCreationIntent commits a pre-create intent before any Telegram
+// topic is created.
+func (r *GroupRepository) BeginTopicCreationIntent(groupID, channelID, chatID, expectedVersion int64, name string) (int64, error) {
+	if r == nil || r.db == nil || r.db.ForumTopics == nil {
+		return 0, errors.New("forum topic repository is not configured")
+	}
+	return r.db.ForumTopics.BeginCreationIntent(groupID, channelID, chatID, expectedVersion, name)
+}
+
+// JournalTopicCreationIntent records Telegram's returned thread ID.
+func (r *GroupRepository) JournalTopicCreationIntent(intentID, threadID int64) error {
+	if r == nil || r.db == nil || r.db.ForumTopics == nil {
+		return errors.New("forum topic repository is not configured")
+	}
+	return r.db.ForumTopics.JournalCreationIntent(intentID, threadID)
+}
+
+// CompleteTopicCreationIntent clears a converged pre-create intent.
+func (r *GroupRepository) CompleteTopicCreationIntent(intentID int64) error {
+	if r == nil || r.db == nil || r.db.ForumTopics == nil {
+		return errors.New("forum topic repository is not configured")
+	}
+	return r.db.ForumTopics.CompleteCreationIntent(intentID)
+}
+
+// PersistClosedTopicTombstone keeps successful compensation visible only as
+// closed lifecycle-owned history.
+func (r *GroupRepository) PersistClosedTopicTombstone(groupID, threadID int64, name string) error {
+	if r == nil || r.db == nil || r.db.ForumTopics == nil {
+		return errors.New("forum topic repository is not configured")
+	}
+	return r.db.ForumTopics.PersistClosedTombstone(groupID, threadID, name)
+}
+
+// PersistClosedTopicTombstoneByIdentity keeps compensation durable when the
+// group foreign row has already been removed.
+func (r *GroupRepository) PersistClosedTopicTombstoneByIdentity(groupID, threadID, chatID int64, name string) error {
+	if r == nil || r.db == nil || r.db.ForumTopics == nil {
+		return errors.New("forum topic repository is not configured")
+	}
+	return r.db.ForumTopics.PersistClosedTombstoneByIdentity(groupID, threadID, chatID, name)
 }
 
 // GetChannelsForGroup returns full channel objects assigned to a group.

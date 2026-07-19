@@ -373,6 +373,10 @@ func (s *Server) handleGroupByID(w http.ResponseWriter, r *http.Request) {
 			writeGroupError(w, errors.New("group deletion locking is not configured"))
 			return
 		}
+		if s.forumFence != nil {
+			s.forumFence.Lock()
+			defer s.forumFence.Unlock()
+		}
 		err := s.withGroupSchedulerLifecycle(func() error {
 			group, err := s.groupService.repository.GetByID(id)
 			if err != nil {

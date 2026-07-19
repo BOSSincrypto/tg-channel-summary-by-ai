@@ -17,6 +17,7 @@ import (
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
 	"github.com/boss/tg-channel-summary-by-ai/internal/digest"
+	"github.com/boss/tg-channel-summary-by-ai/internal/forum"
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
 	"github.com/boss/tg-channel-summary-by-ai/internal/telegram"
 	"github.com/mymmrac/telego"
@@ -92,6 +93,7 @@ type Service struct {
 	botName        string
 	webAppURL      string
 	topicRegistry  forumTopicRegistry
+	topicFence     *forum.MutationFence
 	commands       map[string]CommandHandler
 	applyData      func(context.Context, *telego.Message, BotSettings) error
 	onTokenRevoked func(error)
@@ -192,6 +194,23 @@ func (s *Service) SetForumTopicRegistry(registry forumTopicRegistry) {
 	if s != nil {
 		s.topicRegistry = registry
 	}
+}
+
+// SetForumMutationFence connects topic lifecycle work to the same fence used
+// by the WebApp group-deletion boundary.
+func (s *Service) SetForumMutationFence(fence *forum.MutationFence) {
+	if s != nil {
+		s.topicFence = fence
+	}
+}
+
+func (s *Service) withTopicMutation(fn func() error) error {
+	if s.topicFence != nil {
+		return s.topicFence.With(fn)
+	}
+	s.topicMu.Lock()
+	defer s.topicMu.Unlock()
+	return fn()
 }
 
 // Start begins long polling for updates.
@@ -383,39 +402,45 @@ func (s *Service) observeForumTopicMessage(message *telego.Message) error {
 	if group.Status != "" && group.Status != model.GroupStatusActive {
 		return nil
 	}
-	switch {
-	case message.ForumTopicCreated != nil:
-		name := strings.TrimSpace(message.ForumTopicCreated.Name)
-		if name == "" {
-			return nil
-		}
-		return s.topicRegistry.Observe(group.ID, threadID, name)
-	case message.ForumTopicEdited != nil:
-		name := strings.TrimSpace(message.ForumTopicEdited.Name)
-		if name == "" {
-			return nil
-		}
-		if err := s.topicRegistry.MarkEdited(group.ID, threadID, name); err != nil {
-			if !errors.Is(err, db.ErrNotFound) {
+	observe := func() error {
+		switch {
+		case message.ForumTopicCreated != nil:
+			name := strings.TrimSpace(message.ForumTopicCreated.Name)
+			if name == "" {
+				return nil
+			}
+			return s.topicRegistry.Observe(group.ID, threadID, name)
+		case message.ForumTopicEdited != nil:
+			name := strings.TrimSpace(message.ForumTopicEdited.Name)
+			if name == "" {
+				return nil
+			}
+			if err := s.topicRegistry.MarkEdited(group.ID, threadID, name); err != nil {
+				if !errors.Is(err, db.ErrNotFound) {
+					return err
+				}
+				// Telegram can deliver an edit for a topic observed before the
+				// bot joined or before its registry was initialized. Preserve the
+				// real positive ID and name rather than dropping that catalog item.
+				return s.topicRegistry.Observe(group.ID, threadID, name)
+			}
+		case message.ForumTopicClosed != nil:
+			if err := s.topicRegistry.MarkClosed(group.ID, threadID); err != nil &&
+				!errors.Is(err, db.ErrNotFound) {
 				return err
 			}
-			// Telegram can deliver an edit for a topic observed before the
-			// bot joined or before its registry was initialized. Preserve the
-			// real positive ID and name rather than dropping that catalog item.
-			return s.topicRegistry.Observe(group.ID, threadID, name)
+		case message.ForumTopicReopened != nil:
+			if err := s.topicRegistry.MarkReopened(group.ID, threadID); err != nil &&
+				!errors.Is(err, db.ErrNotFound) {
+				return err
+			}
 		}
-	case message.ForumTopicClosed != nil:
-		if err := s.topicRegistry.MarkClosed(group.ID, threadID); err != nil &&
-			!errors.Is(err, db.ErrNotFound) {
-			return err
-		}
-	case message.ForumTopicReopened != nil:
-		if err := s.topicRegistry.MarkReopened(group.ID, threadID); err != nil &&
-			!errors.Is(err, db.ErrNotFound) {
-			return err
-		}
+		return nil
 	}
-	return nil
+	if s.topicFence != nil {
+		return s.topicFence.With(observe)
+	}
+	return observe()
 }
 
 func (s *Service) configureAdminCommands() {
@@ -846,78 +871,90 @@ func (s *Service) AssignChannelTopicWithVersion(
 	if s.groups == nil {
 		return 0, errors.New("group repository is not configured")
 	}
-	s.topicMu.Lock()
-	defer s.topicMu.Unlock()
-
-	group, err := s.groups.GetByID(groupID)
-	if err != nil {
-		return 0, fmt.Errorf("load group for topic assignment: %w", err)
-	}
-	if group.Version != expectedVersion {
-		return 0, db.ErrConflict
-	}
-	if group.Status != "" && group.Status != model.GroupStatusActive {
-		return 0, errors.New("group is not eligible for forum topics")
-	}
-	if err := s.ensureTopicPermission(ctx, group.TelegramChatID); err != nil {
-		return 0, fmt.Errorf("check topic permission before assignment: %w", err)
-	}
-
-	assignments, err := s.groups.GetChannelAssignments(groupID)
-	if err != nil {
-		return 0, fmt.Errorf("load topic assignments: %w", err)
-	}
-	for _, assignment := range assignments {
-		if assignment.ChannelID == channelID {
-			return 0, db.ErrDuplicate
-		}
-	}
-
-	if selectedThreadID != nil {
-		topic, err := s.groups.GetForumTopic(groupID, *selectedThreadID)
+	var resultVersion int64
+	err := s.withTopicMutation(func() error {
+		group, err := s.groups.GetByID(groupID)
 		if err != nil {
-			return 0, fmt.Errorf("load selected forum topic: %w", err)
+			return fmt.Errorf("load group for topic assignment: %w", err)
 		}
-		if topic.Closed || topic.ClosePending || topic.MessageThreadID <= 0 {
-			return 0, db.ErrConflict
+		if group.Version != expectedVersion {
+			return db.ErrConflict
 		}
-		return s.groups.AssignChannelOptimistic(groupID, channelID, selectedThreadID, expectedVersion)
-	}
-	if s.channels == nil {
-		return 0, errors.New("channel repository is not configured")
-	}
-	channel, err := s.channels.GetByID(channelID)
-	if err != nil {
-		return 0, fmt.Errorf("load channel for topic assignment: %w", err)
-	}
-	name := strings.TrimSpace(channel.Title)
-	if name == "" {
-		name = "@" + channel.Username
-	}
-	name = truncateRunes(name, 128)
-	topic, err := s.api.CreateForumTopic(ctx, &telego.CreateForumTopicParams{
-		ChatID: groupTelegramChatID(group.TelegramChatID),
-		Name:   name,
-	})
-	if err != nil {
-		return 0, fmt.Errorf("create topic for channel %d: %w", channelID, s.classifyTelegramError(err))
-	}
-	if topic == nil || topic.MessageThreadID <= 0 {
-		return 0, errors.New("create topic returned an invalid message thread id")
-	}
-	threadID := int64(topic.MessageThreadID)
-	nextVersion, err := s.groups.FinalizeCreatedTopicAssignment(
-		groupID, channelID, threadID, expectedVersion, name,
-	)
-	if err == nil {
-		return nextVersion, nil
-	}
+		if group.Status != "" && group.Status != model.GroupStatusActive {
+			return errors.New("group is not eligible for forum topics")
+		}
+		if err := s.ensureTopicPermission(ctx, group.TelegramChatID); err != nil {
+			return fmt.Errorf("check topic permission before assignment: %w", err)
+		}
 
-	cleanupErr := s.cleanupCreatedTopic(ctx, group, threadID, name)
-	if cleanupErr != nil {
-		return 0, fmt.Errorf("finalize topic assignment: %w; durable cleanup: %v", err, cleanupErr)
-	}
-	return 0, fmt.Errorf("finalize topic assignment: %w; external topic compensated", err)
+		assignments, err := s.groups.GetChannelAssignments(groupID)
+		if err != nil {
+			return fmt.Errorf("load topic assignments: %w", err)
+		}
+		for _, assignment := range assignments {
+			if assignment.ChannelID == channelID {
+				return db.ErrDuplicate
+			}
+		}
+
+		if selectedThreadID != nil {
+			topic, err := s.groups.GetForumTopic(groupID, *selectedThreadID)
+			if err != nil {
+				return fmt.Errorf("load selected forum topic: %w", err)
+			}
+			if topic.Closed || topic.ClosePending || topic.MessageThreadID <= 0 {
+				return db.ErrConflict
+			}
+			resultVersion, err = s.groups.AssignChannelOptimistic(groupID, channelID, selectedThreadID, expectedVersion)
+			return err
+		}
+		if s.channels == nil {
+			return errors.New("channel repository is not configured")
+		}
+		channel, err := s.channels.GetByID(channelID)
+		if err != nil {
+			return fmt.Errorf("load channel for topic assignment: %w", err)
+		}
+		name := strings.TrimSpace(channel.Title)
+		if name == "" {
+			name = "@" + channel.Username
+		}
+		name = truncateRunes(name, 128)
+		intentID, err := s.groups.BeginTopicCreationIntent(
+			groupID, channelID, group.TelegramChatID, expectedVersion, name,
+		)
+		if err != nil {
+			return fmt.Errorf("record topic creation intent: %w", err)
+		}
+		topic, err := s.api.CreateForumTopic(ctx, &telego.CreateForumTopicParams{
+			ChatID: groupTelegramChatID(group.TelegramChatID),
+			Name:   name,
+		})
+		if err != nil {
+			return fmt.Errorf("create topic for channel %d: %w", channelID, s.classifyTelegramError(err))
+		}
+		if topic == nil || topic.MessageThreadID <= 0 {
+			return errors.New("create topic returned an invalid message thread id")
+		}
+		threadID := int64(topic.MessageThreadID)
+		if err := s.groups.JournalTopicCreationIntent(intentID, threadID); err != nil {
+			return fmt.Errorf("journal created topic %d: %w", threadID, err)
+		}
+		nextVersion, err := s.groups.FinalizeCreatedTopicAssignmentWithIntent(
+			groupID, channelID, threadID, expectedVersion, name, intentID,
+		)
+		if err == nil {
+			resultVersion = nextVersion
+			return nil
+		}
+
+		cleanupErr := s.cleanupCreatedTopic(ctx, group, threadID, name)
+		if cleanupErr != nil {
+			return fmt.Errorf("finalize topic assignment: %w; durable cleanup: %v", err, cleanupErr)
+		}
+		return fmt.Errorf("finalize topic assignment: %w; external topic compensated", err)
+	})
+	return resultVersion, err
 }
 
 func (s *Service) cleanupCreatedTopic(
@@ -938,7 +975,24 @@ func (s *Service) cleanupCreatedTopic(
 		ChatID:          groupTelegramChatID(group.TelegramChatID),
 		MessageThreadID: int(threadID),
 	})
-	if err == nil {
+	if err == nil || isConvergedTopicError(err) {
+		if tombstoneErr := s.groups.PersistClosedTopicTombstone(group.ID, threadID, name); tombstoneErr != nil {
+			if tombstone, lookupErr := s.groups.GetForumTopic(group.ID, threadID); lookupErr == nil &&
+				tombstone.LifecycleOwned && tombstone.Closed {
+				_ = s.groups.DeleteTopicCreationRecovery(group.ID, threadID)
+				return nil
+			}
+			if recordErr := s.groups.RecordTopicCreationRecovery(
+				group.ID, threadID, group.TelegramChatID, name,
+			); recordErr != nil {
+				return fmt.Errorf("persist compensation tombstone: %w; record recovery: %v", tombstoneErr, recordErr)
+			}
+			return fmt.Errorf("persist compensation tombstone: %w", tombstoneErr)
+		}
+		if clearErr := s.groups.DeleteTopicCreationRecovery(group.ID, threadID); clearErr != nil &&
+			!errors.Is(clearErr, db.ErrNotFound) {
+			return fmt.Errorf("clear compensated topic recovery: %w", clearErr)
+		}
 		return nil
 	}
 	classified := s.classifyTelegramError(err)
@@ -957,67 +1011,96 @@ func (s *Service) ReconcilePendingTopicCreations(ctx context.Context) error {
 	if s == nil || s.api == nil || s.groups == nil {
 		return nil
 	}
-	s.topicMu.Lock()
-	defer s.topicMu.Unlock()
-	recoveries, err := s.groups.ListPendingTopicCreationRecoveries()
-	if err != nil {
-		return fmt.Errorf("list topic creation recoveries: %w", err)
-	}
-	var reconcileErr error
-	for _, recovery := range recoveries {
-		group, err := s.groups.GetByID(recovery.GroupID)
+	return s.withTopicMutation(func() error {
+		recoveries, err := s.groups.ListPendingTopicCreationRecoveries()
 		if err != nil {
-			reconcileErr = errors.Join(reconcileErr,
-				fmt.Errorf("load recovery group %d: %w", recovery.GroupID, err))
-			continue
+			return fmt.Errorf("list topic creation recoveries: %w", err)
 		}
-		assignments, err := s.groups.GetChannelAssignments(recovery.GroupID)
-		if err != nil {
-			reconcileErr = errors.Join(reconcileErr,
-				fmt.Errorf("load recovery assignments %d: %w", recovery.MessageThreadID, err))
-			continue
-		}
-		if hasTopicAssignment(assignments, recovery.MessageThreadID) {
-			// A concurrent finalization owns the topic now only when its
-			// registry row is present as well. Otherwise retain the recovery
-			// record and never delete a topic referenced by an assignment.
-			topic, topicErr := s.groups.GetForumTopic(recovery.GroupID, recovery.MessageThreadID)
-			if topicErr != nil || !topic.LifecycleOwned {
-				if topicErr != nil && !errors.Is(topicErr, db.ErrNotFound) {
+		var reconcileErr error
+		for _, recovery := range recoveries {
+			if recovery.MessageThreadID <= 0 {
+				// The Telegram response was not journaled yet. Preserve the
+				// pre-create intent for operator/restart inspection rather than
+				// issuing an invalid topic mutation.
+				continue
+			}
+			chatID := recovery.ChatID
+			var group *model.Group
+			group, err = s.groups.GetByID(recovery.GroupID)
+			if err == nil {
+				chatID = group.TelegramChatID
+			} else if !errors.Is(err, db.ErrNotFound) {
+				reconcileErr = errors.Join(reconcileErr,
+					fmt.Errorf("load recovery group %d: %w", recovery.GroupID, err))
+				continue
+			}
+			var assignments []model.GroupChannel
+			if group != nil {
+				assignments, err = s.groups.GetChannelAssignments(recovery.GroupID)
+				if err != nil {
 					reconcileErr = errors.Join(reconcileErr,
-						fmt.Errorf("inspect converged topic %d: %w", recovery.MessageThreadID, topicErr))
+						fmt.Errorf("load recovery assignments %d: %w", recovery.MessageThreadID, err))
+					continue
 				}
+			}
+			if group != nil && hasTopicAssignment(assignments, recovery.MessageThreadID) {
+				// A concurrent finalization owns the topic now only when its
+				// registry row is present as well. Otherwise retain the recovery
+				// record and never delete a topic referenced by an assignment.
+				topic, topicErr := s.groups.GetForumTopic(recovery.GroupID, recovery.MessageThreadID)
+				if topicErr != nil || !topic.LifecycleOwned {
+					if topicErr != nil && !errors.Is(topicErr, db.ErrNotFound) {
+						reconcileErr = errors.Join(reconcileErr,
+							fmt.Errorf("inspect converged topic %d: %w", recovery.MessageThreadID, topicErr))
+					}
+					continue
+				}
+				if err := s.groups.DeleteTopicCreationRecovery(
+					recovery.GroupID, recovery.MessageThreadID,
+				); err != nil && !errors.Is(err, db.ErrNotFound) {
+					reconcileErr = errors.Join(reconcileErr,
+						fmt.Errorf("clear converged topic recovery %d: %w", recovery.MessageThreadID, err))
+				}
+				continue
+			}
+			if err := s.ensureTopicPermission(ctx, chatID); err != nil {
+				reconcileErr = errors.Join(reconcileErr,
+					fmt.Errorf("check recovery topic permission %d: %w", recovery.MessageThreadID, err))
+				continue
+			}
+			if err := s.api.DeleteForumTopic(ctx, &telego.DeleteForumTopicParams{
+				ChatID:          groupTelegramChatID(chatID),
+				MessageThreadID: int(recovery.MessageThreadID),
+			}); err != nil && !isConvergedTopicError(err) {
+				reconcileErr = errors.Join(reconcileErr,
+					fmt.Errorf("reconcile created topic %d: %w", recovery.MessageThreadID, s.classifyTelegramError(err)))
+				continue
+			}
+			if group != nil {
+				if err := s.groups.PersistClosedTopicTombstone(group.ID, recovery.MessageThreadID, recovery.Name); err != nil {
+					if tombstone, lookupErr := s.groups.GetForumTopic(group.ID, recovery.MessageThreadID); lookupErr != nil ||
+						!tombstone.LifecycleOwned || !tombstone.Closed {
+						reconcileErr = errors.Join(reconcileErr,
+							fmt.Errorf("persist compensated topic tombstone %d: %w", recovery.MessageThreadID, err))
+						continue
+					}
+				}
+			} else if err := s.groups.PersistClosedTopicTombstoneByIdentity(
+				recovery.GroupID, recovery.MessageThreadID, recovery.ChatID, recovery.Name,
+			); err != nil {
+				reconcileErr = errors.Join(reconcileErr,
+					fmt.Errorf("persist deleted-group topic tombstone %d: %w", recovery.MessageThreadID, err))
 				continue
 			}
 			if err := s.groups.DeleteTopicCreationRecovery(
 				recovery.GroupID, recovery.MessageThreadID,
 			); err != nil && !errors.Is(err, db.ErrNotFound) {
 				reconcileErr = errors.Join(reconcileErr,
-					fmt.Errorf("clear converged topic recovery %d: %w", recovery.MessageThreadID, err))
+					fmt.Errorf("clear topic recovery %d: %w", recovery.MessageThreadID, err))
 			}
-			continue
 		}
-		if err := s.ensureTopicPermission(ctx, group.TelegramChatID); err != nil {
-			reconcileErr = errors.Join(reconcileErr,
-				fmt.Errorf("check recovery topic permission %d: %w", recovery.MessageThreadID, err))
-			continue
-		}
-		if err := s.api.DeleteForumTopic(ctx, &telego.DeleteForumTopicParams{
-			ChatID:          groupTelegramChatID(group.TelegramChatID),
-			MessageThreadID: int(recovery.MessageThreadID),
-		}); err != nil {
-			reconcileErr = errors.Join(reconcileErr,
-				fmt.Errorf("reconcile created topic %d: %w", recovery.MessageThreadID, s.classifyTelegramError(err)))
-			continue
-		}
-		if err := s.groups.DeleteTopicCreationRecovery(
-			recovery.GroupID, recovery.MessageThreadID,
-		); err != nil && !errors.Is(err, db.ErrNotFound) {
-			reconcileErr = errors.Join(reconcileErr,
-				fmt.Errorf("clear topic recovery %d: %w", recovery.MessageThreadID, err))
-		}
-	}
-	return reconcileErr
+		return reconcileErr
+	})
 }
 
 // RenameChannelTopic updates the Telegram topic name for an assignment.
@@ -1077,6 +1160,13 @@ func (s *Service) removeChannelTopic(ctx context.Context, groupID, channelID, ex
 	if s.groups == nil {
 		return 0, errors.New("group repository is not configured")
 	}
+	if s.topicFence != nil {
+		s.topicFence.Lock()
+		defer s.topicFence.Unlock()
+	} else {
+		s.topicMu.Lock()
+		defer s.topicMu.Unlock()
+	}
 	group, err := s.groups.GetByID(groupID)
 	if err != nil {
 		return 0, fmt.Errorf("load group: %w", err)
@@ -1087,8 +1177,6 @@ func (s *Service) removeChannelTopic(ctx context.Context, groupID, channelID, ex
 	if err := s.ensureTopicPermission(ctx, group.TelegramChatID); err != nil {
 		return 0, fmt.Errorf("check topic permission before removal: %w", err)
 	}
-	s.topicMu.Lock()
-	defer s.topicMu.Unlock()
 	unassign := func() (int64, error) {
 		if expectedVersion <= 0 {
 			if err := s.groups.UnassignChannel(groupID, channelID); err != nil {
@@ -1190,7 +1278,7 @@ func (s *Service) removeChannelTopic(ctx context.Context, groupID, channelID, ex
 	}
 	if err := s.api.CloseForumTopic(ctx, &telego.CloseForumTopicParams{
 		MessageThreadID: int(threadID),
-	}); err != nil {
+	}); err != nil && !isAlreadyClosedTopicError(err) {
 		if coordinated {
 			return 0, fmt.Errorf("close topic: %w; durable close intent remains pending", s.classifyTelegramError(err))
 		}
@@ -1219,6 +1307,30 @@ func (s *Service) removeChannelTopic(ctx context.Context, groupID, channelID, ex
 	return 0, nil
 }
 
+func isConvergedTopicError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "message thread not found") ||
+		strings.Contains(message, "topic not found") ||
+		strings.Contains(message, "already deleted") ||
+		strings.Contains(message, "topic was deleted")
+}
+
+func isAlreadyClosedTopicError(err error) bool {
+	if isConvergedTopicError(err) {
+		return true
+	}
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "topic_closed") ||
+		strings.Contains(message, "topic closed") ||
+		strings.Contains(message, "already closed")
+}
+
 // ReconcilePendingTopicClosures retries durable close intents once during
 // startup. Pending topics stay hidden from the catalog until Telegram close
 // and registry finalization both succeed.
@@ -1226,8 +1338,13 @@ func (s *Service) ReconcilePendingTopicClosures(ctx context.Context) error {
 	if s == nil || s.api == nil || s.groups == nil || s.topicRegistry == nil {
 		return nil
 	}
-	s.topicMu.Lock()
-	defer s.topicMu.Unlock()
+	if s.topicFence != nil {
+		s.topicFence.Lock()
+		defer s.topicFence.Unlock()
+	} else {
+		s.topicMu.Lock()
+		defer s.topicMu.Unlock()
+	}
 	coordinator, ok := s.topicRegistry.(forumTopicCloseCoordinator)
 	if !ok {
 		return nil
@@ -1269,7 +1386,7 @@ func (s *Service) ReconcilePendingTopicClosures(ctx context.Context) error {
 		if err := s.api.CloseForumTopic(ctx, &telego.CloseForumTopicParams{
 			ChatID:          groupTelegramChatID(group.TelegramChatID),
 			MessageThreadID: int(topic.MessageThreadID),
-		}); err != nil {
+		}); err != nil && !isAlreadyClosedTopicError(err) {
 			reconcileErr = errors.Join(reconcileErr, fmt.Errorf("reconcile close topic %d: %w", topic.MessageThreadID, s.classifyTelegramError(err)))
 			continue
 		}

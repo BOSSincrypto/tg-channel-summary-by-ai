@@ -21,6 +21,7 @@ import (
 	"github.com/boss/tg-channel-summary-by-ai/internal/config"
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
 	"github.com/boss/tg-channel-summary-by-ai/internal/digest"
+	"github.com/boss/tg-channel-summary-by-ai/internal/forum"
 	"github.com/boss/tg-channel-summary-by-ai/internal/lifecycle"
 	"github.com/boss/tg-channel-summary-by-ai/internal/maintenance"
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
@@ -82,6 +83,8 @@ func main() {
 		log.Fatalf("failed to configure WebApp authentication: %v", err)
 	}
 	srv := webapp.NewWithProvidersAuthenticated(store, 10*time.Second, http.DefaultClient, webAppAuth)
+	forumFence := &forum.MutationFence{}
+	srv.SetForumMutationFence(forumFence)
 	revocationHandler := func(err error) {
 		log.Printf("FATAL: Bot token revoked (401 Unauthorized): %v", err)
 		srv.EnterTerminal(err)
@@ -116,6 +119,7 @@ func main() {
 	}
 	telegramBot.SetTokenRevocationHandler(revocationHandler)
 	srv.SetTopicLifecycle(telegramBot)
+	telegramBot.SetForumMutationFence(forumFence)
 	telegramBot.SetForumTopicRegistry(store.ForumTopics)
 	if err := telegramBot.ReconcilePendingTopicClosures(context.Background()); err != nil {
 		log.Printf("pending forum topic reconciliation incomplete: %v", err)

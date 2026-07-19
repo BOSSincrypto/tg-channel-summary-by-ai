@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
+	"github.com/boss/tg-channel-summary-by-ai/internal/forum"
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
 	"github.com/boss/tg-channel-summary-by-ai/internal/parser"
 	staticwebapp "github.com/boss/tg-channel-summary-by-ai/webapp"
@@ -30,6 +31,7 @@ type Server struct {
 	groupService     *GroupService
 	groupScheduler   GroupScheduler
 	groupLifecycleMu sync.Mutex
+	forumFence       *forum.MutationFence
 	digestRunner     DigestRunner
 	settingsApplier  SettingsApplier
 	digestJobs       *digestJobStore
@@ -342,6 +344,14 @@ func (s *Server) SetTokenRevocationHandler(handler func(error)) {
 func (s *Server) SetTopicLifecycle(lifecycle TopicLifecycle) {
 	if s.groupService != nil {
 		s.groupService.SetTopicLifecycle(lifecycle)
+	}
+}
+
+// SetForumMutationFence shares the Telegram forum lifecycle fence with group
+// deletion and any other WebApp mutation boundary.
+func (s *Server) SetForumMutationFence(fence *forum.MutationFence) {
+	if s != nil {
+		s.forumFence = fence
 	}
 }
 

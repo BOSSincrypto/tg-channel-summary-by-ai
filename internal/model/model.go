@@ -57,10 +57,14 @@ type ForumTopic struct {
 // ForumTopicCreationRecovery records an externally created topic whose
 // durable assignment could not be finalized and must be cleaned up.
 type ForumTopicCreationRecovery struct {
+	IntentID        int64
 	GroupID         int64
+	ChannelID       int64
 	MessageThreadID int64
 	ChatID          int64
 	Name            string
+	ExpectedVersion int64
+	State           string
 	CreatedAt       string
 }
 

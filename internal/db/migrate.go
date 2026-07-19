@@ -28,6 +28,12 @@ func runMigrations(conn *sql.DB) error {
 	if err := ensureForumTopicClosePendingColumn(conn); err != nil {
 		return fmt.Errorf("migrate forum topic recovery state: %w", err)
 	}
+	if err := ensureForumTopicCreationIntentTable(conn); err != nil {
+		return fmt.Errorf("migrate forum topic creation intents: %w", err)
+	}
+	if err := ensureForumTopicRecoveryIdentity(conn); err != nil {
+		return fmt.Errorf("migrate forum topic recovery identity: %w", err)
+	}
 	return nil
 }
 
@@ -167,6 +173,115 @@ func ensureForumTopicClosePendingColumn(conn *sql.DB) error {
 		if _, err := conn.Exec(`ALTER TABLE forum_topics ADD COLUMN close_pending INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return fmt.Errorf("add forum_topics.close_pending: %w", err)
 		}
+	}
+	return nil
+}
+
+func ensureForumTopicCreationIntentTable(conn *sql.DB) error {
+	_, err := conn.Exec(`
+		CREATE TABLE IF NOT EXISTS forum_topic_creation_intents (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			group_id INTEGER NOT NULL,
+			channel_id INTEGER NOT NULL,
+			chat_id INTEGER NOT NULL,
+			message_thread_id INTEGER NOT NULL DEFAULT 0 CHECK (message_thread_id >= 0),
+			expected_version INTEGER NOT NULL,
+			name TEXT NOT NULL,
+			state TEXT NOT NULL DEFAULT 'creating',
+			created_at TEXT DEFAULT (datetime('now')),
+			updated_at TEXT DEFAULT (datetime('now')),
+			UNIQUE(group_id, channel_id, state)
+		)`)
+	if err != nil {
+		return fmt.Errorf("create forum topic creation intents: %w", err)
+	}
+	_, err = conn.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_forum_topic_creation_intents_pending
+		ON forum_topic_creation_intents(state, chat_id, message_thread_id)`)
+	if err != nil {
+		return fmt.Errorf("index forum topic creation intents: %w", err)
+	}
+	_, err = conn.Exec(`
+		CREATE TABLE IF NOT EXISTS forum_topic_tombstones (
+			chat_id INTEGER NOT NULL,
+			message_thread_id INTEGER NOT NULL CHECK (message_thread_id > 0),
+			group_id INTEGER NOT NULL,
+			name TEXT NOT NULL,
+			created_at TEXT DEFAULT (datetime('now')),
+			PRIMARY KEY(chat_id, message_thread_id)
+		)`)
+	if err != nil {
+		return fmt.Errorf("create forum topic tombstones: %w", err)
+	}
+	return nil
+}
+
+func ensureForumTopicRecoveryIdentity(conn *sql.DB) (err error) {
+	rows, err := conn.Query(`PRAGMA foreign_key_list(forum_topic_creation_recovery)`)
+	if err != nil {
+		return fmt.Errorf("inspect topic recovery foreign keys: %w", err)
+	}
+	hasGroupForeignKey := false
+	for rows.Next() {
+		var id, seq int
+		var table, from, to, onUpdate, onDelete, match string
+		if err := rows.Scan(&id, &seq, &table, &from, &to, &onUpdate, &onDelete, &match); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan topic recovery foreign key: %w", err)
+		}
+		if table == "groups" && from == "group_id" {
+			hasGroupForeignKey = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate topic recovery foreign keys: %w", err)
+	}
+	rows.Close()
+	if !hasGroupForeignKey {
+		return nil
+	}
+	if _, err := conn.Exec(`PRAGMA foreign_keys = OFF`); err != nil {
+		return fmt.Errorf("disable foreign keys for topic recovery migration: %w", err)
+	}
+	defer func() {
+		if _, restoreErr := conn.Exec(`PRAGMA foreign_keys = ON`); restoreErr != nil && err == nil {
+			err = fmt.Errorf("restore foreign keys after topic recovery migration: %w", restoreErr)
+		}
+	}()
+	if _, err := conn.Exec(`DROP INDEX IF EXISTS idx_forum_topic_creation_recovery_group`); err != nil {
+		return fmt.Errorf("drop topic recovery index: %w", err)
+	}
+	if _, err := conn.Exec(`
+		ALTER TABLE forum_topic_creation_recovery
+		RENAME TO forum_topic_creation_recovery_legacy`); err != nil {
+		return fmt.Errorf("rename legacy topic recovery: %w", err)
+	}
+	if _, err := conn.Exec(`
+		CREATE TABLE forum_topic_creation_recovery (
+			group_id INTEGER NOT NULL,
+			message_thread_id INTEGER NOT NULL CHECK (message_thread_id > 0),
+			chat_id INTEGER NOT NULL,
+			name TEXT NOT NULL,
+			created_at TEXT DEFAULT (datetime('now')),
+			PRIMARY KEY(group_id, message_thread_id)
+		)`); err != nil {
+		return fmt.Errorf("create durable topic recovery table: %w", err)
+	}
+	if _, err := conn.Exec(`
+		INSERT INTO forum_topic_creation_recovery
+			(group_id, message_thread_id, chat_id, name, created_at)
+		SELECT group_id, message_thread_id, chat_id, name, created_at
+		FROM forum_topic_creation_recovery_legacy`); err != nil {
+		return fmt.Errorf("copy legacy topic recoveries: %w", err)
+	}
+	if _, err := conn.Exec(`DROP TABLE forum_topic_creation_recovery_legacy`); err != nil {
+		return fmt.Errorf("drop legacy topic recovery: %w", err)
+	}
+	if _, err := conn.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_forum_topic_creation_recovery_group
+		ON forum_topic_creation_recovery(group_id, message_thread_id)`); err != nil {
+		return fmt.Errorf("recreate topic recovery index: %w", err)
 	}
 	return nil
 }
@@ -316,7 +431,7 @@ var migrations = []string{
 	// 11. forum topic creation recovery
 	// --------------------------------------------------
 	`CREATE TABLE IF NOT EXISTS forum_topic_creation_recovery (
-		group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+		group_id INTEGER NOT NULL,
 		message_thread_id INTEGER NOT NULL CHECK (message_thread_id > 0),
 		chat_id INTEGER NOT NULL,
 		name TEXT NOT NULL,

@@ -151,8 +151,13 @@ func (r *GroupRepository) AssignChannel(groupID, channelID int64, topicThreadID 
 	}
 	result, err := r.db.Conn().Exec(
 		`INSERT OR IGNORE INTO group_channels (group_id, channel_id, topic_thread_id)
-		 VALUES (?, ?, ?)`,
-		groupID, channelID, threadID,
+		 SELECT ?, ?, ?
+		 WHERE ? IS NULL OR NOT EXISTS (
+			SELECT 1 FROM forum_topics
+			WHERE group_id = ? AND message_thread_id = ?
+				AND (closed = 1 OR close_pending = 1)
+		 )`,
+		groupID, channelID, threadID, threadID, groupID, threadID,
 	)
 	if err != nil {
 		return fmt.Errorf("assign channel: %w", err)
@@ -162,7 +167,18 @@ func (r *GroupRepository) AssignChannel(groupID, channelID int64, topicThreadID 
 		return fmt.Errorf("assign channel rows affected: %w", err)
 	}
 	if affected == 0 {
-		return ErrDuplicate
+		var exists int
+		if err := r.db.Conn().QueryRow(`
+			SELECT EXISTS(
+				SELECT 1 FROM group_channels
+				WHERE group_id = ? AND channel_id = ?
+			)`, groupID, channelID).Scan(&exists); err != nil {
+			return fmt.Errorf("check existing channel assignment: %w", err)
+		}
+		if exists == 1 {
+			return ErrDuplicate
+		}
+		return ErrConflict
 	}
 	return nil
 }

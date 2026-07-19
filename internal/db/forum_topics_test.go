@@ -139,3 +139,76 @@ func TestForumTopicRegistryPersistsPendingCloseAndHidesItFromCatalog(t *testing.
 		t.Fatalf("closed topic = %#v, want finalized", topic)
 	}
 }
+
+func TestForumTopicBeginCloseRejectsSurvivingAssignment(t *testing.T) {
+	store, cleanup := newTestDB(t)
+	defer cleanup()
+	groupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: -100206,
+		Status:         model.GroupStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	channelID, err := store.Channels.Insert(&model.Channel{Username: "surviving_assignment"})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	threadID := int64(906)
+	if err := store.ForumTopics.PersistOwned(groupID, threadID, "Surviving assignment"); err != nil {
+		t.Fatalf("persist owned topic: %v", err)
+	}
+	if err := store.Groups.AssignChannel(groupID, channelID, &threadID); err != nil {
+		t.Fatalf("assign topic: %v", err)
+	}
+
+	if err := store.ForumTopics.BeginClose(groupID, threadID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("begin close with surviving assignment = %v, want ErrNotFound", err)
+	}
+	topic, err := store.ForumTopics.Get(groupID, threadID)
+	if err != nil {
+		t.Fatalf("get topic after rejected close: %v", err)
+	}
+	if topic.ClosePending || topic.Closed {
+		t.Fatalf("topic after rejected close = %#v, want open and not pending", topic)
+	}
+}
+
+func TestAssignChannelRejectsPendingOrClosedTopic(t *testing.T) {
+	store, cleanup := newTestDB(t)
+	defer cleanup()
+	groupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: -100207,
+		Status:         model.GroupStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	channelID, err := store.Channels.Insert(&model.Channel{Username: "blocked_topic"})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	threadID := int64(907)
+	if err := store.ForumTopics.PersistOwned(groupID, threadID, "Blocked topic"); err != nil {
+		t.Fatalf("persist topic: %v", err)
+	}
+	for _, state := range []string{"pending", "closed"} {
+		t.Run(state, func(t *testing.T) {
+			if state == "pending" {
+				if err := store.ForumTopics.BeginClose(groupID, threadID); err != nil {
+					t.Fatalf("begin close: %v", err)
+				}
+			} else {
+				if err := store.ForumTopics.MarkClosed(groupID, threadID); err != nil {
+					t.Fatalf("mark closed: %v", err)
+				}
+			}
+			if err := store.Groups.AssignChannel(groupID, channelID, &threadID); !errors.Is(err, ErrConflict) {
+				t.Fatalf("assign %s topic = %v, want ErrConflict", state, err)
+			}
+			if err := store.ForumTopics.MarkReopened(groupID, threadID); err != nil {
+				t.Fatalf("reset topic: %v", err)
+			}
+		})
+	}
+}

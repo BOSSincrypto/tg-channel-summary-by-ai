@@ -93,9 +93,10 @@ type Service struct {
 	applyData      func(context.Context, *telego.Message, BotSettings) error
 	onTokenRevoked func(error)
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	stopMu sync.Mutex
+	ctx     context.Context
+	cancel  context.CancelFunc
+	stopMu  sync.Mutex
+	topicMu sync.Mutex
 }
 
 // New creates an unconfigured service. Use NewWithConfig for production.
@@ -840,6 +841,8 @@ func (s *Service) RemoveChannelTopic(ctx context.Context, groupID, channelID int
 	if s.groups == nil {
 		return errors.New("group repository is not configured")
 	}
+	s.topicMu.Lock()
+	defer s.topicMu.Unlock()
 	threadID, chatID, err := s.topicAssignment(groupID, channelID)
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
@@ -865,32 +868,51 @@ func (s *Service) RemoveChannelTopic(ctx context.Context, groupID, channelID int
 	if err != nil {
 		return fmt.Errorf("load topic assignments: %w", err)
 	}
-	shared := false
-	for _, assignment := range assignments {
-		if assignment.ChannelID == channelID || assignment.TopicThreadID == nil {
-			continue
-		}
-		if *assignment.TopicThreadID == threadID {
-			shared = true
-			break
-		}
-	}
+	shared := hasOtherTopicAssignment(assignments, channelID, threadID)
 	closeCoordinator, coordinated := s.topicRegistry.(forumTopicCloseCoordinator)
 	if registeredTopic != nil && registeredTopic.Closed {
 		return s.groups.UnassignChannel(groupID, channelID)
 	}
+	// The initial shared-assignment check deliberately happens before close
+	// intent. A shared removal still continues through the guarded close path
+	// after unassignment, so the final removal can close an otherwise-unused
+	// lifecycle-owned topic without closing a topic that still has a survivor.
+	if shared {
+		if err := s.groups.UnassignChannel(groupID, channelID); err != nil {
+			return fmt.Errorf("remove shared topic assignment: %w", err)
+		}
+	} else {
+		// Remove the assignment before recording close intent. This keeps an
+		// assignment-persistence failure from creating a pending close that
+		// still points at the topic. BeginClose below atomically verifies that
+		// no other assignment appeared while this removal was in flight.
+		if err := s.groups.UnassignChannel(groupID, channelID); err != nil {
+			return fmt.Errorf("remove topic assignment: %w", err)
+		}
+	}
 	if coordinated {
 		if err := closeCoordinator.BeginClose(groupID, threadID); err != nil {
 			if errors.Is(err, db.ErrNotFound) {
-				return s.groups.UnassignChannel(groupID, channelID)
+				return nil
 			}
 			return fmt.Errorf("record topic close intent: %w", err)
 		}
 	}
-	if err := s.groups.UnassignChannel(groupID, channelID); err != nil {
-		return fmt.Errorf("remove topic assignment: %w", err)
+	// Re-read group_channels immediately before the irreversible Telegram
+	// close. A concurrent assignment, or an assignment whose persistence
+	// failed during the removal, must cancel this pending close instead of
+	// allowing recovery to close a still-referenced topic.
+	assignments, err = s.groups.GetChannelAssignments(groupID)
+	if err != nil {
+		return fmt.Errorf("recheck topic assignments before close: %w", err)
 	}
-	if shared {
+	if hasTopicAssignment(assignments, threadID) {
+		if coordinated {
+			if err := s.topicRegistry.MarkReopened(groupID, threadID); err != nil &&
+				!errors.Is(err, db.ErrNotFound) {
+				return fmt.Errorf("cancel shared topic close: %w", err)
+			}
+		}
 		return nil
 	}
 	if err := s.api.CloseForumTopic(ctx, &telego.CloseForumTopicParams{
@@ -929,6 +951,8 @@ func (s *Service) ReconcilePendingTopicClosures(ctx context.Context) error {
 	if s == nil || s.api == nil || s.groups == nil || s.topicRegistry == nil {
 		return nil
 	}
+	s.topicMu.Lock()
+	defer s.topicMu.Unlock()
 	coordinator, ok := s.topicRegistry.(forumTopicCloseCoordinator)
 	if !ok {
 		return nil
@@ -947,6 +971,18 @@ func (s *Service) ReconcilePendingTopicClosures(ctx context.Context) error {
 			reconcileErr = errors.Join(reconcileErr, fmt.Errorf("load pending topic group %d: %w", topic.GroupID, err))
 			continue
 		}
+		assignments, err := s.groups.GetChannelAssignments(topic.GroupID)
+		if err != nil {
+			reconcileErr = errors.Join(reconcileErr, fmt.Errorf("recheck pending topic assignments %d: %w", topic.MessageThreadID, err))
+			continue
+		}
+		if hasTopicAssignment(assignments, topic.MessageThreadID) {
+			if err := s.topicRegistry.MarkReopened(topic.GroupID, topic.MessageThreadID); err != nil &&
+				!errors.Is(err, db.ErrNotFound) {
+				reconcileErr = errors.Join(reconcileErr, fmt.Errorf("cancel pending topic close %d: %w", topic.MessageThreadID, err))
+			}
+			continue
+		}
 		if err := s.api.CloseForumTopic(ctx, &telego.CloseForumTopicParams{
 			ChatID:          groupTelegramChatID(group.TelegramChatID),
 			MessageThreadID: int(topic.MessageThreadID),
@@ -960,6 +996,27 @@ func (s *Service) ReconcilePendingTopicClosures(ctx context.Context) error {
 		}
 	}
 	return reconcileErr
+}
+
+func hasOtherTopicAssignment(assignments []model.GroupChannel, removedChannelID, threadID int64) bool {
+	for _, assignment := range assignments {
+		if assignment.ChannelID == removedChannelID || assignment.TopicThreadID == nil {
+			continue
+		}
+		if *assignment.TopicThreadID == threadID {
+			return true
+		}
+	}
+	return false
+}
+
+func hasTopicAssignment(assignments []model.GroupChannel, threadID int64) bool {
+	for _, assignment := range assignments {
+		if assignment.TopicThreadID != nil && *assignment.TopicThreadID == threadID {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) topicAssignment(groupID, channelID int64) (threadID, chatID int64, err error) {

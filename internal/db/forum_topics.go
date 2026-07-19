@@ -162,7 +162,8 @@ func (r *ForumTopicRepository) MarkReopened(groupID, threadID int64) error {
 
 // BeginClose durably records that an owned topic is being closed before the
 // Telegram side effect. Pending topics are hidden from the WebApp catalog and
-// can be retried after a process restart.
+// can be retried after a process restart. The assignment guard is part of the
+// same SQLite write so a surviving group_channels row rejects the intent.
 func (r *ForumTopicRepository) BeginClose(groupID, threadID int64) error {
 	if r == nil || r.db == nil {
 		return errors.New("forum topic repository is not configured")
@@ -171,8 +172,12 @@ func (r *ForumTopicRepository) BeginClose(groupID, threadID int64) error {
 		UPDATE forum_topics
 		SET close_pending = 1, updated_at = datetime('now')
 		WHERE group_id = ? AND message_thread_id = ?
-			AND lifecycle_owned = 1 AND closed = 0`,
-		groupID, threadID,
+			AND lifecycle_owned = 1 AND closed = 0
+			AND NOT EXISTS (
+				SELECT 1 FROM group_channels
+				WHERE group_id = ? AND topic_thread_id = ?
+			)`,
+		groupID, threadID, groupID, threadID,
 	)
 	if err != nil {
 		return fmt.Errorf("begin forum topic close: %w", err)

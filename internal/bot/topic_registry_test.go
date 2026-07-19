@@ -3,10 +3,15 @@ package bot
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
+	"github.com/boss/tg-channel-summary-by-ai/internal/webapp"
 	"github.com/mymmrac/telego"
 )
 
@@ -250,5 +255,187 @@ func TestProductionTopicCloseFailureLeavesDurablePendingRecovery(t *testing.T) {
 	}
 	if len(api.closedTopics) != 2 {
 		t.Fatalf("repeat reconciliation close calls = %d, want idempotent no-op", len(api.closedTopics))
+	}
+}
+
+func TestPendingCloseReconciliationCancelsWhenAssignmentPersistenceFails(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+	groupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: -100305,
+		Title:          "Forum",
+		Status:         model.GroupStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	channelID, err := store.Channels.Insert(&model.Channel{Username: "assignment_failure"})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	threadID := int64(1903)
+	if err := store.Groups.AssignChannel(groupID, channelID, &threadID); err != nil {
+		t.Fatalf("assign channel: %v", err)
+	}
+	if err := store.ForumTopics.PersistOwned(groupID, threadID, "Assignment failure"); err != nil {
+		t.Fatalf("persist topic: %v", err)
+	}
+	if _, err := store.Conn().Exec(`
+		CREATE TRIGGER reject_topic_unassignment
+		BEFORE DELETE ON group_channels
+		BEGIN
+			SELECT RAISE(ABORT, 'unassignment persistence failure');
+		END`); err != nil {
+		t.Fatalf("create unassignment trigger: %v", err)
+	}
+
+	api := &fakeTelegramClient{}
+	service := newServiceForTest(api, nil)
+	service.groups = store.Groups
+	service.SetForumTopicRegistry(store.ForumTopics)
+	if err := service.RemoveChannelTopic(context.Background(), groupID, channelID); err == nil {
+		t.Fatal("remove topic succeeded despite assignment persistence failure")
+	}
+	if len(api.closedTopics) != 0 {
+		t.Fatalf("close calls after assignment failure = %#v, want none", api.closedTopics)
+	}
+	topic, err := store.ForumTopics.Get(groupID, threadID)
+	if err != nil {
+		t.Fatalf("load pending topic: %v", err)
+	}
+	if topic.ClosePending || topic.Closed {
+		t.Fatalf("topic after assignment failure = %#v, want open and not pending", topic)
+	}
+	assignments, err := store.Groups.GetChannelAssignments(groupID)
+	if err != nil {
+		t.Fatalf("load surviving assignment: %v", err)
+	}
+	if len(assignments) != 1 || assignments[0].TopicThreadID == nil ||
+		*assignments[0].TopicThreadID != threadID {
+		t.Fatalf("surviving assignment = %#v", assignments)
+	}
+
+	if _, err := store.Conn().Exec(`
+		UPDATE forum_topics
+		SET close_pending = 1
+		WHERE group_id = ? AND message_thread_id = ?`, groupID, threadID); err != nil {
+		t.Fatalf("seed legacy pending close: %v", err)
+	}
+	if err := service.ReconcilePendingTopicClosures(context.Background()); err != nil {
+		t.Fatalf("reconcile surviving assignment: %v", err)
+	}
+	if len(api.closedTopics) != 0 {
+		t.Fatalf("close calls during assignment reconciliation = %#v, want none", api.closedTopics)
+	}
+	topic, err = store.ForumTopics.Get(groupID, threadID)
+	if err != nil {
+		t.Fatalf("load reopened pending topic: %v", err)
+	}
+	if topic.ClosePending || topic.Closed {
+		t.Fatalf("topic after assignment reconciliation = %#v, want open and not pending", topic)
+	}
+	if _, err := store.Conn().Exec(`DROP TRIGGER reject_topic_unassignment`); err != nil {
+		t.Fatalf("drop unassignment trigger: %v", err)
+	}
+	if err := service.RemoveChannelTopic(context.Background(), groupID, channelID); err != nil {
+		t.Fatalf("remove topic after persistence recovery: %v", err)
+	}
+	if len(api.closedTopics) != 1 {
+		t.Fatalf("close calls after persistence recovery = %d, want one", len(api.closedTopics))
+	}
+}
+
+func TestProductionWebAppUsesRealBotTopicRemovalBoundary(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+	groupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: -100306,
+		Title:          "WebApp forum",
+		Status:         model.GroupStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	channelID, err := store.Channels.Insert(&model.Channel{
+		Username: "webapp_real_boundary",
+		Title:    "WebApp real boundary",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	threadID := int64(1904)
+	if err := store.ForumTopics.PersistOwned(groupID, threadID, "WebApp real boundary"); err != nil {
+		t.Fatalf("persist topic: %v", err)
+	}
+	api := &fakeTelegramClient{}
+	registry := &markClosedFailureRegistry{
+		ForumTopicRepository: store.ForumTopics,
+		failMarkClosed:       true,
+	}
+	service := newServiceForTest(api, nil)
+	service.groups = store.Groups
+	service.SetForumTopicRegistry(registry)
+	server := webapp.NewWithProvidersForTesting(store, 0, http.DefaultClient)
+	server.SetTopicLifecycle(service)
+
+	assignment := httptest.NewRequest(http.MethodPost,
+		"/api/groups/"+strconv.FormatInt(groupID, 10)+"/channels",
+		strings.NewReader(`{"channel_id":"`+strconv.FormatInt(channelID, 10)+`","topic_thread_id":`+
+			strconv.FormatInt(threadID, 10)+`}`))
+	assignment.Header.Set("Content-Type", "application/json")
+	assignmentResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(assignmentResponse, assignment)
+	if assignmentResponse.Code != http.StatusCreated {
+		t.Fatalf("assignment response = %d, body=%s", assignmentResponse.Code, assignmentResponse.Body.String())
+	}
+
+	removal := httptest.NewRequest(http.MethodDelete,
+		"/api/groups/"+strconv.FormatInt(groupID, 10)+"/channels/"+strconv.FormatInt(channelID, 10), nil)
+	removalResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(removalResponse, removal)
+	if removalResponse.Code != http.StatusBadGateway {
+		t.Fatalf("removal response = %d, body=%s", removalResponse.Code, removalResponse.Body.String())
+	}
+	if len(api.closedTopics) != 1 || api.closedTopics[0].MessageThreadID != int(threadID) {
+		t.Fatalf("real boundary close calls = %#v, want one close", api.closedTopics)
+	}
+	assignments, err := store.Groups.GetChannelAssignments(groupID)
+	if err != nil {
+		t.Fatalf("load assignments after WebApp removal: %v", err)
+	}
+	if len(assignments) != 0 {
+		t.Fatalf("WebApp assignments after removal = %#v, want none", assignments)
+	}
+	topic, err := store.ForumTopics.Get(groupID, threadID)
+	if err != nil {
+		t.Fatalf("load pending WebApp topic: %v", err)
+	}
+	if !topic.ClosePending || topic.Closed {
+		t.Fatalf("WebApp topic after MarkClosed failure = %#v, want pending", topic)
+	}
+
+	registry.failMarkClosed = false
+	if err := service.ReconcilePendingTopicClosures(context.Background()); err != nil {
+		t.Fatalf("reconcile WebApp topic: %v", err)
+	}
+	topic, err = store.ForumTopics.Get(groupID, threadID)
+	if err != nil {
+		t.Fatalf("load reconciled WebApp topic: %v", err)
+	}
+	if !topic.Closed || topic.ClosePending {
+		t.Fatalf("WebApp topic after reconciliation = %#v, want closed", topic)
+	}
+	if err := service.ReconcilePendingTopicClosures(context.Background()); err != nil {
+		t.Fatalf("repeat reconcile WebApp topic: %v", err)
+	}
+	if len(api.closedTopics) != 2 {
+		t.Fatalf("repeat WebApp close calls = %d, want idempotent recovery", len(api.closedTopics))
 	}
 }

@@ -495,7 +495,9 @@ func TestProductionWebAppTopicCloseFailureLeavesDurablePendingState(t *testing.T
 	if assigned.Code != http.StatusCreated {
 		t.Fatalf("assignment status = %d, body=%s", assigned.Code, assigned.Body.String())
 	}
-	if err := store.ForumTopics.BeginClose(groupID, lifecycle.threadID); err != nil {
+	if _, err := store.Conn().Exec(`
+		UPDATE forum_topics SET close_pending = 1
+		WHERE group_id = ? AND message_thread_id = ?`, groupID, lifecycle.threadID); err != nil {
 		t.Fatalf("record simulated pending close: %v", err)
 	}
 	pendingView := doJSON(t, server.Handler(), http.MethodGet,
@@ -870,10 +872,10 @@ func (f *failureRecoverableTopicLifecycle) RemoveChannelTopic(_ context.Context,
 	if len(assignments) != 1 || assignments[0].TopicThreadID == nil {
 		return db.ErrNotFound
 	}
-	if err := f.store.ForumTopics.BeginClose(groupID, *assignments[0].TopicThreadID); err != nil {
+	if err := f.store.Groups.UnassignChannel(groupID, channelID); err != nil {
 		return err
 	}
-	if err := f.store.Groups.UnassignChannel(groupID, channelID); err != nil {
+	if err := f.store.ForumTopics.BeginClose(groupID, *assignments[0].TopicThreadID); err != nil {
 		return err
 	}
 	f.closeForumTopicCalls = append(f.closeForumTopicCalls, [2]int64{groupID, *assignments[0].TopicThreadID})

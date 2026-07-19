@@ -596,6 +596,8 @@ func writeGroupError(w http.ResponseWriter, err error) {
 		status, message = http.StatusNotFound, "Группа не найдена"
 	case errors.Is(err, db.ErrDuplicate):
 		status, message = http.StatusConflict, "Группа уже добавлена"
+	case errors.Is(err, db.ErrConflict):
+		status, message = http.StatusConflict, "Топик больше недоступен для назначения"
 	case strings.Contains(strings.ToLower(err.Error()), "chat_id"):
 		status, message = http.StatusBadRequest, "Chat ID должен быть числом (например, -1001234567890)"
 	case strings.Contains(strings.ToLower(err.Error()), "verification"):

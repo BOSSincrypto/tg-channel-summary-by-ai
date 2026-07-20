@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/boss/tg-channel-summary-by-ai/internal/db"
 )
 
 // TestHealthEndpoint verifies that GET /health returns 200 OK with JSON status.
@@ -173,6 +175,56 @@ func TestEmbeddedWebAppAssetsAreServed(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("%s status = %d, want 200", asset, resp.StatusCode)
 		}
+	}
+}
+
+func TestValidatorBrowserBoundaryIsExplicitAndAuthenticated(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	auth, err := NewWebAppAuthWithOrigin("validator:fixture-test", "715602446", "http://localhost:8080/webapp/")
+	if err != nil {
+		t.Fatalf("create validator auth: %v", err)
+	}
+	server := NewWithProvidersAuthenticated(store, time.Second, http.DefaultClient, auth)
+	t.Setenv("VALIDATOR_HTTP_ONLY", "1")
+	if err := server.SetValidatorBrowserBoundary("run-token", "signed-validator-init-data"); err != nil {
+		t.Fatalf("configure validator browser boundary: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/webapp/validator?token=run-token&scenario=server-down", nil)
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("validator browser status = %d, want 200", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{
+		`window.Telegram`,
+		`signed-validator-init-data`,
+		`window.__WEBAPP_VALIDATOR_SCENARIO__`,
+		`simulated server down`,
+		`/webapp/app.js`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("validator browser body missing %q", want)
+		}
+	}
+	if strings.Contains(body, "telegram.org/js/telegram-web-app.js") {
+		t.Fatal("validator browser boundary should not load the external Telegram SDK")
+	}
+
+	unauthorized := httptest.NewRecorder()
+	server.Handler().ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/webapp/validator?token=wrong", nil))
+	if unauthorized.Code != http.StatusNotFound {
+		t.Fatalf("wrong validator token status = %d, want 404", unauthorized.Code)
+	}
+
+	t.Setenv("VALIDATOR_HTTP_ONLY", "")
+	if err := server.SetValidatorBrowserBoundary("run-token", "signed-validator-init-data"); err == nil {
+		t.Fatal("validator browser boundary enabled without explicit validator HTTP mode")
 	}
 }
 

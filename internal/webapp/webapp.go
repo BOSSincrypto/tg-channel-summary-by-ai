@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,22 +25,26 @@ import (
 
 // Server handles HTTP requests for the health check and WebApp.
 type Server struct {
-	router           chi.Router
-	apiRouter        chi.Router
-	srv              *http.Server
-	providerService  *ProviderService
-	database         *db.DB
-	channelService   *ChannelService
-	groupService     *GroupService
-	groupScheduler   GroupScheduler
-	groupLifecycleMu sync.Mutex
-	forumFence       *forum.MutationFence
-	digestRunner     DigestRunner
-	settingsApplier  SettingsApplier
-	digestJobs       *digestJobStore
-	terminalMu       sync.RWMutex
-	terminalReason   error
-	onTokenRevoked   func(error)
+	router                   chi.Router
+	apiRouter                chi.Router
+	srv                      *http.Server
+	providerService          *ProviderService
+	database                 *db.DB
+	channelService           *ChannelService
+	groupService             *GroupService
+	groupScheduler           GroupScheduler
+	groupLifecycleMu         sync.Mutex
+	forumFence               *forum.MutationFence
+	digestRunner             DigestRunner
+	settingsApplier          SettingsApplier
+	digestJobs               *digestJobStore
+	terminalMu               sync.RWMutex
+	terminalReason           error
+	onTokenRevoked           func(error)
+	validatorBrowserMu       sync.RWMutex
+	validatorBrowserToken    string
+	validatorBrowserInitData string
+	authBotTokenValue        string
 }
 
 // SettingsMutation is the validated settings payload shared by authenticated
@@ -114,6 +120,7 @@ func New() *Server {
 		r.Get("/webapp", func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "/webapp/", http.StatusPermanentRedirect)
 		})
+		r.Get("/webapp/validator", s.handleValidatorBrowser)
 		r.Handle("/webapp/*", http.StripPrefix("/webapp/", http.FileServer(http.FS(staticFiles))))
 		r.Get("/", func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "/webapp/", http.StatusTemporaryRedirect)
@@ -161,6 +168,7 @@ func newWithProviders(store *db.DB, timeout time.Duration, client *http.Client, 
 	s.channelService = NewChannelService(store.Channels, parserChannelVerifier{parser: parser.New()})
 	s.groupService = NewGroupService(store.Groups, store.Channels)
 	if auth != nil {
+		s.authBotTokenValue = auth.botToken
 		s.groupService.verifier = &telegramGroupVerifier{token: auth.botToken, client: service.httpClient}
 	}
 	providersHandler := http.Handler(http.HandlerFunc(s.handleProviders))
@@ -184,6 +192,108 @@ func newWithProviders(store *db.DB, timeout time.Duration, client *http.Client, 
 	s.apiRouter.HandleFunc("/digest/status", s.handleDigestStatus)
 	s.router.Mount("/api", s.apiRouter)
 	return s
+}
+
+// SetValidatorBrowserBoundary enables the authenticated browser bootstrap used
+// only by the local validator HTTP mode. It is deliberately guarded by both
+// the validator opt-in environment and the fake credential shape so a normal
+// production server cannot expose a browser authentication bypass.
+func (s *Server) SetValidatorBrowserBoundary(runToken, initData string) error {
+	if s == nil {
+		return errors.New("validator browser boundary: server is not configured")
+	}
+	if os.Getenv("VALIDATOR_HTTP_ONLY") != "1" {
+		return errors.New("validator browser boundary requires VALIDATOR_HTTP_ONLY=1")
+	}
+	if s.providerService == nil || s.providerService.httpClient == nil {
+		return errors.New("validator browser boundary requires a configured HTTP server")
+	}
+	if strings.TrimSpace(runToken) == "" {
+		return errors.New("validator browser boundary requires a run token")
+	}
+	if !strings.HasPrefix(strings.TrimSpace(s.authBotTokenValue), "validator:") {
+		return errors.New("validator browser boundary requires fake validator credentials")
+	}
+	if strings.TrimSpace(initData) == "" {
+		return errors.New("validator browser boundary requires initData")
+	}
+	s.validatorBrowserMu.Lock()
+	s.validatorBrowserToken = strings.TrimSpace(runToken)
+	s.validatorBrowserInitData = initData
+	s.validatorBrowserMu.Unlock()
+	return nil
+}
+
+func (s *Server) handleValidatorBrowser(w http.ResponseWriter, r *http.Request) {
+	s.validatorBrowserMu.RLock()
+	runToken := s.validatorBrowserToken
+	initData := s.validatorBrowserInitData
+	s.validatorBrowserMu.RUnlock()
+	if runToken == "" || initData == "" || r.URL.Query().Get("token") != runToken {
+		http.NotFound(w, r)
+		return
+	}
+	scenario := strings.TrimSpace(r.URL.Query().Get("scenario"))
+	initDataLiteral := validatorScriptLiteral(initData)
+	userLiteral := validatorScriptLiteral(`{"id":715602446,"first_name":"Validator","username":"validator_owner"}`)
+	scenarioLiteral := validatorScriptLiteral(scenario)
+	page := `<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#17212b">
+  <title>Digest Control Validator</title>
+  <link rel="stylesheet" href="/webapp/style.css">
+</head>
+<body>
+  <main id="app" aria-live="polite"></main>
+  <script>
+    window.Telegram = { WebApp: {
+      initData: ` + initDataLiteral + `,
+      initDataUnsafe: { user: ` + userLiteral + ` },
+      colorScheme: "light",
+      themeParams: {},
+      ready: function () {},
+      expand: function () {},
+      close: function () {},
+      onEvent: function () {},
+      MainButton: { setText: function () {}, show: function () {}, hide: function () {}, onClick: function () {}, offClick: function () {} },
+      BackButton: { show: function () {}, hide: function () {}, onClick: function () {} }
+    }};
+    window.__WEBAPP_VALIDATOR_SCENARIO__ = ` + scenarioLiteral + `;
+    if (window.__WEBAPP_VALIDATOR_SCENARIO__ === "server-down") {
+      var validatorFetch = window.fetch.bind(window);
+      var validatorFailed = false;
+      window.fetch = function (input, options) {
+        var requestURL = typeof input === "string" ? input : input && input.url;
+        if (!validatorFailed && requestURL && requestURL.indexOf("/api/") >= 0) {
+          validatorFailed = true;
+          console.error("validator browser boundary: simulated server down");
+          return Promise.reject(new TypeError("Failed to fetch: validator server down"));
+        }
+        return validatorFetch(input, options);
+      };
+    }
+  </script>
+  <script src="/webapp/app.js"></script>
+</body>
+</html>`
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(page))
+}
+
+func validatorScriptLiteral(value string) string {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return `""`
+	}
+	return strings.NewReplacer(
+		"<", `\u003c`,
+		">", `\u003e`,
+		"&", `\u0026`,
+	).Replace(string(encoded))
 }
 
 // SetDigestRunner connects the manual WebApp action to the production digest

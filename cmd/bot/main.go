@@ -285,6 +285,9 @@ func runValidatorHTTPOnly() error {
 		if err := configureValidatorBotAdminFixture(srv, store); err != nil {
 			return fmt.Errorf("configure validator fixture %s: %w", validatorFixtureProfile, err)
 		}
+		if err := srv.SetValidatorBrowserBoundary(os.Getenv(validatorTokenEnv), validatorOwnerInitData()); err != nil {
+			return fmt.Errorf("configure validator browser boundary: %w", err)
+		}
 	}
 	serverErr := make(chan error, 1)
 	go func() {

@@ -710,6 +710,14 @@ func (validatorHTTPTransport) RoundTrip(request *http.Request) (*http.Response, 
 }
 
 func validatorOwnerInitData() string {
+	token := strings.TrimSpace(os.Getenv("BOT_TOKEN"))
+	if !strings.HasPrefix(token, "validator:") {
+		token = "validator:fixture-test"
+	}
+	return validatorOwnerInitDataForToken(token)
+}
+
+func validatorOwnerInitDataForToken(token string) string {
 	values := url.Values{}
 	values.Set("auth_date", strconv.FormatInt(time.Now().Unix(), 10))
 	values.Set("query_id", "validator-bot-admin-r2")
@@ -720,7 +728,7 @@ func validatorOwnerInitData() string {
 		"user=" + values.Get("user"),
 	}, "\n")
 	secretMAC := hmac.New(sha256.New, []byte("WebAppData"))
-	_, _ = secretMAC.Write([]byte("validator:fixture-test"))
+	_, _ = secretMAC.Write([]byte(token))
 	hashMAC := hmac.New(sha256.New, secretMAC.Sum(nil))
 	_, _ = hashMAC.Write([]byte(dataCheckString))
 	values.Set("hash", hex.EncodeToString(hashMAC.Sum(nil)))

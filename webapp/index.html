@@ -10,6 +10,11 @@
 </head>
 <body>
   <main id="app" aria-live="polite"></main>
+  <script>
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.register("./sw.js", { scope: "./" }).catch(function () {});
+    }
+  </script>
   <script src="./app.js"></script>
 </body>
 </html>

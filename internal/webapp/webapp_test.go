@@ -3,6 +3,7 @@ package webapp
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -163,7 +164,7 @@ func TestEmbeddedWebAppAssetsAreServed(t *testing.T) {
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	for _, asset := range []string{"app.js", "style.css"} {
+	for _, asset := range []string{"app.js", "style.css", "offline.html", "sw.js"} {
 		resp, err := http.Get(ts.URL + "/webapp/" + asset)
 		if err != nil {
 			t.Fatalf("failed to GET %s: %v", asset, err)
@@ -171,6 +172,53 @@ func TestEmbeddedWebAppAssetsAreServed(t *testing.T) {
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("%s status = %d, want 200", asset, resp.StatusCode)
+		}
+	}
+}
+
+func TestOfflineFallbackShellIsSelfContainedAndRecoverable(t *testing.T) {
+	srv := New()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/webapp/offline.html")
+	if err != nil {
+		t.Fatalf("failed to GET offline fallback shell: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read offline fallback shell: %v", err)
+	}
+	content := string(body)
+	for _, want := range []string{
+		"Не удалось загрузить приложение",
+		"Повторить",
+		"connection refused",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("offline fallback shell does not contain %q", want)
+		}
+	}
+	for _, forbidden := range []string{"telegram.org", "https://", "http://"} {
+		if strings.Contains(content, forbidden) {
+			t.Fatalf("offline fallback shell contains external reference %q", forbidden)
+		}
+	}
+
+	swResp, err := http.Get(ts.URL + "/webapp/sw.js")
+	if err != nil {
+		t.Fatalf("failed to GET offline service worker: %v", err)
+	}
+	defer swResp.Body.Close()
+	swBody, err := io.ReadAll(swResp.Body)
+	if err != nil {
+		t.Fatalf("read offline service worker: %v", err)
+	}
+	sw := string(swBody)
+	for _, want := range []string{"offline.html", "request.mode !== \"navigate\"", "catch"} {
+		if !strings.Contains(sw, want) {
+			t.Fatalf("offline service worker does not contain %q", want)
 		}
 	}
 }

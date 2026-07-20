@@ -8,6 +8,8 @@ const fs = require("fs");
 const vm = require("vm");
 
 const appSource = fs.readFileSync(require.resolve("./app.js"), "utf8");
+const offlineShellSource = fs.readFileSync(require.resolve("./offline.html"), "utf8");
+const serviceWorkerSource = fs.readFileSync(require.resolve("./sw.js"), "utf8");
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -210,6 +212,7 @@ function makeApp() {
   document.body.appendChild(app);
   const pending = [];
   const requests = [];
+  const consoleErrors = [];
   const hooks = {};
   const windowListeners = {};
   const schedule = (callback, delay, ...args) => {
@@ -221,6 +224,11 @@ function makeApp() {
     const timer = setInterval(callback, delay, ...args);
     if (timer && typeof timer.unref === "function") timer.unref();
     return timer;
+  };
+  const testConsole = {
+    log: (...args) => console.log(...args),
+    warn: (...args) => console.warn(...args),
+    error: (...args) => consoleErrors.push(args.map(String).join(" "))
   };
 
   const fetch = (path, fetchOptions = {}) => {
@@ -291,7 +299,7 @@ function makeApp() {
     JSON,
     Intl,
     URL,
-    console,
+    console: testConsole,
     setTimeout: schedule,
     clearTimeout,
     setInterval: repeat,
@@ -345,7 +353,7 @@ function makeApp() {
     }
   };
 
-  return { document, window, hooks, requests, findPending, resolve, focus, pressKey };
+  return { document, window, hooks, requests, consoleErrors, findPending, resolve, focus, pressKey };
 }
 
 async function testChannelToggleUsesStableID() {
@@ -1099,14 +1107,19 @@ function validatorSeededBackend() {
 async function testRequestFailuresRenderRecoverableErrorStates() {
   const app = makeApp();
   const initial = app.findPending("/api/channels");
-  initial.reject(new Error("simulated validator server down"));
+  initial.reject(new TypeError("simulated validator server down"));
   await settle();
   assert(app.document.querySelector(".error-state"), "Network failure did not render a recoverable error state");
   assert(
-    visibleText(app.document.querySelector(".error-state")).includes("simulated validator server down"),
-    "Network failure detail was not visible in the error state"
+    visibleText(app.document.querySelector(".error-state")).includes("Не удалось загрузить приложение"),
+    "Network failure did not render the friendly application recovery heading"
+  );
+  assert(
+    visibleText(app.document.querySelector(".error-state")).includes("Сервер настроек временно недоступен"),
+    "Network failure did not render visible recovery guidance"
   );
   assert(initial.path === "/api/channels" && initial.method === "GET", "Network failure evidence did not capture the API request");
+  assert(app.consoleErrors.length === 0, "Network failure unexpectedly produced a console error");
 
   const retry = app.document.querySelector(".error-state").querySelector("button");
   retry.click();
@@ -1140,6 +1153,20 @@ async function testRequestFailuresRenderRecoverableErrorStates() {
     visibleText(app.document.querySelector(".error-state")).includes("seeded settings fixture unavailable"),
     "Seeded settings failure detail was not visible"
   );
+}
+
+async function testOfflineFallbackShellIsLocalAndServedByFailureBoundary() {
+  assert(offlineShellSource.includes("Не удалось загрузить приложение"), "Offline shell is missing the recovery heading");
+  assert(offlineShellSource.includes("Повторить"), "Offline shell is missing the retry control");
+  assert(offlineShellSource.includes("connection refused"), "Offline shell is missing bounded failure detail");
+  assert(!offlineShellSource.includes("telegram.org"), "Offline shell contacts Telegram assets");
+  assert(!offlineShellSource.includes("https://"), "Offline shell contains an external HTTPS dependency");
+  assert(!offlineShellSource.includes("http://"), "Offline shell contains an external HTTP dependency");
+
+  assert(serviceWorkerSource.includes("request.mode !== \"navigate\""), "Service worker handles non-navigation requests");
+  assert(serviceWorkerSource.includes("offline.html"), "Service worker does not cache the offline shell");
+  assert(serviceWorkerSource.includes("catch"), "Service worker does not handle listener failures");
+  assert(!serviceWorkerSource.includes("telegram.org"), "Service worker references an external service");
 }
 
 async function testWrongUserContextFailsClosedWithNetworkEvidence() {
@@ -1263,6 +1290,7 @@ async function run() {
   await testLargeChannelFixtureRendersDeterministically();
   await testAvailableGroupPickerUsesAuthenticatedLocalBoundary();
   await testRequestFailuresRenderRecoverableErrorStates();
+  await testOfflineFallbackShellIsLocalAndServedByFailureBoundary();
   await testWrongUserContextFailsClosedWithNetworkEvidence();
   await testKeyboardTabEnterEscapeFlowsAreAccessible();
   await testTwoAuthenticatedContextsShareSeededConflictState();

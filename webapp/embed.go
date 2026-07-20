@@ -9,7 +9,7 @@ import (
 // Files contains the SPA assets embedded into the bot binary.
 // The HTTP server exposes them below /webapp/.
 //
-//go:embed index.html app.js style.css
+//go:embed index.html app.js style.css offline.html sw.js
 var Files embed.FS
 
 // StaticFS returns the embedded asset filesystem without exposing the

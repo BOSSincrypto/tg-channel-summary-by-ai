@@ -20,6 +20,7 @@
     groupCollectionGeneration: 0,
     groupAppliedGenerations: {},
     groupReloads: {},
+    networkErrors: {},
     digestJob: null,
     digestTimer: null,
     retryAfter: 0,
@@ -211,8 +212,10 @@
   }
   function clearError(tab) {
     delete state.errors[tab];
+    delete state.networkErrors[tab];
   }
   function apiErrorMessage(error) {
+    if (error && error.network) return "Сервер настроек временно недоступен. Проверьте соединение и попробуйте ещё раз.";
     return error && error.message ? error.message : "Что-то пошло не так. Попробуйте ещё раз.";
   }
   function authHeaders() {
@@ -233,7 +236,9 @@
       window.clearTimeout(timer);
       if (response.status === 401 || response.status === 403) {
         state.readonly = true;
-        throw new Error("Сессия истекла или доступ запрещён. Перезапустите бота через /start.");
+        var authError = new Error("Сессия истекла или доступ запрещён. Перезапустите бота через /start.");
+        authError.status = response.status;
+        throw authError;
       }
       if (response.status === 429) {
         var retryAfter = response.headers.get("Retry-After") || "5";
@@ -270,6 +275,12 @@
         var cancelled = new Error("Запрос отменён.");
         cancelled.cancelled = true;
         throw cancelled;
+      }
+      if (!error.status && !error.cancelled && error.name === "TypeError") {
+        var networkError = new Error("Сервер настроек временно недоступен.");
+        networkError.network = true;
+        networkError.cause = error;
+        throw networkError;
       }
       throw error;
     });
@@ -309,7 +320,10 @@
       state.data[tab] = mapped;
       state.loadedAt[tab] = Date.now();
     }).catch(function (error) {
-      if (state.loadGenerations[tab] === generation && !error.cancelled) setError(tab, apiErrorMessage(error));
+      if (state.loadGenerations[tab] === generation && !error.cancelled) {
+        state.networkErrors[tab] = Boolean(error.network);
+        setError(tab, apiErrorMessage(error));
+      }
     }).finally(function () {
       if (state.loadGenerations[tab] === generation) {
         state.loading[tab] = false;
@@ -524,7 +538,7 @@
   function errorState(tab) {
     var node = el("div", "error-state");
     node.appendChild(el("div", "empty-icon", "⚠️"));
-    node.appendChild(el("h3", "", "Не удалось загрузить раздел"));
+    node.appendChild(el("h3", "", state.networkErrors[tab] ? "Не удалось загрузить приложение" : "Не удалось загрузить раздел"));
     node.appendChild(el("p", "", state.errors[tab] || "Попробуйте ещё раз."));
     node.appendChild(button("Повторить", "primary", function () {
       state.loadedAt[tab] = 0;

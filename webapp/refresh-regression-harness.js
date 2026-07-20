@@ -268,6 +268,7 @@ function makeApp() {
     Date,
     JSON,
     Intl,
+    URL,
     console,
     setTimeout: schedule,
     clearTimeout,
@@ -657,6 +658,65 @@ async function testDigestRunButtonSubmitsAndPollsTypedOutcomes() {
   }
 }
 
+async function testProviderValidationPrecedesNativeConstraints() {
+  const app = makeApp();
+  const channels = app.findPending("/api/channels");
+  app.resolve(channels, []);
+  await settle();
+
+  const providersTab = app.document.querySelectorAll("button").find((button) =>
+    button.children.some((child) => child.textContent === "Провайдеры")
+  );
+  assert(providersTab, "Providers tab was not rendered");
+  providersTab.click();
+  const providers = app.findPending("/api/providers");
+  app.resolve(providers, []);
+  await settle();
+
+  const add = app.document.querySelectorAll("button").find((button) => button.textContent === "Добавить провайдера");
+  assert(add, "Provider add action was not rendered");
+  add.click();
+  const form = app.document.querySelector("#provider-name").closest("form");
+  assert(form && form.noValidate === true, "Provider form did not disable native validation UI");
+
+  app.document.querySelector("#provider-url").value = "";
+  form.requestSubmit();
+  for (const id of ["provider-name", "provider-url", "provider-key", "provider-model"]) {
+    const input = app.document.querySelector(`#${id}`);
+    const error = app.document.querySelector(`#${id}-error`);
+    assert(error.textContent === "Обязательное поле.", `${id} empty validation was not rendered`);
+    assert(input.getAttribute("aria-invalid") === "true", `${id} empty validation did not set aria-invalid`);
+  }
+  assert(!app.requests.some((request) => request.path === "/api/providers" && request.method === "POST"), "Empty provider form issued a request");
+
+  const name = app.document.querySelector("#provider-name");
+  const base = app.document.querySelector("#provider-url");
+  const key = app.document.querySelector("#provider-key");
+  const model = app.document.querySelector("#provider-model");
+  name.value = "Custom";
+  base.value = "ftp://example.com/v1";
+  key.value = "secret";
+  model.value = "model";
+  form.requestSubmit();
+  assert(
+    app.document.querySelector("#provider-url-error").textContent === "Неверный формат URL. Должен начинаться с https://",
+    "Non-HTTPS provider URL did not render the custom URL validation"
+  );
+  assert(base.getAttribute("aria-invalid") === "true", "Non-HTTPS provider URL did not set aria-invalid");
+  assert(!app.requests.some((request) => request.path === "/api/providers" && request.method === "POST"), "Invalid provider URL issued a request");
+  assert(name.value === "Custom" && base.value === "ftp://example.com/v1" && key.value === "secret" && model.value === "model", "Invalid provider validation lost draft values");
+
+  base.value = "https://example.com/v1";
+  form.requestSubmit();
+  const submission = app.findPending("/api/providers", "POST");
+  assert(submission.body.base_url === "https://example.com/v1", "Valid provider URL was not submitted");
+  app.resolve(submission, { id: 9, version: 1, name: "Custom", base_url: "https://example.com/v1", default_model: "model", has_key: true });
+  await settle();
+  const refreshed = app.findPending("/api/providers");
+  app.resolve(refreshed, [{ id: 9, version: 1, name: "Custom", base_url: "https://example.com/v1", default_model: "model", has_key: true }]);
+  await settle();
+}
+
 async function run() {
   await testChannelToggleUsesStableID();
   await testGroupRefreshSuppressesStaleGeneration();
@@ -665,7 +725,8 @@ async function run() {
   await testAssignmentReusesNewestGroupVersion();
   await testTimezoneFocusShowsCatalogAndTypingFilters();
   await testDigestRunButtonSubmitsAndPollsTypedOutcomes();
-  console.log("WebApp regression harness passed: stable IDs, stale generations, newest optimistic versions, timezone catalog, digest click and typed outcomes.");
+  await testProviderValidationPrecedesNativeConstraints();
+  console.log("WebApp regression harness passed: stable IDs, stale generations, newest optimistic versions, timezone catalog, provider validation, digest click and typed outcomes.");
 }
 
 run().catch((error) => {

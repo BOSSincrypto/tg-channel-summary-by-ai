@@ -921,8 +921,9 @@
     provider = provider || { name: "", baseUrl: "https://api.openai.com/v1", apiKey: "", model: "", isDefault: false };
     openModal(provider.id ? "Редактировать провайдера" : "Добавить провайдера", function (body, close) {
       var form = el("form", "stack");
+      form.noValidate = true;
       var name = field("Название", "provider-name", provider.name, "text", { required: true, placeholder: "Мой OpenAI endpoint" });
-      var base = field("Base URL", "provider-url", provider.baseUrl, "url", { required: true, placeholder: "https://api.example.com/v1", help: "Только http:// или https://." });
+      var base = field("Base URL", "provider-url", provider.baseUrl, "url", { required: true, placeholder: "https://api.example.com/v1", help: "Только https://." });
       var key = field("API key", "provider-key", provider.apiKey, "password", { required: !provider.id, placeholder: provider.id ? "Оставьте ********, чтобы сохранить текущий" : "Введите ключ" });
       var model = field("Модель", "provider-model", provider.model, "text", { required: true, placeholder: "openai/gpt-oss-120b" });
       [name, base, key, model].forEach(function (item) { form.appendChild(item.wrap); });
@@ -933,13 +934,27 @@
       form.addEventListener("submit", function (event) {
         event.preventDefault();
         var valid = true;
-        [[name, name.input.value.trim()], [base, base.input.value.trim()], [model, model.input.value.trim()]].forEach(function (item) {
+        [[name, name.input.value.trim()], [base, base.input.value.trim()], [key, key.input.value.trim()], [model, model.input.value.trim()]].forEach(function (item) {
           item[0].error.textContent = "";
           item[0].input.removeAttribute("aria-invalid");
-          if (!item[1]) { item[0].error.textContent = "Обязательное поле."; item[0].input.setAttribute("aria-invalid", "true"); valid = false; }
+          var required = item[0] !== key || !provider.id;
+          if (required && !item[1]) {
+            item[0].error.textContent = "Обязательное поле.";
+            item[0].input.setAttribute("aria-invalid", "true");
+            valid = false;
+          }
         });
-        try { var parsed = new URL(base.input.value.trim()); if (parsed.protocol !== "https:" && parsed.protocol !== "http:") throw new Error(); }
-        catch (_) { base.error.textContent = "Неверный формат URL. Должен начинаться с https:// или http://."; base.input.setAttribute("aria-invalid", "true"); valid = false; }
+        var baseValue = base.input.value.trim();
+        if (baseValue) {
+          try {
+            var parsed = new URL(baseValue);
+            if (parsed.protocol !== "https:" || !/^https:\/\//i.test(baseValue) || !parsed.hostname) throw new Error();
+          } catch (_) {
+            base.error.textContent = "Неверный формат URL. Должен начинаться с https://";
+            base.input.setAttribute("aria-invalid", "true");
+            valid = false;
+          }
+        }
         if (!valid) return;
         save.disabled = true;
         var payload = { name: name.input.value.trim(), base_url: base.input.value.trim(), api_key: key.input.value.trim(), default_model: model.input.value.trim(), is_default: provider.isDefault };

@@ -739,6 +739,10 @@ async function testProviderValidationPrecedesNativeConstraints() {
   add.click();
   const form = app.document.querySelector("#provider-name").closest("form");
   assert(form && form.noValidate === true, "Provider form did not disable native validation UI");
+  for (const id of ["provider-name", "provider-url", "provider-key", "provider-model"]) {
+    assert(app.document.querySelector(`#${id}`).required !== true, `${id} still relies on native required validation`);
+  }
+  assert(app.document.querySelector("#provider-url").type === "text", "Provider URL still relies on native type=url validation");
 
   app.document.querySelector("#provider-url").value = "";
   form.requestSubmit();
@@ -776,6 +780,50 @@ async function testProviderValidationPrecedesNativeConstraints() {
   const refreshed = app.findPending("/api/providers");
   app.resolve(refreshed, [{ id: 9, version: 1, name: "Custom", base_url: "https://example.com/v1", default_model: "model", has_key: true }]);
   await settle();
+}
+
+async function testSettingsServerFailurePreservesDraft() {
+  const app = makeApp();
+  const channels = app.findPending("/api/channels");
+  app.resolve(channels, []);
+  await settle();
+
+  const settingsTab = app.document.querySelectorAll("button").find((button) =>
+    button.children.some((child) => child.textContent === "Настройки")
+  );
+  assert(settingsTab, "Settings tab was not rendered");
+  settingsTab.click();
+  const settings = app.findPending("/api/settings");
+  app.resolve(settings, {
+    digest_time: "21:00",
+    timezone: "Europe/Moscow",
+    default_model: "openai/gpt-oss-120b",
+    version: 4
+  });
+  await settle();
+
+  const time = app.document.querySelector("#settings-time");
+  const timezone = app.document.querySelector("#settings-timezone");
+  const model = app.document.querySelector("#settings-model");
+  const form = time.closest("form");
+  time.value = "12:30";
+  timezone.value = "UTC";
+  model.value = "custom/model";
+  [time, timezone, model].forEach((input) => input.dispatchEvent({ type: "input" }));
+  form.requestSubmit();
+  const submission = app.findPending("/api/settings", "PUT");
+  assert(submission.body.version === 4, "Settings save did not send the loaded version");
+  app.resolve(submission, { error: "fixture internal error" }, 500);
+  await settle();
+
+  assert(
+    app.document.querySelectorAll(".toast").some((toast) => visibleText(toast).includes("Не удалось сохранить настройки. Попробуйте позже.")),
+    "Settings HTTP 500 did not render the required friendly error"
+  );
+  assert(
+    time.value === "12:30" && timezone.value === "UTC" && model.value === "custom/model",
+    "Settings HTTP 500 reverted the entered draft values"
+  );
 }
 
 function validatorSeededBackend() {
@@ -994,6 +1042,7 @@ async function run() {
   await testTimezoneFocusShowsCatalogAndTypingFilters();
   await testDigestRunButtonSubmitsAndPollsTypedOutcomes();
   await testProviderValidationPrecedesNativeConstraints();
+  await testSettingsServerFailurePreservesDraft();
   await testRequestFailuresRenderRecoverableErrorStates();
   await testWrongUserContextFailsClosedWithNetworkEvidence();
   await testKeyboardTabEnterEscapeFlowsAreAccessible();

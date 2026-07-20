@@ -924,10 +924,10 @@
     openModal(provider.id ? "Редактировать провайдера" : "Добавить провайдера", function (body, close) {
       var form = el("form", "stack");
       form.noValidate = true;
-      var name = field("Название", "provider-name", provider.name, "text", { required: true, placeholder: "Мой OpenAI endpoint" });
-      var base = field("Base URL", "provider-url", provider.baseUrl, "url", { required: true, placeholder: "https://api.example.com/v1", help: "Только https://." });
-      var key = field("API key", "provider-key", provider.apiKey, "password", { required: !provider.id, placeholder: provider.id ? "Оставьте ********, чтобы сохранить текущий" : "Введите ключ" });
-      var model = field("Модель", "provider-model", provider.model, "text", { required: true, placeholder: "openai/gpt-oss-120b" });
+      var name = field("Название", "provider-name", provider.name, "text", { placeholder: "Мой OpenAI endpoint" });
+      var base = field("Base URL", "provider-url", provider.baseUrl, "text", { placeholder: "https://api.example.com/v1", help: "Только https://." });
+      var key = field("API key", "provider-key", provider.apiKey, "password", { placeholder: provider.id ? "Оставьте ********, чтобы сохранить текущий" : "Введите ключ" });
+      var model = field("Модель", "provider-model", provider.model, "text", { placeholder: "openai/gpt-oss-120b" });
       [name, base, key, model].forEach(function (item) { form.appendChild(item.wrap); });
       var actions = el("div", "actions");
       var cancel = button("Отмена", "secondary", close);
@@ -1070,7 +1070,7 @@
           loadSettings(true);
           return;
         }
-        showToast(apiErrorMessage(error), "error", true);
+        showToast(error && error.status === 500 ? "Не удалось сохранить настройки. Попробуйте позже." : apiErrorMessage(error), "error", true);
       }).finally(function () { save.disabled = false; });
     });
     view.body.appendChild(form); return view.outer;

@@ -550,6 +550,7 @@
       placeholder: "@durov", required: true, help: "Можно указать с @ или без него. Допустимы латинские буквы, цифры и _."
     });
     var addButton = button("Добавить", "primary");
+    addButton.type = "submit";
     var form = el("form", "inline-form");
     form.appendChild(addUser.wrap);
     form.appendChild(addButton);
@@ -666,6 +667,7 @@
       placeholder: "-1001234567890", inputMode: "numeric", help: "Используйте числовой ID супергруппы, обычно начинается с -100."
     });
     var add = button("Добавить", "primary");
+    add.type = "submit";
     var choose = button("Выбрать из списка", "secondary", openAvailableGroups);
     var form = el("form", "inline-form");
     form.appendChild(groupField.wrap); form.appendChild(add); form.appendChild(choose);
@@ -930,6 +932,7 @@
       var actions = el("div", "actions");
       var cancel = button("Отмена", "secondary", close);
       var save = button("Проверить и сохранить", "primary");
+      save.type = "submit";
       actions.appendChild(cancel); actions.appendChild(save); form.appendChild(actions);
       form.addEventListener("submit", function (event) {
         event.preventDefault();
@@ -1037,6 +1040,7 @@
     grid.appendChild(time.wrap); grid.appendChild(tz.wrap); grid.appendChild(model.wrap); form.appendChild(grid);
     var actions = el("div", "actions");
     var save = button("Сохранить настройки", "primary");
+    save.type = "submit";
     var cancel = button("Отмена", "secondary", function () {
       if (settingsChanged(form, saved)) {
         openConfirm("Отменить изменения?", "Введённые значения будут заменены последними сохранёнными.", "Выйти без сохранения", function () {
@@ -1059,7 +1063,15 @@
       save.disabled = true;
       mutation("/api/settings", "PUT", { digest_time: values.digest_time, timezone: values.timezone, default_model: values.default_model, version: saved.version }).then(function () {
         showToast("Настройки сохранены.", "success"); state.loadedAt.settings = 0; state.settingsDraft = null; return loadSettings(true);
-      }).catch(function (error) { showToast(apiErrorMessage(error), "error", true); }).finally(function () { save.disabled = false; });
+      }).catch(function (error) {
+        if (error && error.status === 409) {
+          showToast("Настройки изменились в другой сессии. Загружаем актуальное состояние, сохранение не выполнено.", "error", true);
+          state.loadedAt.settings = 0;
+          loadSettings(true);
+          return;
+        }
+        showToast(apiErrorMessage(error), "error", true);
+      }).finally(function () { save.disabled = false; });
     });
     view.body.appendChild(form); return view.outer;
   }

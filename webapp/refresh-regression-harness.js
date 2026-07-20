@@ -13,6 +13,11 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+function visibleText(node) {
+  if (!node) return "";
+  return String(node.textContent || "") + node.children.map(visibleText).join("");
+}
+
 class Element {
   constructor(tagName) {
     this.tagName = tagName.toUpperCase();
@@ -150,6 +155,7 @@ class Document {
   constructor() {
     this.documentElement = new Element("html");
     this.body = new Element("body");
+    this.activeElement = null;
     this.documentElement.appendChild(this.body);
   }
 
@@ -197,6 +203,7 @@ async function findPendingEventually(app, path, method = "GET") {
 }
 
 function makeApp() {
+  const options = arguments[0] || {};
   const document = new Document();
   const app = document.createElement("main");
   app.id = "app";
@@ -204,6 +211,7 @@ function makeApp() {
   const pending = [];
   const requests = [];
   const hooks = {};
+  const windowListeners = {};
   const schedule = (callback, delay, ...args) => {
     const timer = setTimeout(callback, delay, ...args);
     if (timer && typeof timer.unref === "function") timer.unref();
@@ -215,13 +223,14 @@ function makeApp() {
     return timer;
   };
 
-  const fetch = (path, options = {}) => {
+  const fetch = (path, fetchOptions = {}) => {
     const entry = {
       path,
-      method: options.method || "GET",
-      headers: options.headers || {},
-      rawBody: options.body || null,
-      body: options.body ? JSON.parse(options.body) : null,
+      method: fetchOptions.method || "GET",
+      headers: fetchOptions.headers || {},
+      rawBody: fetchOptions.body || null,
+      body: fetchOptions.body ? JSON.parse(fetchOptions.body) : null,
+      context: options.contextName || "default",
       resolve: null,
       reject: null
     };
@@ -231,13 +240,21 @@ function makeApp() {
       entry.reject = reject;
     });
     pending.push(entry);
+    if (options.backend) {
+      Promise.resolve()
+        .then(() => options.backend(entry))
+        .then((result) => {
+          entry.resolve(result && result.status !== undefined ? result : response(result));
+        })
+        .catch((error) => entry.reject(error));
+    }
     return promise;
   };
 
   const window = {
     Telegram: {
       WebApp: {
-        initData: "deterministic-test-init-data",
+        initData: options.initData || "deterministic-test-init-data",
         initDataUnsafe: { user: { first_name: "Harness" } },
         colorScheme: "light",
         themeParams: {},
@@ -256,7 +273,12 @@ function makeApp() {
     clearTimeout,
     setInterval: repeat,
     clearInterval,
-    addEventListener: () => {},
+    addEventListener: (type, listener) => {
+      (windowListeners[type] || (windowListeners[type] = [])).push(listener);
+    },
+    dispatchEvent: (event) => {
+      (windowListeners[event.type] || []).slice().forEach((listener) => listener(event));
+    },
     location: { reload: () => {} }
   };
   const context = {
@@ -273,7 +295,9 @@ function makeApp() {
     setTimeout: schedule,
     clearTimeout,
     setInterval: repeat,
-    clearInterval
+    clearInterval,
+    addEventListener: window.addEventListener,
+    dispatchEvent: window.dispatchEvent
   };
   vm.runInNewContext(appSource, context, { filename: "webapp/app.js" });
 
@@ -284,7 +308,44 @@ function makeApp() {
   };
   const resolve = (entry, payload, status = 200) => entry.resolve(response(payload, status));
 
-  return { document, hooks, requests, findPending, resolve };
+  const allFocusable = () => [
+    ...document.querySelectorAll("button"),
+    ...document.querySelectorAll("input"),
+    ...document.querySelectorAll("select"),
+    ...document.querySelectorAll("a")
+  ].filter((node) => !node.disabled && !node.hidden);
+  const focus = (node) => {
+    document.querySelectorAll("*").forEach((item) => { item.focused = false; });
+    node.focused = true;
+    document.activeElement = node;
+    node.dispatchEvent({ type: "focus" });
+  };
+  const pressKey = (key, modifiers = {}) => {
+    const active = document.activeElement;
+    const event = {
+      type: "keydown",
+      key,
+      shiftKey: Boolean(modifiers.shiftKey),
+      preventDefault() { this.defaultPrevented = true; },
+      defaultPrevented: false
+    };
+    window.dispatchEvent(event);
+    if (event.defaultPrevented) return;
+    if (key === "Tab") {
+      const focusable = allFocusable();
+      const currentIndex = active ? focusable.indexOf(active) : -1;
+      const delta = modifiers.shiftKey ? -1 : 1;
+      const nextIndex = currentIndex < 0
+        ? (modifiers.shiftKey ? focusable.length - 1 : 0)
+        : (currentIndex + delta + focusable.length) % focusable.length;
+      if (focusable[nextIndex]) focus(focusable[nextIndex]);
+    } else if (key === "Enter" && active) {
+      if (active.tagName === "BUTTON") active.click();
+      else if (active.closest("form")) active.closest("form").requestSubmit();
+    }
+  };
+
+  return { document, window, hooks, requests, findPending, resolve, focus, pressKey };
 }
 
 async function testChannelToggleUsesStableID() {
@@ -717,6 +778,213 @@ async function testProviderValidationPrecedesNativeConstraints() {
   await settle();
 }
 
+function validatorSeededBackend() {
+  const state = {
+    settings: {
+      digest_time: "10:15",
+      timezone: "UTC",
+      default_model: "validator-model",
+      version: 1
+    },
+    channel: { id: 101, version: 1, username: "fixture_valid", enabled: true }
+  };
+  const trace = [];
+  const backend = (entry) => {
+    trace.push({
+      context: entry.context,
+      method: entry.method,
+      path: entry.path,
+      headers: { ...entry.headers },
+      body: entry.body
+    });
+    if (entry.path === "/api/channels" && entry.method === "GET") {
+      return response([state.channel]);
+    }
+    if (entry.path === "/api/providers" && entry.method === "GET") {
+      return response([{
+        id: 201,
+        version: 1,
+        name: "OpenRouter",
+        base_url: "https://openrouter.ai/api/v1",
+        default_model: "openai/gpt-oss-120b",
+        has_key: true,
+        is_default: true
+      }]);
+    }
+    if (entry.path === "/api/settings" && entry.method === "GET") return response(state.settings);
+    if (entry.path === "/api/settings" && entry.method === "PUT") {
+      if (entry.body.version !== state.settings.version) {
+        return response({ error: "Configuration was modified by another session. Please reload and try again." }, 409);
+      }
+      state.settings = {
+        digest_time: entry.body.digest_time,
+        timezone: entry.body.timezone,
+        default_model: entry.body.default_model,
+        version: state.settings.version + 1
+      };
+      return response(state.settings);
+    }
+    if (entry.path === "/api/channels" && entry.method === "POST") {
+      state.channel = { id: 101, version: state.channel.version + 1, username: entry.body.username.slice(1), enabled: true };
+      return response(state.channel, 201);
+    }
+    return response({ error: `unexpected ${entry.method} ${entry.path}` }, 500);
+  };
+  return { backend, trace, state };
+}
+
+async function testRequestFailuresRenderRecoverableErrorStates() {
+  const app = makeApp();
+  const initial = app.findPending("/api/channels");
+  initial.reject(new Error("simulated validator server down"));
+  await settle();
+  assert(app.document.querySelector(".error-state"), "Network failure did not render a recoverable error state");
+  assert(
+    visibleText(app.document.querySelector(".error-state")).includes("simulated validator server down"),
+    "Network failure detail was not visible in the error state"
+  );
+  assert(initial.path === "/api/channels" && initial.method === "GET", "Network failure evidence did not capture the API request");
+
+  const retry = app.document.querySelector(".error-state").querySelector("button");
+  retry.click();
+  const retried = app.findPending("/api/channels");
+  app.resolve(retried, [{ id: 101, version: 1, username: "fixture_valid", enabled: true }]);
+  await settle();
+  assert(app.document.querySelector("table"), "Retry did not restore the channel view");
+
+  const providersTab = app.document.querySelectorAll("button").find((button) =>
+    button.children.some((child) => child.textContent === "Провайдеры")
+  );
+  providersTab.click();
+  const providers = app.findPending("/api/providers");
+  app.resolve(providers, { error: "default provider fixture unavailable" }, 503);
+  await settle();
+  assert(app.document.querySelector(".error-state"), "Seeded default-provider failure did not render the error state");
+  assert(
+    visibleText(app.document.querySelector(".error-state")).includes("default provider fixture unavailable"),
+    "Seeded default-provider failure detail was not visible"
+  );
+
+  const settingsTab = app.document.querySelectorAll("button").find((button) =>
+    button.children.some((child) => child.textContent === "Настройки")
+  );
+  settingsTab.click();
+  const settings = app.findPending("/api/settings");
+  app.resolve(settings, { error: "seeded settings fixture unavailable" }, 500);
+  await settle();
+  assert(app.document.querySelector(".error-state"), "Seeded settings failure did not render the error state");
+  assert(
+    visibleText(app.document.querySelector(".error-state")).includes("seeded settings fixture unavailable"),
+    "Seeded settings failure detail was not visible"
+  );
+}
+
+async function testWrongUserContextFailsClosedWithNetworkEvidence() {
+  const trace = [];
+  const app = makeApp({
+    initData: "deterministic-wrong-user-init-data",
+    contextName: "wrong-user",
+    backend: (entry) => {
+      trace.push(entry);
+      return response({ error: "unauthorized wrong-user fixture" }, 403);
+    }
+  });
+  const request = app.findPending("/api/channels");
+  await settle();
+  assert(request.headers["X-Telegram-Init-Data"] === "deterministic-wrong-user-init-data", "Wrong-user context did not send stable initData");
+  assert(request.context === "wrong-user", "Wrong-user network evidence lost its context label");
+  assert(app.document.querySelector(".readonly-banner"), "Wrong-user 403 did not put the SPA into read-only state");
+  assert(app.document.querySelector(".error-state"), "Wrong-user 403 did not render an access error");
+  assert(trace.length === 1 && trace[0].path === "/api/channels", "Wrong-user context made unexpected API requests");
+}
+
+async function testKeyboardTabEnterEscapeFlowsAreAccessible() {
+  const app = makeApp();
+  const initial = app.findPending("/api/channels");
+  app.resolve(initial, [{ id: 101, version: 1, username: "fixture_valid", enabled: true }]);
+  await settle();
+
+  const username = app.document.querySelector("#channel-username");
+  assert(username && username.id === "channel-username", "Keyboard flow input lacked a stable accessible ID");
+  const add = app.document.querySelector("form").querySelector("button");
+  assert(add && add.type === "submit", "Keyboard flow add control was not a submit button");
+  app.focus(username);
+  const beforeTab = app.document.activeElement;
+  app.pressKey("Tab");
+  assert(app.document.activeElement && app.document.activeElement !== beforeTab, "Tab did not move focus to the next accessible control");
+
+  app.focus(username);
+  username.value = "@keyboard_fixture";
+  app.pressKey("Enter");
+  const submission = app.findPending("/api/channels", "POST");
+  assert(submission.body.username === "@keyboard_fixture", "Enter did not submit the focused channel form");
+  app.resolve(submission, { id: 101, version: 2, username: "keyboard_fixture", enabled: true }, 201);
+  await settle();
+  const refreshed = app.findPending("/api/channels");
+  app.resolve(refreshed, [{ id: 101, version: 2, username: "keyboard_fixture", enabled: true }]);
+  await settle();
+  assert(
+    app.document.querySelectorAll(".toast").some((toast) => visibleText(toast).includes("Канал добавлен")),
+    "Enter submission did not expose a visible success result"
+  );
+
+  const deleteButton = app.document.querySelectorAll("button").find((button) => button.textContent === "Удалить");
+  deleteButton.click();
+  assert(app.document.querySelector('[role="dialog"]'), "Delete action did not open an accessible dialog");
+  app.pressKey("Escape");
+  assert(!app.document.querySelector('[role="dialog"]'), "Escape did not close the open dialog");
+}
+
+async function testTwoAuthenticatedContextsShareSeededConflictState() {
+  const seeded = validatorSeededBackend();
+  const first = makeApp({ contextName: "owner-device-1", backend: seeded.backend });
+  const second = makeApp({ contextName: "owner-device-2", backend: seeded.backend });
+  for (const app of [first, second]) {
+    const channels = app.findPending("/api/channels");
+    app.resolve(channels, [{ id: 101, version: 1, username: "fixture_valid", enabled: true }]);
+    await settle();
+    const settingsTab = app.document.querySelectorAll("button").find((button) =>
+      button.children.some((child) => child.textContent === "Настройки")
+    );
+    settingsTab.click();
+    const settings = app.findPending("/api/settings");
+    app.resolve(settings, seeded.state.settings);
+    await settle();
+  }
+
+  const firstTime = first.document.querySelector("#settings-time");
+  firstTime.value = "11:30";
+  firstTime.dispatchEvent({ type: "input" });
+  first.document.querySelector("#settings-time").closest("form").requestSubmit();
+  await settle();
+  const firstPut = seeded.trace.find((request) => request.context === "owner-device-1" && request.method === "PUT");
+  assert(firstPut && firstPut.body.version === 1, "First authenticated context did not send the seeded settings version");
+  assert(seeded.state.settings.version === 2 && seeded.state.settings.digest_time === "11:30", "First context did not persist the shared seeded settings mutation");
+
+  const secondTime = second.document.querySelector("#settings-time");
+  secondTime.value = "12:45";
+  secondTime.dispatchEvent({ type: "input" });
+  second.document.querySelector("#settings-time").closest("form").requestSubmit();
+  await settle();
+  const secondPut = seeded.trace.find((request) => request.context === "owner-device-2" && request.method === "PUT");
+  assert(secondPut && secondPut.body.version === 1, "Second authenticated context did not retain its stale version");
+  assert(
+    second.document.querySelectorAll(".toast").some((toast) => visibleText(toast).includes("Настройки изменились")),
+    "Stale settings conflict did not render a visible conflict message"
+  );
+  const refresh = seeded.trace.filter((request) =>
+    request.context === "owner-device-2" && request.method === "GET" && request.path === "/api/settings"
+  );
+  assert(refresh.length >= 2, "Stale conflict did not request authoritative settings recovery");
+  await settle();
+  assert(second.document.querySelector("#settings-time").value === "11:30", "Second context did not reconcile the first context's authoritative value");
+  assert(
+    seeded.trace.some((request) => request.context === "owner-device-1") &&
+      seeded.trace.some((request) => request.context === "owner-device-2"),
+    "Two-context network evidence did not retain both authenticated context labels"
+  );
+}
+
 async function run() {
   await testChannelToggleUsesStableID();
   await testGroupRefreshSuppressesStaleGeneration();
@@ -726,7 +994,11 @@ async function run() {
   await testTimezoneFocusShowsCatalogAndTypingFilters();
   await testDigestRunButtonSubmitsAndPollsTypedOutcomes();
   await testProviderValidationPrecedesNativeConstraints();
-  console.log("WebApp regression harness passed: stable IDs, stale generations, newest optimistic versions, timezone catalog, provider validation, digest click and typed outcomes.");
+  await testRequestFailuresRenderRecoverableErrorStates();
+  await testWrongUserContextFailsClosedWithNetworkEvidence();
+  await testKeyboardTabEnterEscapeFlowsAreAccessible();
+  await testTwoAuthenticatedContextsShareSeededConflictState();
+  console.log("WebApp regression harness passed: refresh races, request failures, wrong-user auth, keyboard accessibility, seeded conflicts, provider validation, timezone catalog and typed digest outcomes.");
 }
 
 run().catch((error) => {

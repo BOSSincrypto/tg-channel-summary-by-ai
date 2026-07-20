@@ -39,6 +39,9 @@ const (
 
 	validatorFixtureForumChatID   int64 = -1007000000001
 	validatorFixtureRegularChatID int64 = -1007000000002
+
+	validatorFixtureAvailableForumChatID  int64 = -1007000000101
+	validatorFixtureAvailableSecondChatID int64 = -1007000000102
 )
 
 var (
@@ -284,11 +287,33 @@ func configureValidatorBotAdminFixture(server *webapp.Server, store *db.DB) erro
 	}
 	server.SetChannelVerifier(newValidatorChannelVerifier())
 	server.SetGroupVerifier(validatorGroupVerifier{})
+	server.SetAvailableGroupDiscovery(validatorAvailableGroupDiscovery{})
 	server.SetTopicCatalog(validatorTopicCatalog{store: store})
 	server.SetTopicLifecycle(validatorTopicLifecycle{store: store})
 	server.SetSettingsApplier(validatorSettingsApplier{store: store}.Apply)
 	server.SetDigestRunner(validatorDigestRunner{store: store})
 	return nil
+}
+
+// validatorAvailableGroupDiscovery exposes only deterministic, unpersisted
+// forum candidates to the safe HTTP fixture. The normal production wiring
+// uses the bot membership boundary instead, so these identities cannot leak
+// into non-validator startup.
+type validatorAvailableGroupDiscovery struct{}
+
+func (validatorAvailableGroupDiscovery) ListAvailableGroups(context.Context) ([]model.AvailableGroup, error) {
+	return []model.AvailableGroup{
+		{
+			TelegramChatID: validatorFixtureAvailableForumChatID,
+			Title:          "Validator available forum",
+			IsForum:        true,
+		},
+		{
+			TelegramChatID: validatorFixtureAvailableSecondChatID,
+			Title:          "Validator available second",
+			IsForum:        true,
+		},
+	}, nil
 }
 
 type validatorDisabledChannelVerifier struct{}

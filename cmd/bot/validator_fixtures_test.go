@@ -9,11 +9,13 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/config"
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
+	"github.com/boss/tg-channel-summary-by-ai/internal/model"
 	"github.com/boss/tg-channel-summary-by-ai/internal/parser"
 )
 
@@ -213,6 +215,56 @@ func TestValidatorServerWiresFixtureBoundariesWithoutExternalHTTP(t *testing.T) 
 	settingsResponse.Body.Close()
 	if settingsResponse.StatusCode != http.StatusOK {
 		t.Fatalf("GET settings status = %d, want 200", settingsResponse.StatusCode)
+	}
+	availableRequest, err := http.NewRequest(http.MethodGet, testServer.URL+"/api/groups/available", nil)
+	if err != nil {
+		t.Fatalf("create available groups request: %v", err)
+	}
+	availableRequest.Header.Set("X-Telegram-Init-Data", validatorOwnerInitData())
+	availableResponse, err := testServer.Client().Do(availableRequest)
+	if err != nil {
+		t.Fatalf("GET available groups: %v", err)
+	}
+	var available []struct {
+		ChatID  string `json:"chat_id"`
+		Title   string `json:"title"`
+		IsForum bool   `json:"is_forum"`
+	}
+	if err := json.NewDecoder(availableResponse.Body).Decode(&available); err != nil {
+		availableResponse.Body.Close()
+		t.Fatalf("decode available groups: %v", err)
+	}
+	availableResponse.Body.Close()
+	if availableResponse.StatusCode != http.StatusOK {
+		t.Fatalf("GET available groups status = %d, want 200", availableResponse.StatusCode)
+	}
+	if len(available) != 2 ||
+		available[0].ChatID != strconv.FormatInt(validatorFixtureAvailableForumChatID, 10) ||
+		available[0].Title != "Validator available forum" ||
+		!available[0].IsForum {
+		t.Fatalf("available groups = %+v, want deterministic local forum candidates", available)
+	}
+	createAvailableRequest, err := http.NewRequest(http.MethodPost, testServer.URL+"/api/groups",
+		strings.NewReader(`{"chat_id":"-1007000000101"}`))
+	if err != nil {
+		t.Fatalf("create available group selection request: %v", err)
+	}
+	createAvailableRequest.Header.Set("Content-Type", "application/json")
+	createAvailableRequest.Header.Set("X-Telegram-Init-Data", validatorOwnerInitData())
+	createAvailableResponse, err := testServer.Client().Do(createAvailableRequest)
+	if err != nil {
+		t.Fatalf("select available group: %v", err)
+	}
+	createAvailableResponse.Body.Close()
+	if createAvailableResponse.StatusCode != http.StatusCreated {
+		t.Fatalf("select available group status = %d, want 201", createAvailableResponse.StatusCode)
+	}
+	selectedGroup, err := store.Groups.GetByChatID(validatorFixtureAvailableForumChatID)
+	if err != nil {
+		t.Fatalf("load selected available group: %v", err)
+	}
+	if selectedGroup.Title != "Validator Group -1007000000101" || selectedGroup.Status != model.GroupStatusActive {
+		t.Fatalf("selected available group = %+v, want local authenticated boundary result", selectedGroup)
 	}
 	updateRequest, err := http.NewRequest(http.MethodPut, testServer.URL+"/api/settings",
 		strings.NewReader(`{"digest_time":"11:30","timezone":"UTC","default_model":"validator-model","version":1}`))

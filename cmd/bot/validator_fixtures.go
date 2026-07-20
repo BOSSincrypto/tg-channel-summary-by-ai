@@ -42,6 +42,9 @@ const (
 
 	validatorFixtureAvailableForumChatID  int64 = -1007000000101
 	validatorFixtureAvailableSecondChatID int64 = -1007000000102
+
+	validatorDigestOutcomeEnv = "VALIDATOR_DIGEST_OUTCOME"
+	validatorDigestDelayEnv   = "VALIDATOR_DIGEST_STAGE_DELAY_MS"
 )
 
 var (
@@ -291,7 +294,7 @@ func configureValidatorBotAdminFixture(server *webapp.Server, store *db.DB) erro
 	server.SetTopicCatalog(validatorTopicCatalog{store: store})
 	server.SetTopicLifecycle(validatorTopicLifecycle{store: store})
 	server.SetSettingsApplier(validatorSettingsApplier{store: store}.Apply)
-	server.SetDigestRunner(validatorDigestRunner{store: store})
+	server.SetDigestRunner(newValidatorDigestRunner(store))
 	return nil
 }
 
@@ -502,14 +505,47 @@ func (l validatorTopicLifecycle) RemoveChannelTopicWithVersion(_ context.Context
 	return l.store.Groups.UnassignChannelOptimistic(groupID, channelID, version)
 }
 
+// validatorDigestRunner is intentionally only wired by the validator fixture.
+// Each stage has a deterministic delay so authenticated polling can observe
+// progress, while Close unblocks an in-flight run during validator teardown.
 type validatorDigestRunner struct {
-	store *db.DB
+	store      *db.DB
+	stageDelay time.Duration
+	runMu      sync.Mutex
+	currentMu  sync.Mutex
+	current    *validatorDigestRun
 }
 
-func (r validatorDigestRunner) GenerateManual(groupID int64) (*digest.Digest, error) {
-	if r.store == nil {
+type validatorDigestRun struct {
+	done        chan struct{}
+	releaseOnce sync.Once
+}
+
+func newValidatorDigestRunner(store *db.DB) *validatorDigestRunner {
+	delay := 1200 * time.Millisecond
+	if raw := strings.TrimSpace(os.Getenv(validatorDigestDelayEnv)); raw != "" {
+		if milliseconds, err := strconv.Atoi(raw); err == nil && milliseconds >= 0 {
+			delay = time.Duration(milliseconds) * time.Millisecond
+		}
+	}
+	return &validatorDigestRunner{
+		store:      store,
+		stageDelay: delay,
+	}
+}
+
+func (r *validatorDigestRunner) GenerateManual(groupID int64) (*digest.Digest, error) {
+	return r.GenerateManualResultWithProgress(groupID, nil)
+}
+
+func (r *validatorDigestRunner) GenerateManualResultWithProgress(groupID int64, progress func(string, string)) (*digest.Digest, error) {
+	if r == nil || r.store == nil {
 		return nil, errors.New("validator digest runner is not configured")
 	}
+	r.runMu.Lock()
+	defer r.runMu.Unlock()
+	run := r.startRun()
+	defer r.finishRun(run)
 	group, err := r.store.Groups.GetByID(groupID)
 	if err != nil {
 		return nil, err
@@ -521,6 +557,31 @@ func (r validatorDigestRunner) GenerateManual(groupID int64) (*digest.Digest, er
 			Message: "В группе нет доступных каналов для дайджеста.",
 		}, nil
 	}
+	for _, stage := range []struct {
+		name   string
+		detail string
+	}{
+		{name: "parsing", detail: "Парсинг каналов: fixture_valid (1/1)"},
+		{name: "summarizing", detail: "Суммаризация постов..."},
+		{name: "sending", detail: "Отправка в группу..."},
+	} {
+		if progress != nil {
+			progress(stage.name, stage.detail)
+		}
+		if !r.waitStage(run) {
+			return &digest.Digest{
+				GroupID: groupID,
+				Outcome: digest.OutcomeAIFailed,
+				Message: "Тестовый дайджест остановлен валидатором.",
+			}, errors.New("validator digest fixture stopped")
+		}
+		if outcome := strings.TrimSpace(os.Getenv(validatorDigestOutcomeEnv)); outcome != "" && outcome != "succeeded" && stage.name == "summarizing" {
+			if !isValidatorDigestOutcome(outcome) {
+				outcome = digest.OutcomeAIFailed
+			}
+			return validatorDigestOutcome(groupID, outcome), errors.New("validator digest fixture forced terminal outcome")
+		}
+	}
 	return &digest.Digest{
 		GroupID:        groupID,
 		PostCount:      1,
@@ -530,6 +591,104 @@ func (r validatorDigestRunner) GenerateManual(groupID int64) (*digest.Digest, er
 		SummariesSaved: true,
 		Delivered:      true,
 	}, nil
+}
+
+func (r *validatorDigestRunner) startRun() *validatorDigestRun {
+	run := &validatorDigestRun{done: make(chan struct{})}
+	r.currentMu.Lock()
+	r.current = run
+	r.currentMu.Unlock()
+	return run
+}
+
+func (r *validatorDigestRunner) finishRun(run *validatorDigestRun) {
+	if run == nil {
+		return
+	}
+	run.releaseOnce.Do(func() { close(run.done) })
+	r.currentMu.Lock()
+	if r.current == run {
+		r.current = nil
+	}
+	r.currentMu.Unlock()
+}
+
+func (r *validatorDigestRunner) waitStage(run *validatorDigestRun) bool {
+	if run == nil {
+		return false
+	}
+	if r.stageDelay <= 0 {
+		select {
+		case <-run.done:
+			return false
+		default:
+			return true
+		}
+	}
+	timer := time.NewTimer(r.stageDelay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-run.done:
+		return false
+	}
+}
+
+// Close is called by webapp.Server when validator HTTP mode tears down. It is
+// idempotent so success, failure, and shutdown can all release the same run.
+func (r *validatorDigestRunner) Close() {
+	if r == nil {
+		return
+	}
+	r.currentMu.Lock()
+	run := r.current
+	r.currentMu.Unlock()
+	if run != nil {
+		run.releaseOnce.Do(func() { close(run.done) })
+	}
+}
+
+func isValidatorDigestOutcome(outcome string) bool {
+	switch outcome {
+	case digest.OutcomeSucceeded, digest.OutcomeNoPosts, digest.OutcomePartial,
+		digest.OutcomeAllChannelsFailed, digest.OutcomeAIFailed, digest.OutcomeDeliveryFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+func validatorDigestOutcome(groupID int64, outcome string) *digest.Digest {
+	result := &digest.Digest{
+		GroupID: groupID,
+		Outcome: outcome,
+		Message: "Тестовый дайджест завершился с заданным исходом.",
+	}
+	switch outcome {
+	case digest.OutcomeSucceeded:
+		result.PostCount = 1
+		result.ChannelCount = 1
+		result.Message = "Тестовый дайджест отправлен локально."
+		result.SummariesSaved = true
+		result.Delivered = true
+	case digest.OutcomeNoPosts:
+		result.Message = "В тестовом дайджесте нет новых постов."
+	case digest.OutcomePartial:
+		result.PostCount = 1
+		result.ChannelCount = 1
+		result.FailedChannels = []string{"fixture_missing"}
+		result.FailureDetails = []string{"fixture_missing: validator failure"}
+	case digest.OutcomeAllChannelsFailed:
+		result.FailedChannels = []string{"fixture_missing"}
+		result.FailureDetails = []string{"fixture_missing: validator failure"}
+	case digest.OutcomeAIFailed:
+		result.Message = "Тестовый провайдер AI завершился с ошибкой."
+	case digest.OutcomeDeliveryFailed:
+		result.SummariesSaved = true
+		result.Message = "Тестовая доставка завершилась с ошибкой."
+	}
+	return result
 }
 
 // validatorHTTPTransport returns deterministic OpenAI-compatible responses

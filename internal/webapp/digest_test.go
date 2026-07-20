@@ -21,6 +21,72 @@ func (f typedDigestRunnerFixture) GenerateManualResult(int64) (*digest.Digest, e
 	return f.result, f.err
 }
 
+type progressDigestRunnerFixture struct {
+	stages  chan string
+	release chan struct{}
+}
+
+func (f progressDigestRunnerFixture) GenerateManual(int64) (*digest.Digest, error) {
+	return &digest.Digest{Outcome: digest.OutcomeSucceeded, Message: "done"}, nil
+}
+
+func (f progressDigestRunnerFixture) GenerateManualResultWithProgress(_ int64, progress func(string, string)) (*digest.Digest, error) {
+	for _, stage := range []string{"parsing", "summarizing", "sending"} {
+		progress(stage, stage+" detail")
+		f.stages <- stage
+		if stage == "parsing" {
+			<-f.release
+		}
+	}
+	return &digest.Digest{
+		Outcome:   digest.OutcomeSucceeded,
+		Message:   "done",
+		Delivered: true,
+	}, nil
+}
+
+func TestDigestJobUsesProgressRunnerAndKeepsRunningLockUntilTerminalState(t *testing.T) {
+	runner := progressDigestRunnerFixture{
+		stages:  make(chan string, 3),
+		release: make(chan struct{}),
+	}
+	server := &Server{digestJobs: newDigestJobStore(), digestRunner: runner}
+	job := server.digestJobs.create(7)
+	if job == nil {
+		t.Fatal("create returned nil")
+	}
+	done := make(chan struct{})
+	go func() {
+		server.runDigestJob(nil, job.ID, 7)
+		close(done)
+	}()
+
+	if stage := <-runner.stages; stage != "parsing" {
+		t.Fatalf("first stage = %q, want parsing", stage)
+	}
+	if got := server.digestJobs.get(job.ID); got.Status != "parsing" || got.Message != "parsing detail" {
+		t.Fatalf("job after parsing = %+v", got)
+	}
+	if duplicate := server.digestJobs.create(7); duplicate != nil {
+		t.Fatalf("duplicate job = %+v, want running conflict", duplicate)
+	}
+
+	close(runner.release)
+	for _, want := range []string{"summarizing", "sending"} {
+		if stage := <-runner.stages; stage != want {
+			t.Fatalf("next stage = %q, want %s", stage, want)
+		}
+	}
+	<-done
+	got := server.digestJobs.get(job.ID)
+	if got.Status != "completed" || got.Outcome != digest.OutcomeSucceeded {
+		t.Fatalf("terminal job = %+v, want completed success", got)
+	}
+	if duplicate := server.digestJobs.create(7); duplicate == nil {
+		t.Fatal("terminal job did not release running lock")
+	}
+}
+
 func TestDigestJobExposesTypedTerminalOutcomes(t *testing.T) {
 	tests := []struct {
 		name           string

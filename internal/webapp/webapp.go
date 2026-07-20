@@ -394,6 +394,16 @@ func (s *Server) EnterTerminal(reason error) {
 		s.terminalReason = reason
 	}
 	s.terminalMu.Unlock()
+	s.closeDigestRunner()
+}
+
+func (s *Server) closeDigestRunner() {
+	if s == nil || s.digestRunner == nil {
+		return
+	}
+	if runner, ok := s.digestRunner.(closableDigestRunner); ok {
+		runner.Close()
+	}
 }
 
 func (s *Server) terminalState() (bool, error) {
@@ -467,6 +477,7 @@ func (s *Server) Serve(listener net.Listener) error {
 
 // Stop gracefully shuts down the HTTP server.
 func (s *Server) Stop() {
+	s.closeDigestRunner()
 	if s.srv != nil {
 		s.srv.Close()
 	}

@@ -21,6 +21,17 @@ type typedDigestRunner interface {
 	GenerateManualResult(int64) (*digest.Digest, error)
 }
 
+// progressDigestRunner is an optional extension for validator and other
+// narrow-boundary runners that can report deterministic manual-digest stages.
+// DigestRunner remains stable for production implementations.
+type progressDigestRunner interface {
+	GenerateManualResultWithProgress(int64, func(string, string)) (*digest.Digest, error)
+}
+
+type closableDigestRunner interface {
+	Close()
+}
+
 type digestJob struct {
 	ID             string   `json:"job_id"`
 	GroupID        int64    `json:"group_id"`
@@ -55,7 +66,12 @@ func (s *digestJobStore) create(groupID int64) *digestJob {
 		return nil
 	}
 	s.nextID++
-	job := &digestJob{ID: strconv.FormatInt(s.nextID, 10), GroupID: groupID, Status: "parsing"}
+	job := &digestJob{
+		ID:      strconv.FormatInt(s.nextID, 10),
+		GroupID: groupID,
+		Status:  "parsing",
+		Message: "Подготовка...",
+	}
 	s.jobs[job.ID] = job
 	s.running[groupID] = job.ID
 	return cloneDigestJob(job)
@@ -141,16 +157,27 @@ func (s *Server) runDigestJob(ctx context.Context, jobID string, groupID int64) 
 			return nil
 		}
 
-		s.digestJobs.update(jobID, func(job *digestJob) {
-			job.Status = "summarizing"
-		})
 		var (
 			result *digest.Digest
 			runErr error
 		)
-		if runner, ok := s.digestRunner.(typedDigestRunner); ok {
+		if runner, ok := s.digestRunner.(progressDigestRunner); ok {
+			runnerProgress := func(stage, detail string) {
+				s.digestJobs.update(jobID, func(job *digestJob) {
+					job.Status = stage
+					job.Message = detail
+				})
+			}
+			result, runErr = runner.GenerateManualResultWithProgress(groupID, runnerProgress)
+		} else if runner, ok := s.digestRunner.(typedDigestRunner); ok {
+			s.digestJobs.update(jobID, func(job *digestJob) {
+				job.Status = "summarizing"
+			})
 			result, runErr = runner.GenerateManualResult(groupID)
 		} else {
+			s.digestJobs.update(jobID, func(job *digestJob) {
+				job.Status = "summarizing"
+			})
 			result, runErr = s.digestRunner.GenerateManual(groupID)
 		}
 		if runErr != nil {

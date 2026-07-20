@@ -6,15 +6,18 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/config"
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
+	"github.com/boss/tg-channel-summary-by-ai/internal/digest"
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
 	"github.com/boss/tg-channel-summary-by-ai/internal/parser"
 )
@@ -404,6 +407,169 @@ func TestValidatorFixtureMutationBoundariesStayCleanAcrossRuns(t *testing.T) {
 	if first, second := run(), run(); first != second || first != 1 {
 		t.Fatalf("fresh validator runs produced rows %d and %d, want one each", first, second)
 	}
+}
+
+func TestValidatorDigestRunnerReportsStagesAndCanRunAgainAfterSuccess(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	seed, err := seedValidatorBotAdminFixture(store)
+	if err != nil {
+		t.Fatalf("seed fixture: %v", err)
+	}
+	t.Setenv(validatorDigestDelayEnv, "0")
+	runner := newValidatorDigestRunner(store)
+	var stages []string
+	result, err := runner.GenerateManualResultWithProgress(seed.ForumGroupID, func(stage, detail string) {
+		stages = append(stages, stage+":"+detail)
+	})
+	if err != nil {
+		t.Fatalf("run validator digest: %v", err)
+	}
+	if result.Outcome != "succeeded" || !result.Delivered || !result.SummariesSaved {
+		t.Fatalf("result = %+v, want delivered success", result)
+	}
+	if want := []string{
+		"parsing:Парсинг каналов: fixture_valid (1/1)",
+		"summarizing:Суммаризация постов...",
+		"sending:Отправка в группу...",
+	}; !reflect.DeepEqual(stages, want) {
+		t.Fatalf("stages = %v, want %v", stages, want)
+	}
+	if _, err := runner.GenerateManual(seed.ForumGroupID); err != nil {
+		t.Fatalf("second validator digest run: %v", err)
+	}
+}
+
+func TestValidatorDigestRunnerCloseReleasesInFlightRun(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	seed, err := seedValidatorBotAdminFixture(store)
+	if err != nil {
+		t.Fatalf("seed fixture: %v", err)
+	}
+	t.Setenv(validatorDigestDelayEnv, "3600000")
+	runner := newValidatorDigestRunner(store)
+	started := make(chan struct{})
+	resultCh := make(chan *digest.Digest, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		result, runErr := runner.GenerateManualResultWithProgress(seed.ForumGroupID, func(stage, _ string) {
+			if stage == "parsing" {
+				close(started)
+			}
+		})
+		resultCh <- result
+		errCh <- runErr
+	}()
+	<-started
+	runner.Close()
+	select {
+	case result := <-resultCh:
+		if result == nil || result.Outcome != digest.OutcomeAIFailed {
+			t.Fatalf("result after close = %+v, want ai_failed", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("validator digest did not stop after Close")
+	}
+	if runErr := <-errCh; runErr == nil {
+		t.Fatal("closed validator digest returned nil error")
+	}
+}
+
+func TestValidatorHTTPDigestProgressAndRunningConflict(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	seed, err := seedValidatorBotAdminFixture(store)
+	if err != nil {
+		t.Fatalf("seed fixture: %v", err)
+	}
+	t.Setenv(validatorDigestDelayEnv, "3600000")
+	server, err := newValidatorHTTPServer(&validatorConfigForTest, store)
+	if err != nil {
+		t.Fatalf("create validator server: %v", err)
+	}
+	if err := configureValidatorBotAdminFixture(server, store); err != nil {
+		t.Fatalf("configure validator fixture: %v", err)
+	}
+	testServer := httptest.NewServer(server.Handler())
+	t.Cleanup(testServer.Close)
+
+	postDigest := func() *http.Response {
+		request, err := http.NewRequest(http.MethodPost, testServer.URL+"/api/digest/test",
+			strings.NewReader(`{"group_id":"`+strconv.FormatInt(seed.ForumGroupID, 10)+`"}`))
+		if err != nil {
+			t.Fatalf("create digest request: %v", err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-Telegram-Init-Data", validatorOwnerInitData())
+		response, err := testServer.Client().Do(request)
+		if err != nil {
+			t.Fatalf("post digest: %v", err)
+		}
+		return response
+	}
+
+	first := postDigest()
+	var job struct {
+		ID     string `json:"job_id"`
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(first.Body).Decode(&job); err != nil {
+		first.Body.Close()
+		t.Fatalf("decode first digest response: %v", err)
+	}
+	first.Body.Close()
+	if first.StatusCode != http.StatusAccepted || job.ID == "" || job.Status != "parsing" {
+		t.Fatalf("first digest response = status %d job %+v, want accepted parsing", first.StatusCode, job)
+	}
+
+	second := postDigest()
+	var conflict struct {
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(second.Body).Decode(&conflict); err != nil {
+		second.Body.Close()
+		t.Fatalf("decode conflict response: %v", err)
+	}
+	second.Body.Close()
+	if second.StatusCode != http.StatusConflict ||
+		!strings.Contains(conflict.Error, "уже выполняется") {
+		t.Fatalf("second digest response = status %d body %+v, want running conflict", second.StatusCode, conflict)
+	}
+
+	statusRequest, err := http.NewRequest(http.MethodGet,
+		testServer.URL+"/api/digest/status?id="+url.QueryEscape(job.ID), nil)
+	if err != nil {
+		t.Fatalf("create status request: %v", err)
+	}
+	statusRequest.Header.Set("X-Telegram-Init-Data", validatorOwnerInitData())
+	statusResponse, err := testServer.Client().Do(statusRequest)
+	if err != nil {
+		t.Fatalf("get digest status: %v", err)
+	}
+	var status struct {
+		Status  string `json:"status"`
+		Message string `json:"message"`
+	}
+	if err := json.NewDecoder(statusResponse.Body).Decode(&status); err != nil {
+		statusResponse.Body.Close()
+		t.Fatalf("decode digest status: %v", err)
+	}
+	statusResponse.Body.Close()
+	if status.Status != "parsing" || status.Message == "" {
+		t.Fatalf("digest status = %+v, want parsing detail", status)
+	}
+
+	server.Stop()
 }
 
 func TestValidatorListenerOwnershipIsExclusiveAndReleasable(t *testing.T) {

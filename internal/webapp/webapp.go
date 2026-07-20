@@ -324,6 +324,15 @@ func (s *Server) SetGroupVerifier(verifier GroupVerifier) {
 	}
 }
 
+// SetAvailableGroupDiscovery connects the authenticated WebApp group picker
+// to the running Telegram bot's membership discovery boundary.
+func (s *Server) SetAvailableGroupDiscovery(discovery AvailableGroupDiscovery) {
+	if s == nil || s.groupService == nil {
+		return
+	}
+	s.groupService.discovery = discovery
+}
+
 // SetTokenRevocationHandler connects the production Telegram getChat boundary
 // to the shared application lifecycle supervisor.
 func (s *Server) SetTokenRevocationHandler(handler func(error)) {

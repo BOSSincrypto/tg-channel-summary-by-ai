@@ -27,6 +27,14 @@ type Group struct {
 	CreatedAt      string
 }
 
+// AvailableGroup is a Telegram group discovered through the production bot
+// boundary for presentation in the WebApp group picker.
+type AvailableGroup struct {
+	TelegramChatID int64
+	Title          string
+	IsForum        bool
+}
+
 const (
 	GroupStatusActive     = "active"
 	GroupStatusInactive   = "inactive"

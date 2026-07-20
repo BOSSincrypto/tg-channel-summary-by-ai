@@ -261,6 +261,46 @@ func TestServiceAdminCommandsDenyNonOwnerWithoutMarkup(t *testing.T) {
 	}
 }
 
+func TestListAvailableGroupsUsesTelegramMembershipBoundary(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	for _, group := range []model.Group{
+		{TelegramChatID: -1002, Title: "Forum", Status: model.GroupStatusActive},
+		{TelegramChatID: -1003, Title: "Regular", Status: model.GroupStatusIneligible},
+		{TelegramChatID: -1004, Title: "Inactive", Status: model.GroupStatusInactive},
+	} {
+		if _, err := store.Groups.Insert(&group); err != nil {
+			t.Fatalf("insert group %d: %v", group.TelegramChatID, err)
+		}
+	}
+	api := &fakeTelegramClient{
+		chats: map[int64]*telego.ChatFullInfo{
+			-1002: {ID: -1002, Type: telego.ChatTypeSupergroup, Title: "Forum", IsForum: true},
+			-1003: {ID: -1003, Type: telego.ChatTypeSupergroup, Title: "Regular", IsForum: false},
+		},
+	}
+	service := newServiceForTest(api, nil)
+	service.groups = store.Groups
+
+	groups, err := service.ListAvailableGroups(context.Background())
+	if err != nil {
+		t.Fatalf("list available groups: %v", err)
+	}
+	if len(groups) != 1 {
+		t.Fatalf("available groups = %#v, want one forum group", groups)
+	}
+	if groups[0].TelegramChatID != -1002 || !groups[0].IsForum {
+		t.Fatalf("available groups = %#v, want Telegram metadata", groups)
+	}
+	if api.getChatCalls != 2 {
+		t.Fatalf("GetChat calls = %d, want inactive group skipped", api.getChatCalls)
+	}
+}
+
 func TestServiceAdminCommandsIgnoreMalformedSender(t *testing.T) {
 	api := &fakeTelegramClient{
 		me:    &telego.User{ID: 123, Username: "DigestBot"},

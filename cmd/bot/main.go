@@ -127,6 +127,7 @@ func main() {
 	}
 	telegramBot.SetTokenRevocationHandler(revocationHandler)
 	srv.SetTopicLifecycle(telegramBot)
+	srv.SetAvailableGroupDiscovery(telegramBot)
 	telegramBot.SetForumMutationFence(forumFence)
 	telegramBot.SetForumTopicRegistry(store.ForumTopics)
 	if err := telegramBot.ReconcilePendingTopicClosures(context.Background()); err != nil {

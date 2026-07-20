@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -87,6 +88,50 @@ type GroupLifecycle interface {
 
 type groupRestorer interface {
 	RestoreGroup(groupID int64) error
+}
+
+// ListAvailableGroups discovers current Telegram group membership through the
+// production Bot API boundary rather than a WebApp test fixture.
+func (s *Service) ListAvailableGroups(ctx context.Context) ([]model.AvailableGroup, error) {
+	if s == nil || s.api == nil || s.groups == nil {
+		return nil, errors.New("group discovery is not configured")
+	}
+	groups, err := s.groups.List()
+	if err != nil {
+		return nil, fmt.Errorf("list groups for discovery: %w", err)
+	}
+	result := make([]model.AvailableGroup, 0, len(groups))
+	for _, group := range groups {
+		if group.Status == model.GroupStatusInactive {
+			continue
+		}
+		chat, err := s.api.GetChat(ctx, &telego.GetChatParams{
+			ChatID: groupTelegramChatID(group.TelegramChatID),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("discover group %d: %w", group.TelegramChatID, s.classifyTelegramError(err))
+		}
+		if chat == nil || chat.ID == 0 {
+			return nil, fmt.Errorf("discover group %d: Telegram returned no chat metadata", group.TelegramChatID)
+		}
+		if !chat.IsForum {
+			continue
+		}
+		result = append(result, model.AvailableGroup{
+			TelegramChatID: chat.ID,
+			Title:          strings.TrimSpace(chat.Title),
+			IsForum:        true,
+		})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		left := strings.ToLower(result[i].Title)
+		right := strings.ToLower(result[j].Title)
+		if left == right {
+			return result[i].TelegramChatID < result[j].TelegramChatID
+		}
+		return left < right
+	})
+	return result, nil
 }
 
 // CommandHandler handles a normalized bot command and its optional argument.

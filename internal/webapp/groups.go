@@ -64,6 +64,13 @@ type TopicCatalog interface {
 	ListTopics(context.Context, int64) ([]Topic, error)
 }
 
+// AvailableGroupDiscovery is the production boundary for discovering groups
+// where the bot is currently a member. It deliberately returns Telegram
+// identity data rather than WebApp presentation models.
+type AvailableGroupDiscovery interface {
+	ListAvailableGroups(context.Context) ([]model.AvailableGroup, error)
+}
+
 type permissiveGroupVerifier struct{}
 
 func (permissiveGroupVerifier) Verify(chatID int64) (string, error) {
@@ -131,6 +138,7 @@ type GroupService struct {
 	repository   dbGroupRepository
 	channels     dbChannelLookup
 	verifier     GroupVerifier
+	discovery    AvailableGroupDiscovery
 	topics       TopicLifecycle
 	catalog      TopicCatalog
 	assignmentMu sync.Mutex
@@ -754,7 +762,40 @@ func (s *Server) handleAvailableGroups(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	writeJSON(w, http.StatusOK, []map[string]any{})
+	if s.groupService == nil || s.groupService.discovery == nil {
+		writeJSON(w, http.StatusOK, []map[string]any{})
+		return
+	}
+	groups, err := s.groupService.discovery.ListAvailableGroups(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{
+			"error": "Не удалось загрузить доступные группы",
+		})
+		return
+	}
+	body := make([]map[string]any, 0, len(groups))
+	seen := make(map[int64]struct{}, len(groups))
+	for _, group := range groups {
+		if group.TelegramChatID == 0 || !group.IsForum {
+			continue
+		}
+		if _, ok := seen[group.TelegramChatID]; ok {
+			continue
+		}
+		seen[group.TelegramChatID] = struct{}{}
+		title := strings.TrimSpace(group.Title)
+		if title == "" {
+			title = strconv.FormatInt(group.TelegramChatID, 10)
+		}
+		chatID := strconv.FormatInt(group.TelegramChatID, 10)
+		body = append(body, map[string]any{
+			"chat_id":          chatID,
+			"telegram_chat_id": chatID,
+			"title":            title,
+			"is_forum":         true,
+		})
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 func parsePositiveID(value string) (int64, error) {

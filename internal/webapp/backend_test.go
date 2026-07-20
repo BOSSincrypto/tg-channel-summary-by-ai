@@ -389,6 +389,51 @@ func TestGroupsAPIUsesStringChatIDAndRejectsDuplicateAssignments(t *testing.T) {
 	}
 }
 
+func TestAvailableGroupsUsesInjectedProductionDiscoveryBoundary(t *testing.T) {
+	server, _ := newBackendTestServer(t)
+	server.SetAvailableGroupDiscovery(staticAvailableGroupDiscovery{groups: []model.AvailableGroup{
+		{TelegramChatID: -1002, Title: "Forum", IsForum: true},
+		{TelegramChatID: -1003, Title: "Regular", IsForum: false},
+		{TelegramChatID: -1002, Title: "Duplicate", IsForum: true},
+		{TelegramChatID: -1004, IsForum: true},
+	}})
+
+	response := doJSON(t, server.Handler(), http.MethodGet, "/api/groups/available", "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("available groups status = %d, body=%s", response.Code, response.Body.String())
+	}
+	var groups []map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &groups); err != nil {
+		t.Fatalf("decode available groups: %v", err)
+	}
+	if len(groups) != 2 {
+		t.Fatalf("available groups = %#v, want two forum groups", groups)
+	}
+	if groups[0]["chat_id"] != "-1002" || groups[0]["telegram_chat_id"] != "-1002" ||
+		groups[0]["title"] != "Forum" || groups[0]["is_forum"] != true {
+		t.Fatalf("first available group = %#v", groups[0])
+	}
+	if groups[1]["chat_id"] != "-1004" || groups[1]["title"] != "-1004" {
+		t.Fatalf("fallback-title available group = %#v", groups[1])
+	}
+}
+
+func TestAvailableGroupsPropagatesDiscoveryFailureAsBadGateway(t *testing.T) {
+	server, _ := newBackendTestServer(t)
+	server.SetAvailableGroupDiscovery(staticAvailableGroupDiscovery{
+		err: errors.New("Telegram discovery unavailable"),
+	})
+
+	response := doJSON(t, server.Handler(), http.MethodGet, "/api/groups/available", "")
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("available groups failure status = %d, body=%s, want 502",
+			response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "доступные группы") {
+		t.Fatalf("available groups failure body = %s", response.Body.String())
+	}
+}
+
 func TestProductionTopicLifecycleIsUsedForAssignmentAndRemoval(t *testing.T) {
 	server, store := newBackendTestServer(t)
 	lifecycle := &fakeTopicLifecycle{store: store}
@@ -1171,6 +1216,18 @@ func (c staticTopicCatalog) ListTopics(context.Context, int64) ([]Topic, error) 
 		return nil, c.err
 	}
 	return append([]Topic(nil), c.topics...), nil
+}
+
+type staticAvailableGroupDiscovery struct {
+	groups []model.AvailableGroup
+	err    error
+}
+
+func (d staticAvailableGroupDiscovery) ListAvailableGroups(context.Context) ([]model.AvailableGroup, error) {
+	if d.err != nil {
+		return nil, d.err
+	}
+	return append([]model.AvailableGroup(nil), d.groups...), nil
 }
 
 type fakeForumGroupVerifier struct {

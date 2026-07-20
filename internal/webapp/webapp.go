@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -430,11 +431,29 @@ func (s *Server) Start(port string) error {
 	if terminal, _ := s.terminalState(); terminal {
 		return errors.New("HTTP server is in terminal state")
 	}
+	listener, err := net.Listen("tcp", ":"+port)
+	if err != nil {
+		return err
+	}
+	return s.Serve(listener)
+}
+
+// Serve starts the HTTP server on an already-bound listener. Callers that
+// need to establish ownership of a socket before serving can bind the
+// listener first and then pass it here.
+func (s *Server) Serve(listener net.Listener) error {
+	if listener == nil {
+		return errors.New("HTTP server requires a listener")
+	}
+	if terminal, _ := s.terminalState(); terminal {
+		_ = listener.Close()
+		return errors.New("HTTP server is in terminal state")
+	}
 	s.srv = &http.Server{
-		Addr:    ":" + port,
+		Addr:    listener.Addr().String(),
 		Handler: s.router,
 	}
-	return s.srv.ListenAndServe()
+	return s.srv.Serve(listener)
 }
 
 // Stop gracefully shuts down the HTTP server.

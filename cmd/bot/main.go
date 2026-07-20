@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -225,6 +226,42 @@ func runValidatorHTTPOnly() error {
 	if err != nil {
 		return err
 	}
+	runDB, err := newValidatorRunDatabase(cfg.DBPath)
+	if err != nil {
+		return err
+	}
+	validatorOwnerKey := cfg.DBPath
+	defer func() {
+		if cleanupErr := runDB.cleanup(); cleanupErr != nil {
+			log.Printf("validator database cleanup failed: %v", cleanupErr)
+		}
+	}()
+	cfg.DBPath = runDB.path
+
+	listener, err := net.Listen("tcp", ":"+cfg.Port)
+	if err != nil {
+		return fmt.Errorf("bind validator HTTP listener on port %s: %w", cfg.Port, err)
+	}
+	var owner *validatorListenerOwner
+	defer func() {
+		if closeErr := listener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			log.Printf("validator listener cleanup failed: %v", closeErr)
+		}
+		if owner != nil {
+			if releaseErr := owner.Release(); releaseErr != nil {
+				log.Printf("validator listener ownership cleanup failed: %v", releaseErr)
+			}
+		}
+	}()
+
+	owner, err = newValidatorListenerOwnerForRun(validatorOwnerKey, cfg.DBPath)
+	if err != nil {
+		return err
+	}
+	if err := owner.Claim(); err != nil {
+		return err
+	}
+
 	store, err := db.OpenWithEncryptionKey(cfg.DBPath, cfg.ProviderKey)
 	if err != nil {
 		return fmt.Errorf("open validator database at %s: %w", cfg.DBPath, err)
@@ -250,9 +287,7 @@ func runValidatorHTTPOnly() error {
 	}
 	serverErr := make(chan error, 1)
 	go func() {
-		if err := srv.Start(cfg.Port); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			serverErr <- err
-		}
+		serverErr <- srv.Serve(listener)
 	}()
 
 	quit := make(chan os.Signal, 1)
@@ -263,9 +298,15 @@ func runValidatorHTTPOnly() error {
 		log.Printf("Validator HTTP mode received signal %v, shutting down...", sig)
 	case err := <-serverErr:
 		srv.Stop()
-		return fmt.Errorf("validator HTTP server: %w", err)
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("validator HTTP server: %w", err)
+		}
+		return nil
 	}
 	srv.Stop()
+	if err := <-serverErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("validator HTTP server shutdown: %w", err)
+	}
 	return nil
 }
 

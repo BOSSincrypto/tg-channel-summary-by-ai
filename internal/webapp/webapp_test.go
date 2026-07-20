@@ -3,10 +3,12 @@ package webapp
 import (
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestHealthEndpoint verifies that GET /health returns 200 OK with JSON status.
@@ -60,6 +62,45 @@ func TestHealthEndpointMethodNotAllowed(t *testing.T) {
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("expected status 405, got %d", resp.StatusCode)
 	}
+}
+
+func TestServeUsesExclusiveBoundListenerAndStopReleasesIt(t *testing.T) {
+	srv := New()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("bind listener: %v", err)
+	}
+	address := listener.Addr().String()
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- srv.Serve(listener)
+	}()
+
+	var response *http.Response
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		response, err = http.Get("http://" + address + "/health")
+		if err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("GET /health through bound listener: %v", err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("GET /health status = %d, want 200", response.StatusCode)
+	}
+
+	srv.Stop()
+	if err := <-serverErr; !errors.Is(err, http.ErrServerClosed) {
+		t.Fatalf("Serve() after Stop() = %v, want ErrServerClosed", err)
+	}
+	released, err := net.Listen("tcp", address)
+	if err != nil {
+		t.Fatalf("listener was not released after Stop(): %v", err)
+	}
+	released.Close()
 }
 
 func TestTerminalStateBoundsHealthAndStopsNormalHTTPWork(t *testing.T) {

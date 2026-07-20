@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -212,6 +215,145 @@ func TestValidatorServerWiresFixtureBoundariesWithoutExternalHTTP(t *testing.T) 
 	updateResponse.Body.Close()
 	if updateResponse.StatusCode != http.StatusOK {
 		t.Fatalf("PUT settings status = %d, want 200", updateResponse.StatusCode)
+	}
+}
+
+func TestNewValidatorRunDatabaseUsesFreshFilesAndCleansAllSQLiteSidecars(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "validator.sqlite")
+	first, err := newValidatorRunDatabase(base)
+	if err != nil {
+		t.Fatalf("create first validator database: %v", err)
+	}
+	second, err := newValidatorRunDatabase(base)
+	if err != nil {
+		t.Fatalf("create second validator database: %v", err)
+	}
+	if first.path == second.path {
+		t.Fatalf("validator runs reused database path %q", first.path)
+	}
+	if !strings.HasPrefix(filepath.Base(first.path), validatorRunDBPrefix) {
+		t.Fatalf("first database path %q does not identify a validator run", first.path)
+	}
+	if !strings.HasPrefix(filepath.Base(second.path), validatorRunDBPrefix) {
+		t.Fatalf("second database path %q does not identify a validator run", second.path)
+	}
+	if _, err := os.Stat(first.path); err != nil {
+		t.Fatalf("first database placeholder missing: %v", err)
+	}
+	if _, err := os.Stat(second.path); err != nil {
+		t.Fatalf("second database placeholder missing: %v", err)
+	}
+	if err := first.cleanup(); err != nil {
+		t.Fatalf("cleanup first validator database: %v", err)
+	}
+	if err := second.cleanup(); err != nil {
+		t.Fatalf("cleanup second validator database: %v", err)
+	}
+	for _, path := range []string{first.path, second.path, first.path + "-wal", first.path + "-shm", second.path + "-wal", second.path + "-shm"} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("validator database artifact %q remains after cleanup, err=%v", path, err)
+		}
+	}
+}
+
+func TestValidatorListenerOwnershipIsExclusiveAndReleasable(t *testing.T) {
+	t.Setenv(validatorOwnerEnv, filepath.Join(t.TempDir(), "listener-owner.json"))
+	t.Setenv(validatorTokenEnv, "run-one")
+
+	firstDBPath := filepath.Join(os.TempDir(), validatorRunDBPrefix+"run-one.sqlite")
+	secondDBPath := filepath.Join(os.TempDir(), validatorRunDBPrefix+"run-two.sqlite")
+	first, err := newValidatorListenerOwner(firstDBPath)
+	if err != nil {
+		t.Fatalf("create first listener owner: %v", err)
+	}
+	if err := first.Claim(); err != nil {
+		t.Fatalf("claim first listener ownership: %v", err)
+	}
+	second, err := newValidatorListenerOwner(secondDBPath)
+	if err != nil {
+		t.Fatalf("create second listener owner: %v", err)
+	}
+	if err := second.Claim(); err == nil {
+		t.Fatal("second validator run claimed an owned listener")
+	}
+	if err := first.Release(); err != nil {
+		t.Fatalf("release first listener ownership: %v", err)
+	}
+	if err := second.Claim(); err != nil {
+		t.Fatalf("claim listener after release: %v", err)
+	}
+	if err := second.Release(); err != nil {
+		t.Fatalf("release second listener ownership: %v", err)
+	}
+}
+
+func TestValidatorListenerOwnershipReplacesDeadValidatorRecordOnly(t *testing.T) {
+	ownerPath := filepath.Join(t.TempDir(), "listener-owner.json")
+	t.Setenv(validatorOwnerEnv, ownerPath)
+	t.Setenv(validatorTokenEnv, "replacement")
+	dbPath := filepath.Join(os.TempDir(), validatorRunDBPrefix+"replacement.sqlite")
+
+	stale := validatorListenerOwnerRecord{
+		Mode:   "validator_http_only",
+		PID:    int(^uint32(0)),
+		Token:  "old-run",
+		DBPath: dbPath,
+	}
+	data, err := json.Marshal(stale)
+	if err != nil {
+		t.Fatalf("encode stale owner record: %v", err)
+	}
+	if err := os.WriteFile(ownerPath, data, 0o600); err != nil {
+		t.Fatalf("write stale owner record: %v", err)
+	}
+
+	owner, err := newValidatorListenerOwner(dbPath)
+	if err != nil {
+		t.Fatalf("create replacement listener owner: %v", err)
+	}
+	if err := owner.Claim(); err != nil {
+		t.Fatalf("replace stale owner record: %v", err)
+	}
+	if err := owner.Release(); err != nil {
+		t.Fatalf("release replacement listener owner: %v", err)
+	}
+
+	if _, err := os.Stat(ownerPath); !os.IsNotExist(err) {
+		t.Fatalf("owner record remains after replacement release, err=%v", err)
+	}
+}
+
+func TestValidatorListenerOwnershipPreservesActiveNonValidatorRecord(t *testing.T) {
+	ownerPath := filepath.Join(t.TempDir(), "listener-owner.json")
+	t.Setenv(validatorOwnerEnv, ownerPath)
+	t.Setenv(validatorTokenEnv, "protected")
+	dbPath := filepath.Join(os.TempDir(), validatorRunDBPrefix+"protected.sqlite")
+	data, err := json.Marshal(validatorListenerOwnerRecord{
+		Mode:   "production",
+		PID:    os.Getpid(),
+		Token:  "production",
+		DBPath: dbPath,
+	})
+	if err != nil {
+		t.Fatalf("encode protected owner record: %v", err)
+	}
+	if err := os.WriteFile(ownerPath, data, 0o600); err != nil {
+		t.Fatalf("write protected owner record: %v", err)
+	}
+
+	owner, err := newValidatorListenerOwner(dbPath)
+	if err != nil {
+		t.Fatalf("create protected listener owner: %v", err)
+	}
+	if err := owner.Claim(); err == nil {
+		t.Fatal("validator claim replaced an active non-validator owner record")
+	}
+	preserved, err := readValidatorListenerOwner(ownerPath)
+	if err != nil {
+		t.Fatalf("read preserved owner record: %v", err)
+	}
+	if preserved.Mode != "production" || preserved.PID != os.Getpid() {
+		t.Fatalf("protected owner record changed: %+v", preserved)
 	}
 }
 

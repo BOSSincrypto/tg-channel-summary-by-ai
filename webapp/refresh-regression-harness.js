@@ -826,6 +826,221 @@ async function testSettingsServerFailurePreservesDraft() {
   );
 }
 
+async function testAuthenticatedCancelFlowsPreserveStateWithoutMutations() {
+  const channelApp = makeApp();
+  const channels = channelApp.findPending("/api/channels");
+  channelApp.resolve(channels, [{ id: 101, version: 4, username: "fixture_valid", title: "Stable channel", enabled: true }]);
+  await settle();
+  channelApp.document.querySelectorAll("button").find((button) => button.textContent === "Удалить").click();
+  const channelDialog = channelApp.document.querySelector('[role="dialog"]');
+  assert(channelDialog, "Channel delete confirmation did not open");
+  channelDialog.querySelectorAll("button").find((button) => button.textContent === "Отмена").click();
+  assert(!channelApp.document.querySelector('[role="dialog"]'), "Channel cancel left the confirmation open");
+  assert(channelApp.hooks.findChannel("101").username === "fixture_valid", "Channel cancel changed visible channel state");
+  assert(
+    !channelApp.requests.some((request) => request.path === "/api/channels/101" && request.method === "DELETE"),
+    "Channel cancel issued a delete request"
+  );
+
+  const groupApp = makeApp();
+  const groupChannels = groupApp.findPending("/api/channels");
+  groupApp.resolve(groupChannels, []);
+  await settle();
+  groupApp.document.querySelectorAll("button").find((button) =>
+    button.children.some((child) => child.textContent === "Группы")
+  ).click();
+  const groups = groupApp.findPending("/api/groups?with_channels=true");
+  groupApp.resolve(groups, [{
+    id: 7,
+    version: 3,
+    telegram_chat_id: "-1007",
+    title: "Stable group",
+    assignments: []
+  }]);
+  await settle();
+  groupApp.document.querySelectorAll("button").find((button) => button.textContent === "Удалить").click();
+  const groupDialog = groupApp.document.querySelector('[role="dialog"]');
+  assert(groupDialog, "Group delete confirmation did not open");
+  groupDialog.querySelectorAll("button").find((button) => button.textContent === "Отмена").click();
+  assert(!groupApp.document.querySelector('[role="dialog"]'), "Group cancel left the confirmation open");
+  assert(groupApp.hooks.findGroup("7").title === "Stable group", "Group cancel changed visible group state");
+  assert(
+    !groupApp.requests.some((request) => request.path === "/api/groups/7" && request.method === "DELETE"),
+    "Group cancel issued a delete request"
+  );
+
+  const providerApp = makeApp();
+  const providerChannels = providerApp.findPending("/api/channels");
+  providerApp.resolve(providerChannels, []);
+  await settle();
+  providerApp.document.querySelectorAll("button").find((button) =>
+    button.children.some((child) => child.textContent === "Провайдеры")
+  ).click();
+  const providers = providerApp.findPending("/api/providers");
+  providerApp.resolve(providers, [{
+    id: 201,
+    version: 5,
+    name: "Stable provider",
+    base_url: "https://validator.local/v1",
+    default_model: "validator-model",
+    has_key: true,
+    is_default: false
+  }]);
+  await settle();
+  providerApp.document.querySelectorAll("button").find((button) => button.textContent === "Редактировать").click();
+  const providerDialog = providerApp.document.querySelector('[role="dialog"]');
+  assert(providerDialog, "Provider edit form did not open");
+  providerApp.document.querySelector("#provider-name").value = "Discarded provider draft";
+  providerDialog.querySelectorAll("button").find((button) => button.textContent === "Отмена").click();
+  assert(!providerApp.document.querySelector('[role="dialog"]'), "Provider cancel left the edit form open");
+  assert(
+    visibleText(providerApp.document.querySelector("table")).includes("Stable provider") &&
+      !visibleText(providerApp.document.querySelector("table")).includes("Discarded provider draft"),
+    "Provider cancel did not preserve the saved provider row"
+  );
+  assert(
+    !providerApp.requests.some((request) => request.path === "/api/providers/201" && request.method === "PUT"),
+    "Provider cancel issued an update request"
+  );
+}
+
+async function testAllAssignedGroupRendersEmptyAssignmentState() {
+  const app = makeApp();
+  const channels = app.findPending("/api/channels");
+  app.resolve(channels, [
+    { id: 101, version: 1, username: "fixture_valid", enabled: true },
+    { id: 102, version: 1, username: "fixture_large_01", enabled: true }
+  ]);
+  await settle();
+  app.document.querySelectorAll("button").find((button) =>
+    button.children.some((child) => child.textContent === "Группы")
+  ).click();
+  const groups = app.findPending("/api/groups?with_channels=true");
+  app.resolve(groups, [{
+    id: 7,
+    version: 8,
+    telegram_chat_id: "-1007",
+    title: "All assigned",
+    is_forum: true,
+    assignments: [
+      { channel_id: 101, username: "fixture_valid" },
+      { channel_id: 102, username: "fixture_large_01" }
+    ]
+  }]);
+  await settle();
+  app.document.querySelectorAll("button").find((button) => button.textContent === "Назначить каналы").click();
+  const detail = app.findPending("/api/groups/7");
+  app.resolve(detail, {
+    id: 7,
+    version: 8,
+    telegram_chat_id: "-1007",
+    title: "All assigned",
+    is_forum: true,
+    assignments: [
+      { channel_id: 101, username: "fixture_valid" },
+      { channel_id: 102, username: "fixture_large_01" }
+    ]
+  });
+  await settle();
+  const topics = await findPendingEventually(app, "/api/groups/7/topics");
+  app.resolve(topics, [{ message_thread_id: 101, name: "Announcements" }]);
+  await settle();
+  const modal = app.document.querySelector('[role="dialog"]');
+  assert(modal, "All-assigned assignment modal did not open");
+  assert(
+    visibleText(modal).includes("Все каналы уже назначены этой группе"),
+    "All-assigned group did not render its empty assignment state"
+  );
+  assert(!modal.querySelectorAll("input").some((input) => input.type === "checkbox"), "All-assigned group rendered selectable channels");
+  assert(
+    !app.requests.some((request) => request.path === "/api/groups/7/channels" && request.method === "POST"),
+    "Opening an all-assigned group issued an assignment mutation"
+  );
+}
+
+async function testLargeChannelFixtureRendersDeterministically() {
+  const app = makeApp();
+  const fixtureChannels = Array.from({ length: 34 }, (_, index) => ({
+    id: 1000 + index,
+    version: 1,
+    username: `fixture_large_${String(index + 1).padStart(2, "0")}`,
+    title: `Large fixture channel ${index + 1}`,
+    enabled: index % 4 !== 0
+  }));
+  const channels = app.findPending("/api/channels");
+  app.resolve(channels, fixtureChannels);
+  await settle();
+  const wrapper = app.document.querySelector(".table-wrap");
+  const body = app.document.querySelector("tbody");
+  const rows = body ? body.children : [];
+  assert(wrapper, "Large channel fixture did not render a scrollable table wrapper");
+  assert(rows.length === fixtureChannels.length, `Large channel fixture rendered ${rows.length} rows, want ${fixtureChannels.length}`);
+  assert(
+    visibleText(rows[0]).includes("@fixture_large_01") &&
+      visibleText(rows[rows.length - 1]).includes("@fixture_large_34"),
+    "Large channel fixture did not retain deterministic first and last rows"
+  );
+  assert(
+    fixtureChannels.filter((channel) => !channel.enabled).length ===
+      rows.filter((row) => row.className.includes("row-muted")).length,
+    "Large channel fixture lost deterministic enabled/disabled row states"
+  );
+}
+
+async function testAvailableGroupPickerUsesAuthenticatedLocalBoundary() {
+  const app = makeApp();
+  const channels = app.findPending("/api/channels");
+  app.resolve(channels, []);
+  await settle();
+  app.document.querySelectorAll("button").find((button) =>
+    button.children.some((child) => child.textContent === "Группы")
+  ).click();
+  const initialGroups = app.findPending("/api/groups?with_channels=true");
+  app.resolve(initialGroups, []);
+  await settle();
+  const choose = app.document.querySelectorAll("button").find((button) => button.textContent === "Выбрать из списка");
+  assert(choose, "Available group picker trigger was not rendered");
+  choose.click();
+  const available = app.findPending("/api/groups/available");
+  assert(
+    available.headers["X-Telegram-Init-Data"] === "deterministic-test-init-data",
+    "Available group lookup did not use authenticated initData"
+  );
+  app.resolve(available, [
+    { chat_id: "-1007000000101", title: "Validator available forum" },
+    { chat_id: "-1007000000102", title: "Validator available second" }
+  ]);
+  await settle();
+  const picker = app.document.querySelector('[role="dialog"]');
+  assert(picker && visibleText(picker).includes("Validator available forum"), "Available group fixture did not render in the picker");
+  picker.querySelectorAll("button").find((button) => button.textContent.includes("Validator available forum")).click();
+  const creation = app.findPending("/api/groups", "POST");
+  assert(creation.body.chat_id === "-1007000000101", "Available group picker submitted the wrong chat ID");
+  assert(
+    creation.headers["X-Telegram-Init-Data"] === "deterministic-test-init-data",
+    "Available group selection did not use authenticated initData"
+  );
+  app.resolve(creation, {}, 201);
+  await settle();
+  const refreshed = app.findPending("/api/groups?with_channels=true");
+  app.resolve(refreshed, [{
+    id: 301,
+    version: 1,
+    telegram_chat_id: "-1007000000101",
+    title: "Validator available forum",
+    is_forum: true,
+    assignments: []
+  }]);
+  await settle();
+  assert(!app.document.querySelector('[role="dialog"]'), "Available group picker stayed open after selection");
+  const reconciled = app.hooks.findGroup("301");
+  assert(reconciled && reconciled.title === "Validator available forum", "Available group selection did not reconcile the local group list");
+  assert(
+    app.requests.filter((entry) => entry.path === "/api/groups/available" && entry.method === "GET").length === 1,
+    "Available group picker made duplicate discovery requests"
+  );
+}
+
 function validatorSeededBackend() {
   const state = {
     settings: {
@@ -1043,6 +1258,10 @@ async function run() {
   await testDigestRunButtonSubmitsAndPollsTypedOutcomes();
   await testProviderValidationPrecedesNativeConstraints();
   await testSettingsServerFailurePreservesDraft();
+  await testAuthenticatedCancelFlowsPreserveStateWithoutMutations();
+  await testAllAssignedGroupRendersEmptyAssignmentState();
+  await testLargeChannelFixtureRendersDeterministically();
+  await testAvailableGroupPickerUsesAuthenticatedLocalBoundary();
   await testRequestFailuresRenderRecoverableErrorStates();
   await testWrongUserContextFailsClosedWithNetworkEvidence();
   await testKeyboardTabEnterEscapeFlowsAreAccessible();

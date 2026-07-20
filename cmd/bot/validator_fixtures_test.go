@@ -40,8 +40,14 @@ func TestSeedValidatorBotAdminFixtureIsIdempotentAndComplete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list channels: %v", err)
 	}
-	if len(channels) != 2 {
-		t.Fatalf("seeded channels = %d, want valid and duplicate fixtures only", len(channels))
+	if len(channels) != 34 {
+		t.Fatalf("seeded channels = %d, want the 34-channel large-list fixture", len(channels))
+	}
+	if channels[0].Username != validatorFixtureChannelDuplicate ||
+		channels[1].Username != "fixture_large_01" ||
+		channels[len(channels)-1].Username != validatorFixtureChannelValid {
+		t.Fatalf("large-list channel order is not deterministic: first=%q second=%q last=%q",
+			channels[0].Username, channels[1].Username, channels[len(channels)-1].Username)
 	}
 	groups, err := store.Groups.List()
 	if err != nil {
@@ -63,6 +69,13 @@ func TestSeedValidatorBotAdminFixtureIsIdempotentAndComplete(t *testing.T) {
 	}
 	if len(topics) < 2 {
 		t.Fatalf("seeded topics = %d, want observed topic catalog", len(topics))
+	}
+	assignments, err := store.Groups.GetChannelAssignments(first.ForumGroupID)
+	if err != nil {
+		t.Fatalf("list seeded assignments: %v", err)
+	}
+	if len(assignments) != len(channels) {
+		t.Fatalf("seeded forum assignments = %d, want every channel assigned (%d)", len(assignments), len(channels))
 	}
 	digests, err := store.Digests.ListByGroup(first.ForumGroupID, 10)
 	if err != nil {

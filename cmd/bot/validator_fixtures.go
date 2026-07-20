@@ -66,13 +66,23 @@ func seedValidatorBotAdminFixture(store *db.DB) (validatorFixtureSeed, error) {
 	var result validatorFixtureSeed
 
 	channelIDs := make(map[string]int64)
-	for _, fixture := range []struct {
+	channelFixtures := []struct {
 		username string
 		title    string
 	}{
 		{validatorFixtureChannelValid, "Validator Valid Channel"},
 		{validatorFixtureChannelDuplicate, "Validator Duplicate Channel"},
-	} {
+	}
+	for index := 1; index <= 32; index++ {
+		channelFixtures = append(channelFixtures, struct {
+			username string
+			title    string
+		}{
+			username: fmt.Sprintf("fixture_large_%02d", index),
+			title:    fmt.Sprintf("Validator Large Channel %02d", index),
+		})
+	}
+	for _, fixture := range channelFixtures {
 		channel, err := store.Channels.GetByUsername(fixture.username)
 		if errors.Is(err, db.ErrNotFound) {
 			id, insertErr := store.Channels.Insert(&model.Channel{
@@ -139,9 +149,13 @@ func seedValidatorBotAdminFixture(store *db.DB) (validatorFixtureSeed, error) {
 		}
 		result.ForumTopicIDs = append(result.ForumTopicIDs, topic.id)
 	}
-	if err := store.Groups.AssignChannel(result.ForumGroupID, result.ValidChannelID, &result.ForumTopicIDs[0]); err != nil {
-		if !errors.Is(err, db.ErrDuplicate) {
-			return validatorFixtureSeed{}, fmt.Errorf("seed channel assignment: %w", err)
+	for index, fixture := range channelFixtures {
+		channelID := channelIDs[fixture.username]
+		topicID := result.ForumTopicIDs[index%len(result.ForumTopicIDs)]
+		if err := store.Groups.AssignChannel(result.ForumGroupID, channelID, &topicID); err != nil {
+			if !errors.Is(err, db.ErrDuplicate) {
+				return validatorFixtureSeed{}, fmt.Errorf("seed channel assignment %s: %w", fixture.username, err)
+			}
 		}
 	}
 

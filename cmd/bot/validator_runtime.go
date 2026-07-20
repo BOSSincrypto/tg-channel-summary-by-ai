@@ -28,7 +28,13 @@ func newValidatorRunDatabase(configuredPath string) (*validatorRunDatabase, erro
 	if strings.TrimSpace(configuredPath) == "" {
 		return nil, errors.New("validator database path is empty")
 	}
-	directory := filepath.Dir(configuredPath)
+	directory, err := filepath.Abs(filepath.Dir(filepath.Clean(configuredPath)))
+	if err != nil {
+		return nil, fmt.Errorf("resolve validator database directory: %w", err)
+	}
+	if !isWithinValidatorTempDir(directory) {
+		return nil, fmt.Errorf("validator database directory must be inside %s", os.TempDir())
+	}
 	file, err := os.CreateTemp(directory, validatorRunDBPrefix+"*.sqlite")
 	if err != nil {
 		return nil, fmt.Errorf("create validator database: %w", err)
@@ -95,8 +101,7 @@ func newValidatorListenerOwnerForRun(ownerKey, dbPath string) (*validatorListene
 	if err != nil {
 		return nil, fmt.Errorf("resolve validator temporary directory: %w", err)
 	}
-	relative, err := filepath.Rel(tempDir, ownerPath)
-	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+	if !isWithinValidatorTempDirWithRoot(ownerPath, tempDir) {
 		return nil, fmt.Errorf("validator listener owner file must be inside %s", tempDir)
 	}
 	token := strings.TrimSpace(os.Getenv(validatorTokenEnv))
@@ -174,7 +179,10 @@ func (o *validatorListenerOwner) Release() error {
 	if err != nil {
 		return fmt.Errorf("inspect validator listener ownership before release: %w", err)
 	}
-	if record.PID != os.Getpid() || record.Token != o.token || record.DBPath != o.dbPath {
+	if record.Mode != "validator_http_only" ||
+		record.PID != os.Getpid() ||
+		record.Token != o.token ||
+		record.DBPath != o.dbPath {
 		o.held = false
 		return nil
 	}
@@ -227,9 +235,25 @@ func isValidatorRunDatabasePath(path string) bool {
 	if err != nil {
 		return false
 	}
-	relative, err := filepath.Rel(tempDir, absolute)
-	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+	if !isWithinValidatorTempDirWithRoot(absolute, tempDir) {
 		return false
 	}
 	return strings.HasPrefix(filepath.Base(absolute), validatorRunDBPrefix)
+}
+
+func isWithinValidatorTempDir(path string) bool {
+	tempDir, err := filepath.Abs(filepath.Clean(os.TempDir()))
+	if err != nil {
+		return false
+	}
+	return isWithinValidatorTempDirWithRoot(path, tempDir)
+}
+
+func isWithinValidatorTempDirWithRoot(path, tempDir string) bool {
+	absolute, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return false
+	}
+	relative, err := filepath.Rel(tempDir, absolute)
+	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
 }

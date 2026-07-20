@@ -85,6 +85,10 @@ func LoadValidator() (*Config, error) {
 	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 		return nil, fmt.Errorf("validator HTTP mode requires DB_PATH inside %s", tempDir)
 	}
+	parentRelative, err := filepath.Rel(tempDir, filepath.Dir(dbPath))
+	if err != nil || parentRelative == ".." || strings.HasPrefix(parentRelative, ".."+string(filepath.Separator)) {
+		return nil, fmt.Errorf("validator HTTP mode requires DB_PATH parent inside %s", tempDir)
+	}
 	cfg.DBPath = dbPath
 	cfg.Port = "8080"
 	cfg.ProviderKey = cfg.BotToken

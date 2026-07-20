@@ -521,3 +521,16 @@ func TestLoadValidatorRequiresExplicitOptIn(t *testing.T) {
 		t.Fatal("expected validator config to require VALIDATOR_HTTP_ONLY=1")
 	}
 }
+
+func TestLoadValidatorRejectsTemporaryDirectoryAsDatabasePath(t *testing.T) {
+	chdirToTempDir(t)
+	t.Setenv("VALIDATOR_HTTP_ONLY", "1")
+	t.Setenv("BOT_TOKEN", "validator:fake")
+	t.Setenv("OWNER_TELEGRAM_ID", "715602446")
+	t.Setenv("OPENROUTER_API_KEY", "validator-openrouter-key")
+	t.Setenv("DB_PATH", os.TempDir())
+
+	if _, err := LoadValidator(); err == nil {
+		t.Fatal("expected validator mode to reject a database path whose parent is outside the temporary directory")
+	}
+}

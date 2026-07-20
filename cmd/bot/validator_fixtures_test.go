@@ -269,6 +269,91 @@ func TestNewValidatorRunDatabaseUsesFreshFilesAndCleansAllSQLiteSidecars(t *test
 	}
 }
 
+func TestNewValidatorRunDatabaseRejectsDirectoryOutsideSystemTemp(t *testing.T) {
+	if _, err := newValidatorRunDatabase(filepath.Join(os.TempDir(), "..", "validator.sqlite")); err == nil {
+		t.Fatal("validator database creation accepted a directory outside the system temporary directory")
+	}
+}
+
+func TestValidatorFixtureMutationBoundariesStayCleanAcrossRuns(t *testing.T) {
+	run := func() int {
+		t.Helper()
+		runDB, err := newValidatorRunDatabase(filepath.Join(t.TempDir(), "requested.sqlite"))
+		if err != nil {
+			t.Fatalf("create validator database: %v", err)
+		}
+		store, err := db.Open(runDB.path)
+		if err != nil {
+			_ = runDB.cleanup()
+			t.Fatalf("open validator database: %v", err)
+		}
+		server, err := newValidatorHTTPServer(&validatorConfigForTest, store)
+		if err != nil {
+			store.Close()
+			_ = runDB.cleanup()
+			t.Fatalf("create validator server: %v", err)
+		}
+		if err := configureValidatorBotAdminFixture(server, store); err != nil {
+			store.Close()
+			_ = runDB.cleanup()
+			t.Fatalf("configure validator fixture: %v", err)
+		}
+		testServer := httptest.NewServer(server.Handler())
+		defer testServer.Close()
+		defer store.Close()
+		defer runDB.cleanup()
+
+		post := func(username string) *http.Response {
+			request, err := http.NewRequest(http.MethodPost, testServer.URL+"/api/channels",
+				strings.NewReader(`{"username":"`+username+`"}`))
+			if err != nil {
+				t.Fatalf("create channel request: %v", err)
+			}
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("X-Telegram-Init-Data", validatorOwnerInitData())
+			response, err := testServer.Client().Do(request)
+			if err != nil {
+				t.Fatalf("post channel %s: %v", username, err)
+			}
+			return response
+		}
+
+		for _, test := range []struct {
+			username string
+			status   int
+		}{
+			{username: validatorFixtureChannelNotFound, status: http.StatusUnprocessableEntity},
+			{username: validatorFixtureChannelPrivate, status: http.StatusUnprocessableEntity},
+			{username: validatorFixtureChannelEmpty, status: http.StatusCreated},
+		} {
+			response := post(test.username)
+			response.Body.Close()
+			if response.StatusCode != test.status {
+				t.Fatalf("post %s status = %d, want %d", test.username, response.StatusCode, test.status)
+			}
+		}
+		response := post(validatorFixtureChannelEmpty)
+		response.Body.Close()
+		if response.StatusCode != http.StatusConflict {
+			t.Fatalf("duplicate empty channel status = %d, want %d", response.StatusCode, http.StatusConflict)
+		}
+
+		var rows int
+		if err := store.Conn().QueryRow(`SELECT COUNT(*) FROM channels WHERE username IN (?, ?, ?)`,
+			validatorFixtureChannelNotFound, validatorFixtureChannelPrivate, validatorFixtureChannelEmpty).Scan(&rows); err != nil {
+			t.Fatalf("count mutation boundary rows: %v", err)
+		}
+		if rows != 1 {
+			t.Fatalf("mutation boundary rows = %d, want only the empty-channel success", rows)
+		}
+		return rows
+	}
+
+	if first, second := run(), run(); first != second || first != 1 {
+		t.Fatalf("fresh validator runs produced rows %d and %d, want one each", first, second)
+	}
+}
+
 func TestValidatorListenerOwnershipIsExclusiveAndReleasable(t *testing.T) {
 	t.Setenv(validatorOwnerEnv, filepath.Join(t.TempDir(), "listener-owner.json"))
 	t.Setenv(validatorTokenEnv, "run-one")
@@ -297,6 +382,43 @@ func TestValidatorListenerOwnershipIsExclusiveAndReleasable(t *testing.T) {
 	}
 	if err := second.Release(); err != nil {
 		t.Fatalf("release second listener ownership: %v", err)
+	}
+}
+
+func TestValidatorListenerReleasePreservesReplacedOwnershipRecord(t *testing.T) {
+	ownerPath := filepath.Join(t.TempDir(), "listener-owner.json")
+	t.Setenv(validatorOwnerEnv, ownerPath)
+	t.Setenv(validatorTokenEnv, "release")
+	dbPath := filepath.Join(os.TempDir(), validatorRunDBPrefix+"release.sqlite")
+	owner, err := newValidatorListenerOwner(dbPath)
+	if err != nil {
+		t.Fatalf("create listener owner: %v", err)
+	}
+	if err := owner.Claim(); err != nil {
+		t.Fatalf("claim listener ownership: %v", err)
+	}
+	replacement := validatorListenerOwnerRecord{
+		Mode:   "production",
+		PID:    os.Getpid(),
+		Token:  "release",
+		DBPath: dbPath,
+	}
+	data, err := json.Marshal(replacement)
+	if err != nil {
+		t.Fatalf("encode replacement owner record: %v", err)
+	}
+	if err := os.WriteFile(ownerPath, data, 0o600); err != nil {
+		t.Fatalf("replace owner record: %v", err)
+	}
+	if err := owner.Release(); err != nil {
+		t.Fatalf("release replaced ownership: %v", err)
+	}
+	preserved, err := readValidatorListenerOwner(ownerPath)
+	if err != nil {
+		t.Fatalf("read preserved replacement record: %v", err)
+	}
+	if preserved.Mode != "production" {
+		t.Fatalf("replacement owner mode = %q, want production", preserved.Mode)
 	}
 }
 

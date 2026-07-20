@@ -215,27 +215,9 @@ func newValidatorHTTPServer(cfg *config.Config, store *db.DB) (*webapp.Server, e
 		&http.Client{Transport: validatorHTTPTransport{}},
 		auth,
 	)
-	server.SetChannelVerifier(validatorChannelVerifier{})
-	server.SetGroupVerifier(validatorGroupVerifier{})
+	server.SetChannelVerifier(validatorDisabledChannelVerifier{})
+	server.SetGroupVerifier(validatorDisabledGroupVerifier{})
 	return server, nil
-}
-
-type validatorHTTPTransport struct{}
-
-func (validatorHTTPTransport) RoundTrip(*http.Request) (*http.Response, error) {
-	return nil, errors.New("validator HTTP mode blocks external requests")
-}
-
-type validatorChannelVerifier struct{}
-
-func (validatorChannelVerifier) Verify(context.Context, string) (string, error) {
-	return "", errors.New("channel verification is disabled in validator HTTP mode")
-}
-
-type validatorGroupVerifier struct{}
-
-func (validatorGroupVerifier) Verify(int64) (string, error) {
-	return "", errors.New("group verification is disabled in validator HTTP mode")
 }
 
 func runValidatorHTTPOnly() error {
@@ -251,10 +233,20 @@ func runValidatorHTTPOnly() error {
 	if err := ensureDefaultAIProvider(store, cfg.OpenRouterKey); err != nil {
 		return fmt.Errorf("configure validator AI provider: %w", err)
 	}
+	if validatorFixtureEnabled() {
+		if _, err := seedValidatorBotAdminFixture(store); err != nil {
+			return fmt.Errorf("seed validator fixture %s: %w", validatorFixtureProfile, err)
+		}
+	}
 
 	srv, err := newValidatorHTTPServer(cfg, store)
 	if err != nil {
 		return err
+	}
+	if validatorFixtureEnabled() {
+		if err := configureValidatorBotAdminFixture(srv, store); err != nil {
+			return fmt.Errorf("configure validator fixture %s: %w", validatorFixtureProfile, err)
+		}
 	}
 	serverErr := make(chan error, 1)
 	go func() {

@@ -1371,3 +1371,131 @@ func TestGroupProviderIntegration(t *testing.T) {
 		t.Error("expected provider_id to be NULL after provider delete")
 	}
 }
+
+// TestPostRepositoryDeleteOlderThan verifies that DeleteOlderThan correctly
+// deletes posts older than the given number of days and returns the correct
+// RowsAffected count. It covers the regression case where RowsAffected errors
+// were previously ignored.
+func TestPostRepositoryDeleteOlderThan(t *testing.T) {
+	db, cleanup := newTestDB(t)
+	defer cleanup()
+
+	now := time.Now().UTC()
+
+	ch := &model.Channel{Username: "delete-test", Enabled: true}
+	chID, err := db.Channels.Insert(ch)
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+
+	// Insert an old post (100 days ago)
+	oldPost := &model.Post{
+		ChannelID:   chID,
+		MessageID:   1,
+		Text:        "Old post",
+		PostedAt:    offsetRFC3339(now.Add(-100 * 24 * time.Hour), 14),
+		URL:         "https://t.me/delete-test/1",
+		ContentHash: "oldhash1",
+	}
+	oldID, err := db.Posts.Insert(oldPost)
+	if err != nil {
+		t.Fatalf("insert old post: %v", err)
+	}
+
+	// Insert a recent post (1 hour ago)
+	recentPost := &model.Post{
+		ChannelID:   chID,
+		MessageID:   2,
+		Text:        "Recent post",
+		PostedAt:    now.Add(-1 * time.Hour).Format(time.RFC3339),
+		URL:         "https://t.me/delete-test/2",
+		ContentHash: "recenthash1",
+	}
+	recentID, err := db.Posts.Insert(recentPost)
+	if err != nil {
+		t.Fatalf("insert recent post: %v", err)
+	}
+
+	// Delete posts older than 50 days
+	deleted, err := db.Posts.DeleteOlderThan(50)
+	if err != nil {
+		t.Fatalf("delete older than 50 days: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("expected exactly 1 post deleted, got %d", deleted)
+	}
+
+	// Verify old post is gone
+	_, err = db.Posts.GetByID(oldID)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected old post to be deleted, got %v", err)
+	}
+
+	// Verify recent post remains
+	got, err := db.Posts.GetByID(recentID)
+	if err != nil {
+		t.Fatalf("expected recent post to remain, got %v", err)
+	}
+	if got.ID != recentID {
+		t.Fatalf("expected recent post with id %d, got %d", recentID, got.ID)
+	}
+}
+
+// TestDigestRepositoryDeleteOlderThan verifies that DeleteOlderThan correctly
+// deletes digests older than the given number of days and returns the correct
+// RowsAffected count. It covers the regression case where RowsAffected errors
+// were previously ignored.
+func TestDigestRepositoryDeleteOlderThan(t *testing.T) {
+	db, cleanup := newTestDB(t)
+	defer cleanup()
+
+	now := time.Now().UTC()
+
+	g := &model.Group{TelegramChatID: -1008888, Title: "Digest Delete Group"}
+	gID, err := db.Groups.Insert(g)
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+
+	// Insert an old digest (simulating 100 days ago)
+	oldDigest := &model.Digest{GroupID: gID, PostCount: 3}
+	oldID, err := db.Digests.Insert(oldDigest)
+	if err != nil {
+		t.Fatalf("insert old digest: %v", err)
+	}
+	oldSentAt := now.Add(-100 * 24 * time.Hour).Format(time.RFC3339)
+	if _, err := db.Conn().Exec(`UPDATE digests SET sent_at = ? WHERE id = ?`, oldSentAt, oldID); err != nil {
+		t.Fatalf("age old digest: %v", err)
+	}
+
+	// Insert a recent digest (1 day ago)
+	recentDigest := &model.Digest{GroupID: gID, PostCount: 5}
+	recentID, err := db.Digests.Insert(recentDigest)
+	if err != nil {
+		t.Fatalf("insert recent digest: %v", err)
+	}
+
+	// Delete digests older than 50 days
+	deleted, err := db.Digests.DeleteOlderThan(50)
+	if err != nil {
+		t.Fatalf("delete older than 50 days: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("expected exactly 1 digest deleted, got %d", deleted)
+	}
+
+	// Verify old digest is gone
+	_, err = db.Digests.GetByID(oldID)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected old digest to be deleted, got %v", err)
+	}
+
+	// Verify recent digest remains
+	got, err := db.Digests.GetByID(recentID)
+	if err != nil {
+		t.Fatalf("expected recent digest to remain, got %v", err)
+	}
+	if got.ID != recentID {
+		t.Fatalf("expected recent digest with id %d, got %d", recentID, got.ID)
+	}
+}

@@ -256,7 +256,10 @@ func (r *DigestRepository) DeleteOlderThan(days int) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("delete old digests: %w", err)
 	}
-	n, _ := result.RowsAffected()
+	n, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("delete old digests rows affected: %w", err)
+	}
 	return n, nil
 }
 

@@ -202,6 +202,9 @@ func (r *PostRepository) DeleteOlderThan(days int) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("delete old posts: %w", err)
 	}
-	n, _ := result.RowsAffected()
+	n, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("delete old posts rows affected: %w", err)
+	}
 	return n, nil
 }

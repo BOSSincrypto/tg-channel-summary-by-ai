@@ -30,12 +30,16 @@ type Digest struct {
 	Outcome        string
 	FailedChannels []string
 	FailureDetails []string
-	Message        string
-	Text           string
-	MessageID      *int64
-	MessageURL     string
-	SummariesSaved bool
-	Delivered      bool
+	// ChannelFailureNotificationSent prevents the digest outcome layer from
+	// sending a duplicate alert after the parser has already notified the
+	// owner about exhausted channel fetch retries.
+	ChannelFailureNotificationSent bool
+	Message                        string
+	Text                           string
+	MessageID                      *int64
+	MessageURL                     string
+	SummariesSaved                 bool
+	Delivered                      bool
 	// StartPart is used only when resuming a split Telegram delivery after a
 	// previous part was durably acknowledged.
 	StartPart int
@@ -290,9 +294,13 @@ func (s *Service) generate(groupID int64, windowID string, manual bool) (*Digest
 	}
 	posts = capPostsPerChannel(posts, s.maxPostsPerChannel)
 	result := &Digest{
-		GroupID: groupID, PostCount: len(posts), ChannelCount: len(batch.Results),
-		WindowID: windowID, FailedChannels: failedChannelNames(batch),
-		FailureDetails: failedChannelDetails(batch),
+		GroupID:                        groupID,
+		PostCount:                      len(posts),
+		ChannelCount:                   len(batch.Results),
+		WindowID:                       windowID,
+		FailedChannels:                 failedChannelNames(batch),
+		FailureDetails:                 failedChannelDetails(batch),
+		ChannelFailureNotificationSent: batch.FailureNotificationSent,
 	}
 	if len(batch.Results) == 0 && len(batch.Failures) == 0 {
 		// A group with no configured (enabled) channels is a configuration
@@ -524,6 +532,10 @@ func (s *Service) resumePendingLocked(groupID int64) error {
 
 func (s *Service) notifyDigestOutcome(result *Digest) {
 	if s == nil || s.notifier == nil || result == nil {
+		return
+	}
+	if result.ChannelFailureNotificationSent &&
+		(len(result.FailureDetails) > 0 || len(result.FailedChannels) > 0) {
 		return
 	}
 	message := result.Message

@@ -29,6 +29,12 @@ var (
 	// ErrChannelUnavailable indicates that Telegram returned an ambiguous page
 	// which does not reliably identify a missing or private channel.
 	ErrChannelUnavailable = errors.New("channel unavailable or ambiguous")
+	// ErrCloudflareChallenge indicates that the response is an anti-bot
+	// challenge page rather than a Telegram channel preview.
+	ErrCloudflareChallenge = errors.New("cloudflare challenge page")
+	// ErrChannelCloudflareChallenge is retained as a descriptive alias for
+	// callers that classify channel failures by their domain.
+	ErrChannelCloudflareChallenge = ErrCloudflareChallenge
 )
 
 const defaultRateLimitBackoff = 5 * time.Minute
@@ -135,6 +141,16 @@ func (p *Parser) ParseChannelWithStats(username string) ([]ParsedPost, ParseStat
 		}
 		return nil, stats, &RateLimitError{RetryAfter: retryAfter(response.Header.Get("Retry-After"), now())}
 	}
+	document, err := goquery.NewDocumentFromReader(response.Body)
+	if err != nil {
+		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+			return nil, stats, fmt.Errorf("fetch t.me/s/%s: unexpected HTTP status %s", username, response.Status)
+		}
+		return nil, stats, fmt.Errorf("parse t.me/s/%s HTML: %w", username, err)
+	}
+	if isCloudflareChallengePage(document) {
+		return nil, stats, fmt.Errorf("fetch t.me/s/%s: %w", username, ErrCloudflareChallenge)
+	}
 	if response.StatusCode == http.StatusNotFound {
 		return nil, stats, fmt.Errorf("fetch t.me/s/%s: %w", username, ErrChannelNotFound)
 	}
@@ -145,10 +161,6 @@ func (p *Parser) ParseChannelWithStats(username string) ([]ParsedPost, ParseStat
 		return nil, stats, fmt.Errorf("fetch t.me/s/%s: unexpected HTTP status %s", username, response.Status)
 	}
 
-	document, err := goquery.NewDocumentFromReader(response.Body)
-	if err != nil {
-		return nil, stats, fmt.Errorf("parse t.me/s/%s HTML: %w", username, err)
-	}
 	if isPrivatePage(document) {
 		return nil, stats, fmt.Errorf("parse t.me/s/%s: %w", username, ErrChannelPrivate)
 	}
@@ -245,6 +257,23 @@ func isPrivatePage(document *goquery.Document) bool {
 		strings.Contains(text, "private channel") ||
 		strings.Contains(text, "канал является приватным") ||
 		strings.Contains(text, "канал приватный")
+}
+
+func isCloudflareChallengePage(document *goquery.Document) bool {
+	if document == nil {
+		return false
+	}
+	title := strings.ToLower(strings.TrimSpace(document.Find("title").First().Text()))
+	if title == "just a moment..." || title == "checking your browser" {
+		return true
+	}
+	if document.Find(`script[src*="challenge-platform"], script[src*="cdn-cgi/challenge"], #cf-chl-widget, .cf-chl-widget, .cf-turnstile, form#challenge-form`).Length() > 0 {
+		return true
+	}
+	text := strings.ToLower(strings.TrimSpace(document.Text()))
+	return strings.Contains(text, "checking your browser before accessing") ||
+		strings.Contains(text, "enable javascript and cookies to continue") ||
+		strings.Contains(text, "performing security verification")
 }
 
 func isNotFoundPage(document *goquery.Document) bool {

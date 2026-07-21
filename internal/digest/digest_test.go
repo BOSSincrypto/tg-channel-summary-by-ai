@@ -39,6 +39,82 @@ func (n *recordingDigestNotifier) snapshot() []string {
 	return out
 }
 
+type digestRetrySleeper struct{}
+
+func (digestRetrySleeper) Sleep(context.Context, time.Duration) error {
+	return nil
+}
+
+func TestGenerateDoesNotDuplicateExhaustedChannelNotification(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/s/broken":
+			http.Error(w, "channel not found", http.StatusNotFound)
+		case "/s/healthy":
+			_, _ = w.Write([]byte(`<div class="tgme_channel_info"><h1>Healthy</h1></div>`))
+		default:
+			t.Fatalf("unexpected channel path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer database.Close()
+
+	brokenID, err := database.Channels.Insert(&model.Channel{Username: "broken", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert broken channel: %v", err)
+	}
+	healthyID, err := database.Channels.Insert(&model.Channel{Username: "healthy", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert healthy channel: %v", err)
+	}
+	groupID, err := database.Groups.Insert(&model.Group{TelegramChatID: -1010, Title: "Recovery group"})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	if err := database.Groups.AssignChannel(groupID, brokenID, nil); err != nil {
+		t.Fatalf("assign broken channel: %v", err)
+	}
+	if err := database.Groups.AssignChannel(groupID, healthyID, nil); err != nil {
+		t.Fatalf("assign healthy channel: %v", err)
+	}
+
+	notifier := &recordingDigestNotifier{}
+	fetcher := parser.NewWithOptions(parser.Options{Client: server.Client(), BaseURL: server.URL})
+	processor := parser.NewChannelProcessor(
+		fetcher,
+		parser.NewPostStorage(database.Channels, database.Posts),
+		notifier,
+	).WithMaxRetries(1).WithSleeper(digestRetrySleeper{})
+	service := NewWithProcessor(database, processor)
+	service.notifier = notifier
+
+	result, err := service.GenerateManualResult(groupID)
+	if err != nil {
+		t.Fatalf("generate digest: %v", err)
+	}
+	if result == nil || len(result.FailedChannels) != 1 || result.FailedChannels[0] != "@broken" {
+		t.Fatalf("result = %+v, want broken channel failure and healthy continuation", result)
+	}
+	if result.ChannelCount != 1 {
+		t.Fatalf("channel count = %d, want one healthy channel", result.ChannelCount)
+	}
+	if len(notifier.snapshot()) != 1 {
+		t.Fatalf("notifications = %v, want exactly one exhausted-channel alert", notifier.snapshot())
+	}
+	stored, err := database.Channels.GetByID(brokenID)
+	if err != nil {
+		t.Fatalf("get broken channel: %v", err)
+	}
+	if stored.FetchErrorKind != parser.FetchErrorKindNotFound || stored.FetchErrorMessage == "" || stored.FetchErrorAt == nil {
+		t.Fatalf("stored broken channel = %+v, want durable exhausted error", stored)
+	}
+}
+
 // failingThenSucceedingNotifier fails the first N deliveries, then succeeds.
 type failingThenSucceedingNotifier struct {
 	mu           sync.Mutex

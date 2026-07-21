@@ -79,6 +79,24 @@ func TestParseChannelErrors(t *testing.T) {
 			wantErr: ErrChannelPrivate,
 		},
 		{
+			name:    "cloudflare challenge page",
+			status:  http.StatusOK,
+			body:    `<html><head><title>Just a moment...</title><script src="/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1"></script></head><body><div id="cf-chl-widget"></div></body></html>`,
+			wantErr: ErrCloudflareChallenge,
+		},
+		{
+			name:    "cloudflare challenge response with forbidden status",
+			status:  http.StatusForbidden,
+			body:    `<html><head><title>Checking your browser</title></head><body>Checking your browser before accessing</body></html>`,
+			wantErr: ErrCloudflareChallenge,
+		},
+		{
+			name:    "cloudflare challenge response with service unavailable status",
+			status:  http.StatusServiceUnavailable,
+			body:    `<html><head><title>Just a moment...</title></head><body><div class="cf-turnstile"></div></body></html>`,
+			wantErr: ErrCloudflareChallenge,
+		},
+		{
 			name:       "empty channel",
 			status:     http.StatusOK,
 			body:       `<div class="tgme_channel_info"><h1>Example</h1></div>`,

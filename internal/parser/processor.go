@@ -45,7 +45,11 @@ const (
 	FetchErrorKindPrivate     = "private"
 	FetchErrorKindUnavailable = "unavailable"
 	FetchErrorKindRateLimited = "rate_limited"
-	FetchErrorKindFetch       = "fetch"
+	FetchErrorKindCloudflare  = "cloudflare_challenge"
+	// FetchErrorKindCloudflareChallenge is the descriptive alias used by
+	// callers that want the full classification name.
+	FetchErrorKindCloudflareChallenge = FetchErrorKindCloudflare
+	FetchErrorKindFetch               = "fetch"
 )
 
 // ChannelFailure records a channel that could not be fetched or stored.
@@ -57,8 +61,9 @@ type ChannelFailure struct {
 
 // ChannelBatchResult describes a best-effort batch across assigned channels.
 type ChannelBatchResult struct {
-	Results  []ChannelProcessResult
-	Failures []ChannelFailure
+	Results                 []ChannelProcessResult
+	Failures                []ChannelFailure
+	FailureNotificationSent bool
 }
 
 // OwnerNotifier is the dependency-injected transport for owner alerts. The
@@ -68,7 +73,7 @@ type OwnerNotifier interface {
 	NotifyOwner(ctx context.Context, text string) error
 }
 
-// Sleeper abstracts retry delays so callers can make rate-limit handling
+// Sleeper abstracts retry delays so callers can make fetch retries
 // deterministic without waiting in tests.
 type Sleeper interface {
 	Sleep(context.Context, time.Duration) error
@@ -119,8 +124,8 @@ func NewChannelProcessor(fetcher ChannelFetcher, storage *PostStorage, notifiers
 	}
 }
 
-// WithMaxRetries sets the maximum number of fetch attempts for a channel,
-// including its initial attempt. Values less than one are treated as one.
+// WithMaxRetries sets the maximum number of retries after the initial fetch
+// attempt. Values less than one are treated as one.
 func (p *ChannelProcessor) WithMaxRetries(maxRetries int) *ChannelProcessor {
 	if p == nil {
 		return p
@@ -132,8 +137,8 @@ func (p *ChannelProcessor) WithMaxRetries(maxRetries int) *ChannelProcessor {
 	return p
 }
 
-// WithSleeper injects the delay implementation used between rate-limit
-// attempts. A nil sleeper restores the production context-aware sleeper.
+// WithSleeper injects the delay implementation used between fetch attempts.
+// A nil sleeper restores the production context-aware sleeper.
 func (p *ChannelProcessor) WithSleeper(sleeper Sleeper) *ChannelProcessor {
 	if p == nil {
 		return p
@@ -156,7 +161,15 @@ func (p *ChannelProcessor) processChannel(ctx context.Context, channel *model.Ch
 	if err == nil {
 		return result, nil
 	}
-	return p.retryRateLimited(ctx, channel, 1, result, err)
+	result, err = p.retryFetch(ctx, channel, 0, result, err)
+	if err == nil {
+		return result, nil
+	}
+	if persistErr := p.persistFetchError(channel, err); persistErr != nil {
+		return result, persistErr
+	}
+	p.notifyChannelFailure(ctx, *channel, fetchErrorKind(err), err)
+	return result, err
 }
 
 func (p *ChannelProcessor) processChannelAttempt(ctx context.Context, channel *model.Channel) (ChannelProcessResult, error) {
@@ -173,19 +186,11 @@ func (p *ChannelProcessor) processChannelAttempt(ctx context.Context, channel *m
 		kind := fetchErrorKind(err)
 		channel.FetchErrorKind = kind
 		channel.FetchErrorMessage = err.Error()
-		if errorStore, ok := p.storage.channels.(ChannelFetchErrorStore); ok {
-			if persistErr := errorStore.MarkFetchError(channel.ID, kind, err.Error()); persistErr != nil {
-				return ChannelProcessResult{}, fmt.Errorf("process channel %q: persist fetch error: %w", channel.Username, persistErr)
-			}
-		}
 		timestamp := time.Now().UTC().Format(time.RFC3339Nano)
 		channel.FetchErrorAt = &timestamp
 		result := ChannelProcessResult{
 			Channel:    *channel,
 			HTTPStatus: stats.HTTPStatus,
-		}
-		if previouslyPopulated && kind != FetchErrorKindRateLimited {
-			p.notifyChannelFailure(ctx, *channel, kind, err)
 		}
 		return result, fmt.Errorf("process channel %q: %w", channel.Username, err)
 	}
@@ -216,48 +221,55 @@ func (p *ChannelProcessor) processChannelAttempt(ctx context.Context, channel *m
 	}, nil
 }
 
-func (p *ChannelProcessor) retryRateLimited(ctx context.Context, channel *model.Channel, attempts int, result ChannelProcessResult, err error) (ChannelProcessResult, error) {
-	if !isRateLimitError(err) {
+func (p *ChannelProcessor) retryFetch(ctx context.Context, channel *model.Channel, retries int, result ChannelProcessResult, err error) (ChannelProcessResult, error) {
+	if !isRetryableFetchError(err) {
 		return result, err
 	}
 	maxRetries := p.maxRetries
 	if maxRetries < 1 {
 		maxRetries = 1
 	}
-	for attempts < maxRetries {
-		rateLimitErr := rateLimitError(err)
-		if rateLimitErr == nil {
-			return result, err
-		}
+	for retries < maxRetries {
 		sleeper := p.sleeper
 		if sleeper == nil {
 			sleeper = contextSleeper{}
 		}
-		if sleepErr := sleeper.Sleep(ctx, rateLimitErr.RetryAfter); sleepErr != nil {
+		if sleepErr := sleeper.Sleep(ctx, fetchRetryBackoff(retries)); sleepErr != nil {
 			return result, fmt.Errorf("process channel %q: wait before retry: %w", channel.Username, sleepErr)
 		}
-		attempts++
+		retries++
 		result, err = p.processChannelAttempt(ctx, channel)
 		if err == nil {
 			return result, nil
 		}
-		if !isRateLimitError(err) {
+		if !isRetryableFetchError(err) {
 			return result, err
 		}
 	}
 	return result, err
 }
 
-func rateLimitError(err error) *RateLimitError {
-	var rateLimitErr *RateLimitError
-	if errors.As(err, &rateLimitErr) {
-		return rateLimitErr
+func fetchRetryBackoff(retry int) time.Duration {
+	switch retry {
+	case 0:
+		return 5 * time.Second
+	case 1:
+		return 10 * time.Second
+	default:
+		return 20 * time.Second
 	}
-	return nil
 }
 
-func isRateLimitError(err error) bool {
-	return rateLimitError(err) != nil
+func isRetryableFetchError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var rateLimitErr *RateLimitError
+	return errors.As(err, &rateLimitErr) ||
+		errors.Is(err, ErrChannelNotFound) ||
+		errors.Is(err, ErrChannelPrivate) ||
+		errors.Is(err, ErrChannelUnavailable) ||
+		errors.Is(err, ErrCloudflareChallenge)
 }
 
 func fetchErrorKind(err error) string {
@@ -269,11 +281,32 @@ func fetchErrorKind(err error) string {
 		return FetchErrorKindPrivate
 	case errors.Is(err, ErrChannelUnavailable):
 		return FetchErrorKindUnavailable
+	case errors.Is(err, ErrCloudflareChallenge):
+		return FetchErrorKindCloudflare
 	case errors.As(err, &rateLimitErr):
 		return FetchErrorKindRateLimited
 	default:
 		return FetchErrorKindFetch
 	}
+}
+
+func (p *ChannelProcessor) persistFetchError(channel *model.Channel, err error) error {
+	if p == nil || p.storage == nil || channel == nil || err == nil {
+		return nil
+	}
+	kind := fetchErrorKind(err)
+	channel.FetchErrorKind = kind
+	channel.FetchErrorMessage = err.Error()
+	timestamp := time.Now().UTC().Format(time.RFC3339Nano)
+	channel.FetchErrorAt = &timestamp
+	errorStore, ok := p.storage.channels.(ChannelFetchErrorStore)
+	if !ok {
+		return nil
+	}
+	if persistErr := errorStore.MarkFetchError(channel.ID, kind, err.Error()); persistErr != nil {
+		return fmt.Errorf("process channel %q, persist fetch error: %w", channel.Username, persistErr)
+	}
+	return nil
 }
 
 func (p *ChannelProcessor) notifyChannelFailure(ctx context.Context, channel model.Channel, kind string, err error) {
@@ -303,6 +336,16 @@ func channelFailureNotification(username, kind string) string {
 	case FetchErrorKindUnavailable:
 		return fmt.Sprintf(
 			"⚠️ Канал @%s недоступен, но Telegram не сообщил точную причину. Проверьте доступность канала и при необходимости обновите username в настройках.",
+			username,
+		)
+	case FetchErrorKindCloudflare:
+		return fmt.Sprintf(
+			"⚠️ Канал @%s временно закрыт защитной страницей Cloudflare. Проверьте доступность канала и повторите запуск позже.",
+			username,
+		)
+	case FetchErrorKindRateLimited:
+		return fmt.Sprintf(
+			"⚠️ Канал @%s ограничен Telegram (HTTP 429). Повторите запуск позже и проверьте доступность канала.",
 			username,
 		)
 	default:
@@ -344,21 +387,24 @@ func (p *ChannelProcessor) ProcessChannelsContext(ctx context.Context, channels 
 	for i := range channels {
 		result, err := p.processChannelAttempt(ctx, &channels[i])
 		outcomes[i] = channelOutcome{result: result, err: err}
-		if isRateLimitError(err) {
+		if isRetryableFetchError(err) {
 			pending = append(pending, pendingRetry{index: i})
 		}
 	}
 	for _, retry := range pending {
 		channel := &channels[retry.index]
 		outcome := outcomes[retry.index]
-		outcome.result, outcome.err = p.retryRateLimited(ctx, channel, 1, outcome.result, outcome.err)
+		outcome.result, outcome.err = p.retryFetch(ctx, channel, 0, outcome.result, outcome.err)
 		outcomes[retry.index] = outcome
 	}
-	rateLimited := make([]ChannelFailure, 0)
 	for i, outcome := range outcomes {
 		if outcome.err == nil {
 			batch.Results = append(batch.Results, outcome.result)
 			continue
+		}
+		if persistErr := p.persistFetchError(&channels[i], outcome.err); persistErr != nil {
+			outcome.err = persistErr
+			outcomes[i] = outcome
 		}
 		failure := ChannelFailure{
 			Channel:    channels[i],
@@ -366,31 +412,61 @@ func (p *ChannelProcessor) ProcessChannelsContext(ctx context.Context, channels 
 			HTTPStatus: outcome.result.HTTPStatus,
 		}
 		batch.Failures = append(batch.Failures, failure)
-		if isRateLimitError(outcome.err) {
-			rateLimited = append(rateLimited, failure)
-		}
 	}
-	p.notifyRateLimitPartial(ctx, rateLimited)
+	batch.FailureNotificationSent = p.notifyExhaustedFailures(ctx, batch.Failures)
 	p.notifyStructuralChange(ctx, batch)
 	return batch, nil
 }
 
-func (p *ChannelProcessor) notifyRateLimitPartial(ctx context.Context, failures []ChannelFailure) {
+func (p *ChannelProcessor) notifyExhaustedFailures(ctx context.Context, failures []ChannelFailure) bool {
 	if len(failures) == 0 || p.notifier == nil {
-		return
+		return false
+	}
+	allRateLimited := true
+	usernames := make([]string, 0, len(failures))
+	for _, failure := range failures {
+		usernames = append(usernames, "@"+failure.Channel.Username)
+		if fetchErrorKind(failure.Err) != FetchErrorKindRateLimited {
+			allRateLimited = false
+		}
+	}
+	if allRateLimited {
+		return p.notifyRateLimitPartial(ctx, failures)
+	}
+	details := make([]string, 0, len(failures))
+	for _, failure := range failures {
+		details = append(details, fmt.Sprintf("@%s (%s)", failure.Channel.Username, fetchErrorKind(failure.Err)))
+	}
+	message := fmt.Sprintf(
+		"⚠️ частичный дайджест: канал(ы) %s не удалось обработать после исчерпания %d повторных попыток. Причины: %s. Посты из этих каналов не включены. Проверьте доступность каналов и обновите настройки.",
+		strings.Join(usernames, ", "), p.maxRetries, strings.Join(details, ", "),
+	)
+	log.Printf("WARNING: partial digest after exhausted channel failures: %s", strings.Join(usernames, ", "))
+	if err := p.notifier.NotifyOwner(ctx, message); err != nil {
+		log.Printf("WARNING: failed to notify owner about exhausted channel failures: %v", err)
+		return false
+	}
+	return true
+}
+
+func (p *ChannelProcessor) notifyRateLimitPartial(ctx context.Context, failures []ChannelFailure) bool {
+	if len(failures) == 0 || p.notifier == nil {
+		return false
 	}
 	usernames := make([]string, 0, len(failures))
 	for _, failure := range failures {
 		usernames = append(usernames, "@"+failure.Channel.Username)
 	}
 	message := fmt.Sprintf(
-		"⚠️ частичный дайджест: канал(ы) %s ограничены Telegram (HTTP 429) после исчерпания попыток. Посты из этих каналов не включены. Проверьте доступность каналов и повторите запуск позже.",
-		strings.Join(usernames, ", "),
+		"⚠️ частичный дайджест: канал(ы) %s ограничены Telegram (HTTP 429) после исчерпания %d повторных попыток. Посты из этих каналов не включены. Проверьте доступность каналов и повторите запуск позже.",
+		strings.Join(usernames, ", "), p.maxRetries,
 	)
 	log.Printf("WARNING: partial digest after rate-limited channels: %s", strings.Join(usernames, ", "))
 	if err := p.notifier.NotifyOwner(ctx, message); err != nil {
 		log.Printf("WARNING: failed to notify owner about rate-limited channels: %v", err)
+		return false
 	}
+	return true
 }
 
 func (p *ChannelProcessor) notifyStructuralChange(ctx context.Context, batch ChannelBatchResult) {

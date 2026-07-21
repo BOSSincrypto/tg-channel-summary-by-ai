@@ -12,6 +12,11 @@ import (
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
 )
 
+var (
+	errPostValidation = errors.New("post validation failed")
+	errPostStorage    = errors.New("post storage failed")
+)
+
 // ChannelFetcher is the parser contract used by the production channel path.
 type ChannelFetcher interface {
 	ParseChannel(username string) ([]ParsedPost, error)
@@ -165,6 +170,9 @@ func (p *ChannelProcessor) processChannel(ctx context.Context, channel *model.Ch
 	if err == nil {
 		return result, nil
 	}
+	if !isDurableFetchError(err) {
+		return result, err
+	}
 	if persistErr := p.persistFetchError(channel, err); persistErr != nil {
 		return result, persistErr
 	}
@@ -196,16 +204,25 @@ func (p *ChannelProcessor) processChannelAttempt(ctx context.Context, channel *m
 	}
 	for _, post := range posts {
 		if strings.TrimSpace(post.PostedAt) == "" {
-			return ChannelProcessResult{}, fmt.Errorf("process channel %q post %d: missing posted_at timestamp", channel.Username, post.MessageID)
+			return ChannelProcessResult{}, fmt.Errorf(
+				"process channel %q post %d: %w: missing posted_at timestamp",
+				channel.Username, post.MessageID, errPostValidation,
+			)
 		}
 	}
 	stored, err := p.storage.Store(channel, posts)
 	if err != nil {
-		return ChannelProcessResult{}, fmt.Errorf("process channel %q: %w", channel.Username, err)
+		return ChannelProcessResult{}, fmt.Errorf(
+			"process channel %q: %w",
+			channel.Username, errors.Join(errPostStorage, err),
+		)
 	}
 	if errorStore, ok := p.storage.channels.(ChannelFetchErrorStore); ok {
 		if err := errorStore.ClearFetchError(channel.ID); err != nil {
-			return ChannelProcessResult{}, fmt.Errorf("process channel %q: clear fetch error: %w", channel.Username, err)
+			return ChannelProcessResult{}, fmt.Errorf(
+				"process channel %q: clear fetch error: %w",
+				channel.Username, errors.Join(errPostStorage, err),
+			)
 		}
 	}
 	channel.FetchErrorKind = ""
@@ -234,7 +251,7 @@ func (p *ChannelProcessor) retryFetch(ctx context.Context, channel *model.Channe
 		if sleeper == nil {
 			sleeper = contextSleeper{}
 		}
-		if sleepErr := sleeper.Sleep(ctx, fetchRetryBackoff(retries)); sleepErr != nil {
+		if sleepErr := sleeper.Sleep(ctx, retryDelay(err, retries)); sleepErr != nil {
 			return result, fmt.Errorf("process channel %q: wait before retry: %w", channel.Username, sleepErr)
 		}
 		retries++
@@ -247,6 +264,14 @@ func (p *ChannelProcessor) retryFetch(ctx context.Context, channel *model.Channe
 		}
 	}
 	return result, err
+}
+
+func retryDelay(err error, retry int) time.Duration {
+	var rateLimitErr *RateLimitError
+	if errors.As(err, &rateLimitErr) {
+		return rateLimitErr.RetryAfter
+	}
+	return fetchRetryBackoff(retry)
 }
 
 func fetchRetryBackoff(retry int) time.Duration {
@@ -270,6 +295,13 @@ func isRetryableFetchError(err error) bool {
 		errors.Is(err, ErrChannelPrivate) ||
 		errors.Is(err, ErrChannelUnavailable) ||
 		errors.Is(err, ErrCloudflareChallenge)
+}
+
+func isDurableFetchError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return !errors.Is(err, errPostValidation) && !errors.Is(err, errPostStorage)
 }
 
 func fetchErrorKind(err error) string {
@@ -402,9 +434,11 @@ func (p *ChannelProcessor) ProcessChannelsContext(ctx context.Context, channels 
 			batch.Results = append(batch.Results, outcome.result)
 			continue
 		}
-		if persistErr := p.persistFetchError(&channels[i], outcome.err); persistErr != nil {
-			outcome.err = persistErr
-			outcomes[i] = outcome
+		if isDurableFetchError(outcome.err) {
+			if persistErr := p.persistFetchError(&channels[i], outcome.err); persistErr != nil {
+				outcome.err = persistErr
+				outcomes[i] = outcome
+			}
 		}
 		failure := ChannelFailure{
 			Channel:    channels[i],
@@ -422,6 +456,16 @@ func (p *ChannelProcessor) notifyExhaustedFailures(ctx context.Context, failures
 	if len(failures) == 0 || p.notifier == nil {
 		return false
 	}
+	durableFailures := make([]ChannelFailure, 0, len(failures))
+	for _, failure := range failures {
+		if isDurableFetchError(failure.Err) {
+			durableFailures = append(durableFailures, failure)
+		}
+	}
+	if len(durableFailures) == 0 {
+		return false
+	}
+	failures = durableFailures
 	allRateLimited := true
 	usernames := make([]string, 0, len(failures))
 	for _, failure := range failures {

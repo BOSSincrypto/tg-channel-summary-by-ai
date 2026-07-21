@@ -165,6 +165,14 @@ func (f *fakeStoragePosts) Insert(post *model.Post) (int64, error) {
 	return int64(len(f.posts)), nil
 }
 
+type failingProcessorPosts struct {
+	err error
+}
+
+func (f *failingProcessorPosts) Insert(*model.Post) (int64, error) {
+	return 0, f.err
+}
+
 func newStorageTestDB(t *testing.T) (*db.DB, func()) {
 	t.Helper()
 	database, err := db.Open(":memory:")

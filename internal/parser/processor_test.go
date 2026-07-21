@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -527,8 +528,91 @@ func TestProcessChannelsRetriesOnlyRateLimitedChannel(t *testing.T) {
 	if len(fetcher.order) < 3 || fetcher.order[0] != "channela" || fetcher.order[1] != "channelb" || fetcher.order[2] != "channela" {
 		t.Fatalf("fetch order = %v, want [channela, channelb, channela]", fetcher.order)
 	}
-	if len(sleeper.sleeps) != 1 || sleeper.sleeps[0] != 5*time.Second {
-		t.Fatalf("sleeps = %v, want one 5s sleep only for channel A", sleeper.sleeps)
+	if len(sleeper.sleeps) != 1 || sleeper.sleeps[0] != 17*time.Second {
+		t.Fatalf("sleeps = %v, want one 17s Retry-After sleep only for channel A", sleeper.sleeps)
+	}
+}
+
+func TestProcessChannelsUsesRetryAfterForEachRateLimitedResponse(t *testing.T) {
+	database, cleanup := newStorageTestDB(t)
+	defer cleanup()
+
+	channel := &model.Channel{Username: "changing-limit", Enabled: true}
+	id, err := database.Channels.Insert(channel)
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	channel.ID = id
+
+	fetcher := &sequenceFetcher{responses: map[string][]sequenceResponse{
+		"changing-limit": {
+			{stats: ParseStats{HTTPStatus: http.StatusTooManyRequests}, err: &RateLimitError{RetryAfter: 17 * time.Second}},
+			{stats: ParseStats{HTTPStatus: http.StatusTooManyRequests}, err: &RateLimitError{RetryAfter: 3 * time.Second}},
+			{posts: []ParsedPost{{MessageID: 1, Text: "recovered", PostedAt: "2026-07-15T18:30:00Z"}}, stats: ParseStats{HTTPStatus: http.StatusOK}},
+		},
+	}}
+	sleeper := &recordingSleeper{}
+	processor := NewChannelProcessor(fetcher, NewPostStorage(database.Channels, database.Posts)).
+		WithMaxRetries(2).
+		WithSleeper(sleeper)
+
+	batch, err := processor.ProcessChannels([]model.Channel{*channel})
+	if err != nil {
+		t.Fatalf("process channels: %v", err)
+	}
+	if len(batch.Failures) != 0 || len(batch.Results) != 1 {
+		t.Fatalf("batch = results=%+v failures=%+v, want recovered success", batch.Results, batch.Failures)
+	}
+	if got, want := sleeper.sleeps, []time.Duration{17 * time.Second, 3 * time.Second}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("sleeps = %v, want Retry-After durations %v", got, want)
+	}
+}
+
+func TestProcessChannelUsesHTTPDateRetryAfter(t *testing.T) {
+	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if requests == 1 {
+			w.Header().Set("Retry-After", now.Add(45*time.Second).Format(http.TimeFormat))
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_, _ = w.Write([]byte(`
+			<div class="tgme_widget_message" data-post="datelimit/1">
+				<div class="tgme_widget_message_text">recovered</div>
+				<time datetime="2026-07-15T18:30:00Z"></time>
+			</div>`))
+	}))
+	defer server.Close()
+
+	database, cleanup := newStorageTestDB(t)
+	defer cleanup()
+	channel := &model.Channel{Username: "datelimit", Enabled: true}
+	id, err := database.Channels.Insert(channel)
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	channel.ID = id
+	sleeper := &recordingSleeper{}
+	fetcher := NewWithOptions(Options{
+		Client:  server.Client(),
+		BaseURL: server.URL,
+		Now:     func() time.Time { return now },
+	})
+	processor := NewChannelProcessor(fetcher, NewPostStorage(database.Channels, database.Posts)).
+		WithMaxRetries(1).
+		WithSleeper(sleeper)
+
+	result, err := processor.ProcessChannel(channel)
+	if err != nil {
+		t.Fatalf("process channel: %v", err)
+	}
+	if result.StoredPosts != 1 {
+		t.Fatalf("result = %+v, want one recovered post", result)
+	}
+	if len(sleeper.sleeps) != 1 || sleeper.sleeps[0] != 45*time.Second {
+		t.Fatalf("sleeps = %v, want [45s] from HTTP-date Retry-After", sleeper.sleeps)
 	}
 }
 
@@ -570,11 +654,12 @@ func TestProcessChannelsRateLimitDefaultBackoffAndNoInfiniteLoop(t *testing.T) {
 	if fetcher.calls["limited"] != 4 {
 		t.Fatalf("attempts = %d, want initial attempt plus MaxRetries=3 retries", fetcher.calls["limited"])
 	}
-	// Three sleeps between the initial attempt and three retries.
+	// Three sleeps between the initial attempt and three retries. The
+	// five-minute default is used for every response without Retry-After.
 	if len(sleeper.sleeps) != 3 {
 		t.Fatalf("sleeps = %v, want three backoff sleeps", sleeper.sleeps)
 	}
-	for i, want := range []time.Duration{5 * time.Second, 10 * time.Second, 20 * time.Second} {
+	for i, want := range []time.Duration{defaultRateLimitBackoff, defaultRateLimitBackoff, defaultRateLimitBackoff} {
 		if sleeper.sleeps[i] != want {
 			t.Fatalf("sleep %d = %s, want %s", i, sleeper.sleeps[i], want)
 		}
@@ -728,6 +813,78 @@ func TestProcessChannelsFullySuccessfulBatchNoRateLimitNotification(t *testing.T
 	}
 }
 
+func TestProcessChannelDoesNotPersistOrNotifyPostValidationFailure(t *testing.T) {
+	database, cleanup := newStorageTestDB(t)
+	defer cleanup()
+
+	channel := &model.Channel{Username: "invalid-post", Enabled: true}
+	id, err := database.Channels.Insert(channel)
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	channel.ID = id
+	notifier := &recordingOwnerNotifier{}
+	fetcher := &fakeChannelFetcher{
+		posts: map[string][]ParsedPost{
+			"invalid-post": {{MessageID: 1, Text: "missing timestamp"}},
+		},
+	}
+
+	_, err = NewChannelProcessor(fetcher, NewPostStorage(database.Channels, database.Posts), notifier).
+		WithSleeper(&recordingSleeper{}).
+		ProcessChannel(channel)
+	if err == nil {
+		t.Fatal("ProcessChannel() error = nil, want validation failure")
+	}
+	if len(notifier.messages) != 0 {
+		t.Fatalf("notifications = %q, want none for post validation failure", notifier.messages)
+	}
+	stored, err := database.Channels.GetByID(id)
+	if err != nil {
+		t.Fatalf("get channel: %v", err)
+	}
+	if stored.FetchErrorKind != "" || stored.FetchErrorMessage != "" || stored.FetchErrorAt != nil {
+		t.Fatalf("stored fetch error = %+v, want no durable channel-fetch failure", stored)
+	}
+}
+
+func TestProcessChannelDoesNotPersistOrNotifyPostStorageFailure(t *testing.T) {
+	database, cleanup := newStorageTestDB(t)
+	defer cleanup()
+
+	channel := &model.Channel{Username: "storage-failure", Enabled: true}
+	id, err := database.Channels.Insert(channel)
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	channel.ID = id
+	notifier := &recordingOwnerNotifier{}
+	storeErr := errors.New("post database unavailable")
+	storage := NewPostStorage(database.Channels, &failingProcessorPosts{err: storeErr})
+	fetcher := &fakeChannelFetcher{
+		posts: map[string][]ParsedPost{
+			"storage-failure": {{MessageID: 1, Text: "valid", PostedAt: "2026-07-15T18:30:00Z"}},
+		},
+	}
+
+	_, err = NewChannelProcessor(fetcher, storage, notifier).
+		WithSleeper(&recordingSleeper{}).
+		ProcessChannel(channel)
+	if !errors.Is(err, storeErr) {
+		t.Fatalf("ProcessChannel() error = %v, want storage error %v", err, storeErr)
+	}
+	if len(notifier.messages) != 0 {
+		t.Fatalf("notifications = %q, want none for post storage failure", notifier.messages)
+	}
+	stored, err := database.Channels.GetByID(id)
+	if err != nil {
+		t.Fatalf("get channel: %v", err)
+	}
+	if stored.FetchErrorKind != "" || stored.FetchErrorMessage != "" || stored.FetchErrorAt != nil {
+		t.Fatalf("stored fetch error = %+v, want no durable channel-fetch failure", stored)
+	}
+}
+
 func TestProcessChannelsRetriesEveryClassifiedFetchFailure(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -774,8 +931,12 @@ func TestProcessChannelsRetriesEveryClassifiedFetchFailure(t *testing.T) {
 			if fetcher.calls[channel.Username] != 2 {
 				t.Fatalf("attempts = %d, want initial attempt plus one retry", fetcher.calls[channel.Username])
 			}
-			if len(sleeper.sleeps) != 1 || sleeper.sleeps[0] != 5*time.Second {
-				t.Fatalf("sleeps = %v, want [5s]", sleeper.sleeps)
+			wantSleep := 5 * time.Second
+			if test.name == "429" {
+				wantSleep = time.Hour
+			}
+			if len(sleeper.sleeps) != 1 || sleeper.sleeps[0] != wantSleep {
+				t.Fatalf("sleeps = %v, want [%s]", sleeper.sleeps, wantSleep)
 			}
 			if len(notifier.messages) != 0 {
 				t.Fatalf("notifications = %q, want none after recovery", notifier.messages)
@@ -913,6 +1074,9 @@ func TestProcessChannelsExhaustsEveryClassifiedFetchFailure(t *testing.T) {
 				t.Fatalf("attempts = %d, want initial attempt plus three retries", fetcher.calls[channel.Username])
 			}
 			wantSleeps := []time.Duration{5 * time.Second, 10 * time.Second, 20 * time.Second}
+			if test.name == "429" {
+				wantSleeps = []time.Duration{time.Hour, time.Hour, time.Hour}
+			}
 			if len(sleeper.sleeps) != len(wantSleeps) {
 				t.Fatalf("sleeps = %v, want %v", sleeper.sleeps, wantSleeps)
 			}

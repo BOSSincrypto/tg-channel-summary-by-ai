@@ -253,6 +253,23 @@ func TestParseChannelRateLimitDefaultsBackoff(t *testing.T) {
 	}
 }
 
+func TestParseChannelRateLimitInvalidHeaderDefaultsBackoff(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "not-a-duration")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	_, err := NewWithOptions(Options{Client: server.Client(), BaseURL: server.URL}).ParseChannel("example")
+	var rateLimitErr *RateLimitError
+	if !errors.As(err, &rateLimitErr) {
+		t.Fatalf("error = %v, want RateLimitError", err)
+	}
+	if rateLimitErr.RetryAfter != defaultRateLimitBackoff {
+		t.Fatalf("retry after = %s, want default %s", rateLimitErr.RetryAfter, defaultRateLimitBackoff)
+	}
+}
+
 func TestParseChannelRateLimitHTTPDateUsesInjectedClock(t *testing.T) {
 	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -1316,6 +1316,73 @@ func TestGenerateZeroPostsWithFailedChannelRemainsNoPostsAndDoesNotDeliver(t *te
 	}
 }
 
+func TestGeneratePartialFailureNotificationIncludesGroupAndActionableChannelDetails(t *testing.T) {
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer database.Close()
+
+	groupID, err := database.Groups.Insert(&model.Group{
+		TelegramChatID: -10079,
+		Title:          "Новости проекта",
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	for _, channel := range []struct {
+		username string
+	}{
+		{username: "healthy"},
+		{username: "broken"},
+	} {
+		channelID, insertErr := database.Channels.Insert(&model.Channel{
+			Username: channel.username,
+			Enabled:  true,
+		})
+		if insertErr != nil {
+			t.Fatalf("insert channel %s: %v", channel.username, insertErr)
+		}
+		if assignErr := database.Groups.AssignChannel(groupID, channelID, nil); assignErr != nil {
+			t.Fatalf("assign channel %s: %v", channel.username, assignErr)
+		}
+	}
+
+	notifier := &recordingDigestNotifier{}
+	processor := parser.NewChannelProcessor(
+		outcomeFetcher{
+			posts: map[string][]parser.ParsedPost{
+				"healthy": {{
+					MessageID: 1,
+					Text:      "важная новость",
+					PostedAt:  time.Now().UTC().Add(-time.Hour).Format(time.RFC3339),
+				}},
+			},
+			errs: map[string]error{"broken": errors.New("channel was renamed or deleted")},
+		},
+		parser.NewPostStorage(database.Channels, database.Posts),
+	)
+	service := NewWithProcessor(database, processor)
+	service.notifier = notifier
+
+	result, err := service.GenerateManualResult(groupID)
+	if err != nil {
+		t.Fatalf("generate partial digest: %v", err)
+	}
+	if result.Outcome != OutcomePartial {
+		t.Fatalf("outcome = %q, want %q", result.Outcome, OutcomePartial)
+	}
+	if len(notifier.messages) != 1 {
+		t.Fatalf("notifications = %v, want one digest failure alert", notifier.messages)
+	}
+	message := notifier.messages[0]
+	for _, want := range []string{"Новости проекта", "@broken", "channel was renamed or deleted", "Проверьте"} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("notification = %q, want actionable detail %q", message, want)
+		}
+	}
+}
+
 func TestGenerateManualResultExposesAllTerminalOutcomes(t *testing.T) {
 	tests := []struct {
 		name            string

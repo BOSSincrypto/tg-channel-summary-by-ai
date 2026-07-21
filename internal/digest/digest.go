@@ -527,10 +527,16 @@ func (s *Service) notifyDigestOutcome(result *Digest) {
 		return
 	}
 	message := result.Message
+	if result.GroupID != 0 && (len(result.FailureDetails) > 0 || len(result.FailedChannels) > 0) {
+		message = fmt.Sprintf("%s Группа «%s».", strings.TrimSpace(message), s.groupTitle(result.GroupID))
+	}
 	if len(result.FailureDetails) > 0 {
 		message += " Не удалось обработать: " + strings.Join(result.FailureDetails, "; ") + "."
 	} else if len(result.FailedChannels) > 0 {
 		message += " Не удалось обработать: " + strings.Join(result.FailedChannels, ", ") + "."
+	}
+	if len(result.FailureDetails) > 0 || len(result.FailedChannels) > 0 {
+		message += " Проверьте доступность каналов и обновите настройки."
 	}
 	if result.Outcome == OutcomeDeliveryFailed && result.SummariesSaved {
 		message += " Сводки сохранены, но не доставлены."

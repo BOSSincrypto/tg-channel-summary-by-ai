@@ -36,6 +36,12 @@ type Digest struct {
 	MessageURL     string
 	SummariesSaved bool
 	Delivered      bool
+	// StartPart is used only when resuming a split Telegram delivery after a
+	// previous part was durably acknowledged.
+	StartPart int
+	// Progress is an internal durable-checkpoint hook used by the Telegram
+	// delivery boundary after each successfully sent split part.
+	Progress func(partsSent int, messageID int64) error
 }
 
 const (
@@ -56,6 +62,7 @@ var ErrDigestInProgress = errors.New("digest already in progress")
 type DeliveryReceipt struct {
 	MessageID  int64
 	MessageURL string
+	PartsSent  int
 }
 
 // Delivery is the narrow transport boundary used after summaries are saved.
@@ -309,7 +316,7 @@ func (s *Service) generate(groupID int64, windowID string, manual bool) (*Digest
 				s.notifyDigestOutcome(result)
 				return result, terminalDigestError(result, checkpointErr, manual)
 			}
-			receipt, deliveryErr := s.delivery.Deliver(context.Background(), groupID, result)
+			receipt, deliveryErr := s.deliverWithCheckpoint(context.Background(), pendingID, groupID, result)
 			if deliveryErr != nil {
 				result.Outcome = OutcomeDeliveryFailed
 				result.Message = safeDigestMessage(deliveryErr)
@@ -347,7 +354,7 @@ func (s *Service) generate(groupID int64, windowID string, manual bool) (*Digest
 				s.notifyDigestOutcome(result)
 				return result, terminalDigestError(result, checkpointErr, manual)
 			}
-			receipt, deliveryErr := s.delivery.Deliver(context.Background(), groupID, result)
+			receipt, deliveryErr := s.deliverWithCheckpoint(context.Background(), pendingID, groupID, result)
 			if deliveryErr != nil {
 				result.Outcome = OutcomeDeliveryFailed
 				result.Message = safeDigestMessage(deliveryErr)
@@ -379,7 +386,7 @@ func (s *Service) generate(groupID int64, windowID string, manual bool) (*Digest
 			s.notifyDigestOutcome(result)
 			return result, terminalDigestError(result, err, manual)
 		}
-		receipt, err := s.delivery.Deliver(context.Background(), groupID, result)
+		receipt, err := s.deliverWithCheckpoint(context.Background(), pendingID, groupID, result)
 		if err != nil {
 			result.Outcome = OutcomeDeliveryFailed
 			result.Message = safeDigestMessage(err)
@@ -453,6 +460,45 @@ func (s *Service) ResumePending(groupID int64) error {
 	return s.resumePendingLocked(groupID)
 }
 
+// ResumePendingAll retries every durable delivery checkpoint for active
+// groups. It is called during startup before scheduled work begins so a
+// process crash between Telegram delivery and checkpoint finalization does
+// not leave a digest stranded until the next cron cycle.
+func (s *Service) ResumePendingAll() error {
+	if s == nil || s.database == nil || s.database.Groups == nil ||
+		s.database.Digests == nil || s.delivery == nil {
+		return errors.New("resume pending: digest delivery is not configured")
+	}
+	groups, err := s.database.Groups.List()
+	if err != nil {
+		return fmt.Errorf("resume pending: list groups: %w", err)
+	}
+	var resumeErr error
+	for _, group := range groups {
+		if group.Status != "" && group.Status != model.GroupStatusActive {
+			continue
+		}
+		if err := s.ResumePending(group.ID); err != nil {
+			resumeErr = errors.Join(resumeErr,
+				fmt.Errorf("resume pending digest for group %d: %w", group.ID, err))
+		}
+	}
+	return resumeErr
+}
+
+func (s *Service) deliverWithCheckpoint(ctx context.Context, pendingID, groupID int64, result *Digest) (DeliveryReceipt, error) {
+	if result == nil {
+		return DeliveryReceipt{}, errors.New("deliver digest: result is nil")
+	}
+	result.Progress = func(partsSent int, messageID int64) error {
+		if s == nil || s.database == nil || s.database.Digests == nil {
+			return nil
+		}
+		return s.database.Digests.MarkPartSent(pendingID, int64(partsSent), messageID)
+	}
+	return s.delivery.Deliver(ctx, groupID, result)
+}
+
 func (s *Service) resumePendingLocked(groupID int64) error {
 	pending, err := s.database.Digests.ListPendingByGroup(groupID)
 	if err != nil {
@@ -463,7 +509,9 @@ func (s *Service) resumePendingLocked(groupID int64) error {
 			GroupID: groupID, PostCount: item.PostCount, Text: item.MessageText,
 			Outcome: OutcomeDeliveryFailed, Message: "Повторная отправка дайджеста.",
 		}
-		receipt, deliverErr := s.delivery.Deliver(context.Background(), groupID, result)
+		result.StartPart = item.PartsSent
+		result.MessageID = item.MessageID
+		receipt, deliverErr := s.deliverWithCheckpoint(context.Background(), item.ID, groupID, result)
 		if deliverErr != nil {
 			return fmt.Errorf("resume pending digest %d: %w", item.ID, deliverErr)
 		}

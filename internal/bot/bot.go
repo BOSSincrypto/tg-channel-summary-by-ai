@@ -159,13 +159,22 @@ type Service struct {
 	cancel  context.CancelFunc
 	stopMu  sync.Mutex
 	topicMu sync.Mutex
+
+	deliveryQueueMu       sync.Mutex
+	deliveryQueue         []deliveryJob
+	deliveryQueueRunning  bool
+	deliveryQueueNotified bool
+	deliveryLastChatSend  map[int64]time.Time
+	deliveryChatThrottle  time.Duration
+	deliverySleeper       func(context.Context, time.Duration) error
 }
 
 // New creates an unconfigured service. Use NewWithConfig for production.
 func New() *Service {
 	service := &Service{
-		logger:   log.Default(),
-		commands: make(map[string]CommandHandler),
+		logger:               log.Default(),
+		commands:             make(map[string]CommandHandler),
+		deliveryChatThrottle: deliveryChatThrottle,
 	}
 	service.configureAdminCommands()
 	return service
@@ -565,8 +574,8 @@ func (s *Service) sendAdminWebAppMessage(ctx context.Context, chatID telego.Chat
 	if markdown {
 		params.ParseMode = "MarkdownV2"
 	}
-	_, err := s.api.SendMessage(ctx, params)
-	return s.classifyTelegramError(err)
+	_, err := s.sendMessage(ctx, params)
+	return err
 }
 
 func (s *Service) isConfigured() bool {
@@ -689,8 +698,8 @@ func (s *Service) sendPlain(ctx context.Context, chatID telego.ChatID, text stri
 	if s == nil || s.api == nil {
 		return errors.New("bot service is not configured")
 	}
-	_, err := s.api.SendMessage(ctx, &telego.SendMessageParams{ChatID: chatID, Text: text})
-	return s.classifyTelegramError(err)
+	_, err := s.sendMessage(ctx, &telego.SendMessageParams{ChatID: chatID, Text: text})
+	return err
 }
 
 // Deliver sends one assembled digest to its configured Telegram group and
@@ -710,12 +719,25 @@ func (s *Service) Deliver(ctx context.Context, groupID int64, result *digest.Dig
 		ChatID:    groupTelegramChatID(group.TelegramChatID),
 		ParseMode: "MarkdownV2",
 	}
+	settings, settingsErr := s.groups.GetGroupSettings(groupID)
+	if settingsErr != nil {
+		return digest.DeliveryReceipt{}, fmt.Errorf("load digest settings for group %d: %w", groupID, settingsErr)
+	}
+	if settings.SilentDigest {
+		params.DisableNotification = true
+	}
 	assignments, err := s.groups.GetChannelAssignments(groupID)
 	if err != nil {
 		return digest.DeliveryReceipt{}, fmt.Errorf("load digest topics for group %d: %w", groupID, err)
 	}
 	for _, assignment := range assignments {
 		if assignment.TopicThreadID != nil {
+			if *assignment.TopicThreadID <= 0 {
+				return digest.DeliveryReceipt{}, fmt.Errorf(
+					"invalid message thread id %d for group %d",
+					*assignment.TopicThreadID, groupID,
+				)
+			}
 			params.MessageThreadID = int(*assignment.TopicThreadID)
 			break
 		}
@@ -724,22 +746,37 @@ func (s *Service) Deliver(ctx context.Context, groupID int64, result *digest.Dig
 	if len(parts) == 0 {
 		return digest.DeliveryReceipt{}, errors.New("digest message is empty")
 	}
+	startPart := result.StartPart
+	if startPart < 0 || startPart > len(parts) {
+		return digest.DeliveryReceipt{}, fmt.Errorf("invalid digest delivery checkpoint %d/%d", startPart, len(parts))
+	}
 	var lastMessageID int64
+	if result.MessageID != nil {
+		lastMessageID = *result.MessageID
+	}
 	for index, part := range parts {
+		if index < startPart {
+			continue
+		}
 		params.Text = part
-		message, sendErr := s.api.SendMessage(ctx, params)
+		message, sendErr := s.sendMessage(ctx, params)
 		if sendErr != nil {
 			return digest.DeliveryReceipt{}, fmt.Errorf(
 				"send digest part %d/%d to group %d: %w",
-				index+1, len(parts), groupID, s.classifyTelegramError(sendErr),
+				index+1, len(parts), groupID, sendErr,
 			)
 		}
 		if message == nil || message.MessageID == 0 {
 			return digest.DeliveryReceipt{}, errors.New("Telegram delivery returned no message metadata")
 		}
 		lastMessageID = int64(message.MessageID)
+		if result.Progress != nil {
+			if progressErr := result.Progress(index+1, lastMessageID); progressErr != nil {
+				return digest.DeliveryReceipt{}, fmt.Errorf("checkpoint digest part %d/%d: %w", index+1, len(parts), progressErr)
+			}
+		}
 	}
-	return digest.DeliveryReceipt{MessageID: lastMessageID}, nil
+	return digest.DeliveryReceipt{MessageID: lastMessageID, PartsSent: len(parts)}, nil
 }
 
 func (s *Service) handleMyChatMember(ctx context.Context, update *telego.ChatMemberUpdated) error {
@@ -802,7 +839,7 @@ func (s *Service) handleGroupJoin(ctx context.Context, chat telego.Chat) error {
 		if s.lifecycle != nil {
 			s.lifecycle.RemoveGroup(group.ID)
 		}
-		_, sendErr := s.api.SendMessage(ctx, &telego.SendMessageParams{
+		_, sendErr := s.sendMessage(ctx, &telego.SendMessageParams{
 			ChatID: chat.ChatID(),
 			Text:   "This bot requires a forum supergroup with topics enabled. Please convert the group to a forum or create a new forum group.",
 		})
@@ -811,11 +848,10 @@ func (s *Service) handleGroupJoin(ctx context.Context, chat telego.Chat) error {
 			// scheduler job removed. A transient warning-delivery failure
 			// must not make cleanup unreliable or cause repeated lifecycle
 			// processing to leave a stale active job behind.
-			classifiedSendErr := s.classifyTelegramError(sendErr)
-			if errors.Is(classifiedSendErr, ErrTokenRevoked) {
-				return classifiedSendErr
+			if errors.Is(sendErr, ErrTokenRevoked) {
+				return sendErr
 			}
-			s.logf("send forum requirement for group %d: %v", chat.ID, classifiedSendErr)
+			s.logf("send forum requirement for group %d: %v", chat.ID, sendErr)
 		}
 		return nil
 	}

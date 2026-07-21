@@ -19,8 +19,8 @@ func (r *DigestRepository) Insert(d *model.Digest) (int64, error) {
 		msgID = *d.MessageID
 	}
 	result, err := r.db.Conn().Exec(
-		`INSERT INTO digests (group_id, message_id, post_count, status, message_text) VALUES (?, ?, ?, ?, ?)`,
-		d.GroupID, msgID, d.PostCount, normalizedDigestStatus(d.Status), d.MessageText,
+		`INSERT INTO digests (group_id, message_id, post_count, status, message_text, parts_sent) VALUES (?, ?, ?, ?, ?, ?)`,
+		d.GroupID, msgID, d.PostCount, normalizedDigestStatus(d.Status), d.MessageText, d.PartsSent,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("insert digest: %w", err)
@@ -45,7 +45,7 @@ func (r *DigestRepository) CreatePending(groupID int64, text string, posts []mod
 	}
 	defer tx.Rollback()
 	result, err := tx.Exec(
-		`INSERT INTO digests (group_id, post_count, status, message_text) VALUES (?, ?, 'pending', ?)`,
+		`INSERT INTO digests (group_id, post_count, status, message_text, parts_sent) VALUES (?, ?, 'pending', ?, 0)`,
 		groupID, len(posts), text,
 	)
 	if err != nil {
@@ -67,6 +67,29 @@ func (r *DigestRepository) CreatePending(groupID int64, text string, posts []mod
 		return 0, fmt.Errorf("commit pending digest: %w", err)
 	}
 	return digestID, nil
+}
+
+// MarkPartSent durably records a successfully delivered split-message part.
+// The checkpoint remains pending until MarkSent is called for the final part.
+func (r *DigestRepository) MarkPartSent(id, partsSent, messageID int64) error {
+	if partsSent <= 0 {
+		return fmt.Errorf("mark digest part: parts sent must be positive")
+	}
+	result, err := r.db.Conn().Exec(
+		`UPDATE digests SET parts_sent = ?, message_id = ? WHERE id = ? AND status = 'pending' AND parts_sent < ?`,
+		partsSent, messageID, id, partsSent,
+	)
+	if err != nil {
+		return fmt.Errorf("mark digest part: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("mark digest part rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // MarkSent finalizes a pending digest after Telegram confirms delivery.
@@ -92,7 +115,7 @@ func (r *DigestRepository) MarkSent(id, messageID int64) error {
 // a process crash.
 func (r *DigestRepository) ListPendingByGroup(groupID int64) ([]model.Digest, error) {
 	rows, err := r.db.Conn().Query(
-		`SELECT id, group_id, sent_at, message_id, post_count, status, message_text
+		`SELECT id, group_id, sent_at, message_id, post_count, status, message_text, parts_sent
 		 FROM digests WHERE group_id = ? AND status = 'pending'
 		 ORDER BY id ASC`, groupID,
 	)
@@ -104,7 +127,7 @@ func (r *DigestRepository) ListPendingByGroup(groupID int64) ([]model.Digest, er
 	for rows.Next() {
 		var d model.Digest
 		var msgID sql.NullInt64
-		if err := rows.Scan(&d.ID, &d.GroupID, &d.SentAt, &msgID, &d.PostCount, &d.Status, &d.MessageText); err != nil {
+		if err := rows.Scan(&d.ID, &d.GroupID, &d.SentAt, &msgID, &d.PostCount, &d.Status, &d.MessageText, &d.PartsSent); err != nil {
 			return nil, fmt.Errorf("scan pending digest: %w", err)
 		}
 		if msgID.Valid {
@@ -120,9 +143,9 @@ func (r *DigestRepository) GetByID(id int64) (*model.Digest, error) {
 	d := &model.Digest{}
 	var msgID sql.NullInt64
 	err := r.db.Conn().QueryRow(
-		`SELECT id, group_id, sent_at, message_id, post_count, status, message_text
+		`SELECT id, group_id, sent_at, message_id, post_count, status, message_text, parts_sent
 		 FROM digests WHERE id = ?`, id,
-	).Scan(&d.ID, &d.GroupID, &d.SentAt, &msgID, &d.PostCount, &d.Status, &d.MessageText)
+	).Scan(&d.ID, &d.GroupID, &d.SentAt, &msgID, &d.PostCount, &d.Status, &d.MessageText, &d.PartsSent)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -139,7 +162,7 @@ func (r *DigestRepository) GetByID(id int64) (*model.Digest, error) {
 // limited to the given count.
 func (r *DigestRepository) ListByGroup(groupID int64, limit int) ([]model.Digest, error) {
 	rows, err := r.db.Conn().Query(
-		`SELECT id, group_id, sent_at, message_id, post_count, status, message_text
+		`SELECT id, group_id, sent_at, message_id, post_count, status, message_text, parts_sent
 		 FROM digests WHERE group_id = ?
 		 ORDER BY sent_at DESC LIMIT ?`,
 		groupID, limit,
@@ -153,7 +176,7 @@ func (r *DigestRepository) ListByGroup(groupID int64, limit int) ([]model.Digest
 	for rows.Next() {
 		var d model.Digest
 		var msgID sql.NullInt64
-		if err := rows.Scan(&d.ID, &d.GroupID, &d.SentAt, &msgID, &d.PostCount, &d.Status, &d.MessageText); err != nil {
+		if err := rows.Scan(&d.ID, &d.GroupID, &d.SentAt, &msgID, &d.PostCount, &d.Status, &d.MessageText, &d.PartsSent); err != nil {
 			return nil, fmt.Errorf("scan digest: %w", err)
 		}
 		if msgID.Valid {

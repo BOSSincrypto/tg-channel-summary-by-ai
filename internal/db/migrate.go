@@ -22,11 +22,17 @@ func runMigrations(conn *sql.DB) error {
 	if err := ensureGroupSettingsEmptyDigestColumn(conn); err != nil {
 		return fmt.Errorf("migrate empty digest behavior: %w", err)
 	}
+	if err := ensureGroupSettingsSilentDigestColumn(conn); err != nil {
+		return fmt.Errorf("migrate silent digest setting: %w", err)
+	}
 	if err := ensureDigestStatusColumn(conn); err != nil {
 		return fmt.Errorf("migrate digest status: %w", err)
 	}
 	if err := ensureDigestMessageTextColumn(conn); err != nil {
 		return fmt.Errorf("migrate digest message text: %w", err)
+	}
+	if err := ensureDigestPartsSentColumn(conn); err != nil {
+		return fmt.Errorf("migrate digest delivery progress: %w", err)
 	}
 	if err := ensureVersionColumns(conn); err != nil {
 		return fmt.Errorf("migrate optimistic locking versions: %w", err)
@@ -71,6 +77,36 @@ func ensureGroupSettingsEmptyDigestColumn(conn *sql.DB) error {
 	if !hasColumn {
 		if _, err := conn.Exec(`ALTER TABLE group_settings ADD COLUMN empty_digest_behavior TEXT NOT NULL DEFAULT 'send_message'`); err != nil {
 			return fmt.Errorf("add empty_digest_behavior: %w", err)
+		}
+	}
+	return nil
+}
+
+func ensureGroupSettingsSilentDigestColumn(conn *sql.DB) error {
+	rows, err := conn.Query("PRAGMA table_info(group_settings)")
+	if err != nil {
+		return fmt.Errorf("inspect group_settings table: %w", err)
+	}
+	defer rows.Close()
+
+	hasColumn := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return fmt.Errorf("scan group_settings column: %w", err)
+		}
+		if name == "silent_digest" {
+			hasColumn = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate group_settings columns: %w", err)
+	}
+	if !hasColumn {
+		if _, err := conn.Exec(`ALTER TABLE group_settings ADD COLUMN silent_digest INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("add silent_digest: %w", err)
 		}
 	}
 	return nil
@@ -131,6 +167,36 @@ func ensureDigestMessageTextColumn(conn *sql.DB) error {
 	if !hasColumn {
 		if _, err := conn.Exec(`ALTER TABLE digests ADD COLUMN message_text TEXT NOT NULL DEFAULT ''`); err != nil {
 			return fmt.Errorf("add digests message text: %w", err)
+		}
+	}
+	return nil
+}
+
+func ensureDigestPartsSentColumn(conn *sql.DB) error {
+	rows, err := conn.Query("PRAGMA table_info(digests)")
+	if err != nil {
+		return fmt.Errorf("inspect digests table: %w", err)
+	}
+	defer rows.Close()
+
+	hasColumn := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return fmt.Errorf("scan digests column: %w", err)
+		}
+		if name == "parts_sent" {
+			hasColumn = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate digests columns: %w", err)
+	}
+	if !hasColumn {
+		if _, err := conn.Exec(`ALTER TABLE digests ADD COLUMN parts_sent INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("add digests parts_sent: %w", err)
 		}
 	}
 	return nil
@@ -465,7 +531,8 @@ var migrations = []string{
 		model TEXT,
 		digest_time TEXT DEFAULT '21:00',
 		timezone TEXT DEFAULT 'Europe/Moscow',
-		empty_digest_behavior TEXT NOT NULL DEFAULT 'send_message'
+		empty_digest_behavior TEXT NOT NULL DEFAULT 'send_message',
+		silent_digest INTEGER NOT NULL DEFAULT 0
 	)`,
 
 	// --------------------------------------------------
@@ -495,7 +562,8 @@ var migrations = []string{
 		message_id INTEGER,
 		post_count INTEGER DEFAULT 0,
 		status TEXT NOT NULL DEFAULT 'sent',
-		message_text TEXT NOT NULL DEFAULT ''
+		message_text TEXT NOT NULL DEFAULT '',
+		parts_sent INTEGER NOT NULL DEFAULT 0
 	)`,
 
 	// --------------------------------------------------

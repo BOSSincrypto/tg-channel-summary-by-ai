@@ -89,6 +89,7 @@ type GroupSettings struct {
 	DigestTime          string  // HH:MM format
 	Timezone            string  // e.g. Europe/Moscow
 	EmptyDigestBehavior string  // send_message or silent
+	SilentDigest        bool    // send Telegram notifications without sound
 }
 
 const (
@@ -119,6 +120,7 @@ type Digest struct {
 	PostCount   int
 	Status      string
 	MessageText string
+	PartsSent   int
 }
 
 // DigestPost links posts to a digest (many-to-many).

@@ -87,16 +87,17 @@ func (d *DB) ApplySettingsTransaction(update SettingsUpdate) (int64, error) {
 			}
 		}
 		if _, err := tx.Exec(
-			`INSERT INTO group_settings (group_id, provider_id, model, digest_time, timezone, empty_digest_behavior)
-			 VALUES (?, ?, ?, ?, ?, ?)
+			`INSERT INTO group_settings (group_id, provider_id, model, digest_time, timezone, empty_digest_behavior, silent_digest)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(group_id) DO UPDATE SET
 			   provider_id = excluded.provider_id,
 			   model = excluded.model,
 			   digest_time = excluded.digest_time,
 			   timezone = excluded.timezone,
-			   empty_digest_behavior = excluded.empty_digest_behavior`,
+			   empty_digest_behavior = excluded.empty_digest_behavior,
+			   silent_digest = excluded.silent_digest`,
 			settings.GroupID, providerID, modelValue, settings.DigestTime, settings.Timezone,
-			emptyBehavior,
+			emptyBehavior, boolToSQLite(settings.SilentDigest),
 		); err != nil {
 			return 0, fmt.Errorf("settings transaction: update group %d settings: %w", settings.GroupID, err)
 		}

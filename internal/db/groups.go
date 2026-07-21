@@ -844,10 +844,11 @@ func (r *GroupRepository) GetGroupSettings(groupID int64) (*model.GroupSettings,
 	gs := &model.GroupSettings{GroupID: groupID}
 	var providerID sql.NullInt64
 	var modelValue sql.NullString
+	var silentDigest int
 	err := r.db.Conn().QueryRow(
-		`SELECT group_id, provider_id, model, digest_time, timezone, empty_digest_behavior
+		`SELECT group_id, provider_id, model, digest_time, timezone, empty_digest_behavior, silent_digest
 		 FROM group_settings WHERE group_id = ?`, groupID,
-	).Scan(&gs.GroupID, &providerID, &modelValue, &gs.DigestTime, &gs.Timezone, &gs.EmptyDigestBehavior)
+	).Scan(&gs.GroupID, &providerID, &modelValue, &gs.DigestTime, &gs.Timezone, &gs.EmptyDigestBehavior, &silentDigest)
 	if err == sql.ErrNoRows {
 		// Return defaults if no settings row exists
 		gs.DigestTime = "21:00"
@@ -865,6 +866,7 @@ func (r *GroupRepository) GetGroupSettings(groupID int64) (*model.GroupSettings,
 		gs.Model = &modelValue.String
 	}
 	gs.EmptyDigestBehavior = normalizeEmptyDigestBehavior(gs.EmptyDigestBehavior)
+	gs.SilentDigest = silentDigest != 0
 	return gs, nil
 }
 
@@ -927,16 +929,17 @@ func (r *GroupRepository) UpdateGroupSettings(gs *model.GroupSettings) error {
 		modelVal = *gs.Model
 	}
 	_, err := r.db.Conn().Exec(
-		`INSERT INTO group_settings (group_id, provider_id, model, digest_time, timezone, empty_digest_behavior)
-		 VALUES (?, ?, ?, ?, ?, ?)
+		`INSERT INTO group_settings (group_id, provider_id, model, digest_time, timezone, empty_digest_behavior, silent_digest)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(group_id) DO UPDATE SET
 		   provider_id = excluded.provider_id,
 		   model = excluded.model,
 		   digest_time = excluded.digest_time,
 		   timezone = excluded.timezone,
-		   empty_digest_behavior = excluded.empty_digest_behavior`,
+		   empty_digest_behavior = excluded.empty_digest_behavior,
+		   silent_digest = excluded.silent_digest`,
 		gs.GroupID, providerID, modelVal, gs.DigestTime, gs.Timezone,
-		normalizeEmptyDigestBehavior(gs.EmptyDigestBehavior),
+		normalizeEmptyDigestBehavior(gs.EmptyDigestBehavior), boolToSQLite(gs.SilentDigest),
 	)
 	if err != nil {
 		return fmt.Errorf("update group settings: %w", err)
@@ -949,6 +952,13 @@ func normalizeEmptyDigestBehavior(behavior string) string {
 		return model.EmptyDigestSilent
 	}
 	return model.EmptyDigestSendMessage
+}
+
+func boolToSQLite(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func normalizedGroupStatus(status string) string {

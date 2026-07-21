@@ -157,6 +157,54 @@ func TestResumePendingRetriesRenderedDigestWithoutAIOrParsing(t *testing.T) {
 	}
 }
 
+func TestResumePendingAllReconcilesActiveGroupsAndSkipsInactiveGroups(t *testing.T) {
+	database, activeGroupID, _ := newPipelineDatabase(t, "silent")
+	defer database.Close()
+
+	inactiveGroupID, err := database.Groups.Insert(&model.Group{
+		TelegramChatID: -100502,
+		Title:          "Inactive",
+		Status:         model.GroupStatusInactive,
+	})
+	if err != nil {
+		t.Fatalf("insert inactive group: %v", err)
+	}
+	if _, err := database.Digests.CreatePending(activeGroupID, "active pending", nil); err != nil {
+		t.Fatalf("create active pending digest: %v", err)
+	}
+	inactivePendingID, err := database.Digests.CreatePending(inactiveGroupID, "inactive pending", nil)
+	if err != nil {
+		t.Fatalf("create inactive pending digest: %v", err)
+	}
+
+	delivery := &pipelineDelivery{}
+	service := NewWithProcessor(database, parser.NewChannelProcessor(
+		pipelineFetcher{}, parser.NewPostStorage(database.Channels, database.Posts),
+	))
+	service.SetDelivery(delivery)
+
+	if err := service.ResumePendingAll(); err != nil {
+		t.Fatalf("resume pending all: %v", err)
+	}
+	if delivery.calls != 1 || delivery.last == nil || delivery.last.Text != "active pending" {
+		t.Fatalf("delivery = calls:%d last:%+v, want only active pending", delivery.calls, delivery.last)
+	}
+	activePending, err := database.Digests.ListPendingByGroup(activeGroupID)
+	if err != nil {
+		t.Fatalf("list active pending digests: %v", err)
+	}
+	if len(activePending) != 0 {
+		t.Fatalf("active pending digests = %+v, want none", activePending)
+	}
+	inactivePending, err := database.Digests.GetByID(inactivePendingID)
+	if err != nil {
+		t.Fatalf("get inactive pending digest: %v", err)
+	}
+	if inactivePending.Status != "pending" {
+		t.Fatalf("inactive pending status = %q, want pending", inactivePending.Status)
+	}
+}
+
 func TestGenerateEmptyDigestBehaviorIsConfigurable(t *testing.T) {
 	tests := []struct {
 		name      string

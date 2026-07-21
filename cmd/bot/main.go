@@ -160,6 +160,12 @@ func main() {
 		return
 	}
 	digestService.SetDelivery(telegramBot)
+	if err := digestService.ResumePendingAll(); err != nil {
+		// Keep the durable checkpoint for the next retry while allowing the
+		// rest of the application to start. A transient Telegram outage must
+		// not prevent HTTP health checks or the scheduler from coming up.
+		log.Printf("pending digest delivery reconciliation incomplete: %v", err)
+	}
 	if err := sched.Start(); err != nil {
 		log.Fatalf("failed to start scheduler: %v", err)
 	}

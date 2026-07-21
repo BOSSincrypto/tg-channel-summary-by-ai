@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
 )
@@ -74,15 +75,28 @@ func (d *DB) ApplySettingsTransaction(update SettingsUpdate) (int64, error) {
 		if settings.Model != nil {
 			modelValue = *settings.Model
 		}
+		emptyBehavior := normalizeEmptyDigestBehavior(settings.EmptyDigestBehavior)
+		if strings.TrimSpace(settings.EmptyDigestBehavior) == "" {
+			var currentBehavior string
+			err := tx.QueryRow(
+				`SELECT empty_digest_behavior FROM group_settings WHERE group_id = ?`,
+				settings.GroupID,
+			).Scan(&currentBehavior)
+			if err == nil && currentBehavior != "" {
+				emptyBehavior = currentBehavior
+			}
+		}
 		if _, err := tx.Exec(
-			`INSERT INTO group_settings (group_id, provider_id, model, digest_time, timezone)
-			 VALUES (?, ?, ?, ?, ?)
+			`INSERT INTO group_settings (group_id, provider_id, model, digest_time, timezone, empty_digest_behavior)
+			 VALUES (?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(group_id) DO UPDATE SET
 			   provider_id = excluded.provider_id,
 			   model = excluded.model,
 			   digest_time = excluded.digest_time,
-			   timezone = excluded.timezone`,
+			   timezone = excluded.timezone,
+			   empty_digest_behavior = excluded.empty_digest_behavior`,
 			settings.GroupID, providerID, modelValue, settings.DigestTime, settings.Timezone,
+			emptyBehavior,
 		); err != nil {
 			return 0, fmt.Errorf("settings transaction: update group %d settings: %w", settings.GroupID, err)
 		}

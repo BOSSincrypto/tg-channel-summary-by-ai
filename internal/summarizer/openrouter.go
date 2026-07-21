@@ -67,6 +67,18 @@ type OpenRouterProvider struct {
 
 var _ Provider = (*OpenRouterProvider)(nil)
 
+// CreditStatus is the current OpenRouter credit balance returned by /key.
+type CreditStatus struct {
+	Credits float64
+}
+
+// CreditChecker is optionally implemented by providers that expose a
+// pre-request account balance. Digest orchestration uses it to avoid starting
+// an AI batch when the OpenRouter account is exhausted.
+type CreditChecker interface {
+	CheckCredits(context.Context) (CreditStatus, error)
+}
+
 type chatCompletionRequest struct {
 	Model       string    `json:"model"`
 	Messages    []Message `json:"messages"`
@@ -257,6 +269,68 @@ func (p *OpenRouterProvider) chatCompletionAttempt(ctx context.Context, messages
 		return "", 0, errors.New("OpenRouter response contained empty content")
 	}
 	return content, 0, nil
+}
+
+// CheckCredits reads the OpenRouter account balance from GET /key. A balance
+// lookup is deliberately separate from ChatCompletion so callers can perform
+// one check per digest window.
+func (p *OpenRouterProvider) CheckCredits(ctx context.Context) (CreditStatus, error) {
+	if p == nil {
+		return CreditStatus{}, errors.New("OpenRouter provider is nil")
+	}
+	if !strings.EqualFold(strings.TrimSpace(p.providerName), "OpenRouter") &&
+		strings.TrimRight(strings.TrimSpace(p.baseURL), "/") != DefaultOpenRouterBaseURL {
+		return CreditStatus{}, errors.New("credit check is not supported by this provider")
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, p.baseURL+"/key", nil)
+	if err != nil {
+		return CreditStatus{}, fmt.Errorf("create OpenRouter credit request: %w", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+p.apiKey)
+	response, err := p.httpClient.Do(request)
+	if err != nil {
+		return CreditStatus{}, p.sanitizeError(fmt.Errorf("OpenRouter credit request: %w", err))
+	}
+	defer response.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if err != nil {
+		return CreditStatus{}, fmt.Errorf("read OpenRouter credit response: %w", err)
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return CreditStatus{}, p.sanitizeError(&ProviderError{
+			StatusCode: response.StatusCode,
+			Provider:   p.providerName,
+			Message:    strings.TrimSpace(string(body)),
+		})
+	}
+
+	var payload struct {
+		Data struct {
+			Credits json.RawMessage `json:"credits"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return CreditStatus{}, fmt.Errorf("decode OpenRouter credit response: %w", err)
+	}
+	if len(payload.Data.Credits) == 0 || string(payload.Data.Credits) == "null" {
+		return CreditStatus{}, errors.New("OpenRouter credit response did not contain data.credits")
+	}
+	var credits float64
+	if err := json.Unmarshal(payload.Data.Credits, &credits); err != nil {
+		var text string
+		if textErr := json.Unmarshal(payload.Data.Credits, &text); textErr != nil {
+			return CreditStatus{}, fmt.Errorf("decode OpenRouter credits: %w", err)
+		}
+		credits, err = strconv.ParseFloat(strings.TrimSpace(text), 64)
+		if err != nil {
+			return CreditStatus{}, fmt.Errorf("decode OpenRouter credits: %w", err)
+		}
+	}
+	if credits < 0 {
+		return CreditStatus{}, fmt.Errorf("OpenRouter credits cannot be negative")
+	}
+	return CreditStatus{Credits: credits}, nil
 }
 
 // Summarize implements Provider using one batch chat completion request.

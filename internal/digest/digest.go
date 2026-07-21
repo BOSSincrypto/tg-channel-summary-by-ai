@@ -47,6 +47,10 @@ const (
 	OutcomeDeliveryFailed    = "delivery_failed"
 )
 
+// ErrDigestInProgress is returned when a scheduled or manual run already
+// owns the group's digest execution slot.
+var ErrDigestInProgress = errors.New("digest already in progress")
+
 // DeliveryReceipt contains Telegram metadata for a successfully delivered
 // digest message.
 type DeliveryReceipt struct {
@@ -70,6 +74,8 @@ type Service struct {
 	notifier           OwnerNotifier
 	delivery           Delivery
 	maxPostsPerChannel int
+	creditWarning      float64
+	creditMinimum      float64
 
 	notificationMu      sync.Mutex
 	notificationKeys    map[string]notificationKeyState
@@ -77,6 +83,8 @@ type Service struct {
 	// notificationWaitObserved is a deterministic test barrier for callers
 	// that observe an in-flight outage notification claim.
 	notificationWaitObserved chan struct{}
+	runMu                    sync.Mutex
+	runningGroups            map[int64]struct{}
 }
 
 // notificationKeyState tracks delivery-aware outage notification deduplication.
@@ -90,6 +98,11 @@ const (
 
 const defaultMaxPostsPerChannel = 50
 
+const (
+	defaultCreditWarningThreshold = 0.50
+	defaultCreditMinimumThreshold = 0.10
+)
+
 type aiFailureClass string
 
 const (
@@ -98,6 +111,7 @@ const (
 	aiFailurePermanent          aiFailureClass = "permanent"
 	aiFailureOpenRouterOutage   aiFailureClass = "openrouter_outage"
 	aiFailureProvider           aiFailureClass = "provider"
+	aiFailureCreditExhausted    aiFailureClass = "credit_exhausted"
 )
 
 // Option customizes digest candidate selection.
@@ -109,6 +123,17 @@ func WithMaxPostsPerChannel(limit int) Option {
 	return func(s *Service) {
 		if limit > 0 {
 			s.maxPostsPerChannel = limit
+		}
+	}
+}
+
+// WithCreditThresholds configures the OpenRouter pre-digest balance guard.
+// Invalid values retain the service defaults.
+func WithCreditThresholds(warning, minimum float64) Option {
+	return func(s *Service) {
+		if minimum >= 0 && warning >= minimum {
+			s.creditWarning = warning
+			s.creditMinimum = minimum
 		}
 	}
 }
@@ -132,6 +157,8 @@ func NewWithProcessor(database *db.DB, processor *parser.ChannelProcessor, optio
 		database:           database,
 		processor:          processor,
 		maxPostsPerChannel: defaultMaxPostsPerChannel,
+		creditWarning:      defaultCreditWarningThreshold,
+		creditMinimum:      defaultCreditMinimumThreshold,
 	}
 	for _, option := range options {
 		option(service)
@@ -164,6 +191,9 @@ func newWithProcessorAndAI(database *db.DB, processor *parser.ChannelProcessor, 
 		providerHTTPClient: client,
 		notifier:           notifier,
 		maxPostsPerChannel: defaultMaxPostsPerChannel,
+		creditWarning:      defaultCreditWarningThreshold,
+		creditMinimum:      defaultCreditMinimumThreshold,
+		runningGroups:      make(map[int64]struct{}),
 	}
 }
 
@@ -227,6 +257,22 @@ func (s *Service) GenerateWithWindow(groupID int64, windowID string) (*Digest, e
 }
 
 func (s *Service) generate(groupID int64, windowID string, manual bool) (*Digest, error) {
+	if !s.tryStartGroup(groupID) {
+		return nil, ErrDigestInProgress
+	}
+	defer s.finishGroup(groupID)
+
+	if s.delivery != nil && s.database != nil && s.database.Digests != nil {
+		if err := s.resumePendingLocked(groupID); err != nil {
+			result := &Digest{
+				GroupID: groupID, Outcome: OutcomeDeliveryFailed,
+				Message: safeDigestMessage(err),
+			}
+			s.notifyDigestOutcome(result)
+			return result, terminalDigestError(result, err, manual)
+		}
+	}
+
 	batch, err := s.FetchAndStore(groupID)
 	if err != nil {
 		return nil, err
@@ -241,6 +287,41 @@ func (s *Service) generate(groupID int64, windowID string, manual bool) (*Digest
 		WindowID: windowID, FailedChannels: failedChannelNames(batch),
 		FailureDetails: failedChannelDetails(batch),
 	}
+	if len(batch.Results) == 0 && len(batch.Failures) == 0 {
+		// A group with no configured (enabled) channels is a configuration
+		// error, not an empty-posts informational result. Keep the existing
+		// terminal outcome vocabulary for WebApp clients, but use an
+		// actionable message and never invoke AI.
+		result.Outcome = OutcomeNoPosts
+		result.Message = fmt.Sprintf(
+			"⚠️ Группа «%s»: не настроены каналы для дайджеста. Добавьте каналы в настройках.",
+			s.groupTitle(groupID),
+		)
+		result.Text = result.Message
+		if s.delivery != nil {
+			pendingID, checkpointErr := s.database.Digests.CreatePending(groupID, result.Text, nil)
+			if checkpointErr != nil {
+				result.Outcome = OutcomeDeliveryFailed
+				result.Message = safeDigestMessage(checkpointErr)
+				s.notifyDigestOutcome(result)
+				return result, terminalDigestError(result, checkpointErr, manual)
+			}
+			receipt, deliveryErr := s.delivery.Deliver(context.Background(), groupID, result)
+			if deliveryErr != nil {
+				result.Outcome = OutcomeDeliveryFailed
+				result.Message = safeDigestMessage(deliveryErr)
+				s.notifyDigestOutcome(result)
+				return result, terminalDigestError(result, deliveryErr, manual)
+			}
+			result.MessageID = optionalInt64(receipt.MessageID)
+			result.MessageURL = receipt.MessageURL
+			result.Delivered = true
+			if markErr := s.database.Digests.MarkSent(pendingID, receipt.MessageID); markErr != nil {
+				log.Printf("configuration warning %d delivered but checkpoint remains pending: %v", pendingID, markErr)
+			}
+		}
+		return result, terminalDigestError(result, nil, manual)
+	}
 	if len(batch.Results) == 0 && len(batch.Failures) > 0 {
 		result.Outcome = OutcomeAllChannelsFailed
 		result.Message = "Не удалось собрать посты. Все каналы недоступны."
@@ -253,6 +334,29 @@ func (s *Service) generate(groupID int64, windowID string, manual bool) (*Digest
 		if len(batch.Failures) > 0 {
 			result.Message = "Нет новых постов для дайджеста. Часть каналов недоступна."
 			s.notifyDigestOutcome(result)
+		} else if s.emptyDigestBehavior(groupID) == model.EmptyDigestSendMessage && s.delivery != nil {
+			result.Message = "За сегодня нет новых постов"
+			result.Text = result.Message
+			pendingID, checkpointErr := s.database.Digests.CreatePending(groupID, result.Text, nil)
+			if checkpointErr != nil {
+				result.Outcome = OutcomeDeliveryFailed
+				result.Message = safeDigestMessage(checkpointErr)
+				s.notifyDigestOutcome(result)
+				return result, terminalDigestError(result, checkpointErr, manual)
+			}
+			receipt, deliveryErr := s.delivery.Deliver(context.Background(), groupID, result)
+			if deliveryErr != nil {
+				result.Outcome = OutcomeDeliveryFailed
+				result.Message = safeDigestMessage(deliveryErr)
+				s.notifyDigestOutcome(result)
+				return result, terminalDigestError(result, deliveryErr, manual)
+			}
+			result.MessageID = optionalInt64(receipt.MessageID)
+			result.MessageURL = receipt.MessageURL
+			result.Delivered = true
+			if markErr := s.database.Digests.MarkSent(pendingID, receipt.MessageID); markErr != nil {
+				log.Printf("empty digest %d delivered but checkpoint remains pending: %v", pendingID, markErr)
+			}
 		}
 		return result, terminalDigestError(result, nil, manual)
 	}
@@ -265,6 +369,13 @@ func (s *Service) generate(groupID int64, windowID string, manual bool) (*Digest
 	result.SummariesSaved = true
 	result.Text = s.formatDigestMessage(groupID, posts)
 	if s.delivery != nil {
+		pendingID, err := s.database.Digests.CreatePending(groupID, result.Text, posts)
+		if err != nil {
+			result.Outcome = OutcomeDeliveryFailed
+			result.Message = safeDigestMessage(err)
+			s.notifyDigestOutcome(result)
+			return result, terminalDigestError(result, err, manual)
+		}
 		receipt, err := s.delivery.Deliver(context.Background(), groupID, result)
 		if err != nil {
 			result.Outcome = OutcomeDeliveryFailed
@@ -275,6 +386,11 @@ func (s *Service) generate(groupID int64, windowID string, manual bool) (*Digest
 		result.MessageID = optionalInt64(receipt.MessageID)
 		result.MessageURL = receipt.MessageURL
 		result.Delivered = true
+		if err := s.database.Digests.MarkSent(pendingID, receipt.MessageID); err != nil {
+			// The send succeeded and the pending row remains durable, so a
+			// restart can reconcile it instead of losing the checkpoint.
+			log.Printf("digest %d delivered but checkpoint remains pending: %v", pendingID, err)
+		}
 	}
 	if len(batch.Failures) > 0 {
 		result.Outcome = OutcomePartial
@@ -285,6 +401,74 @@ func (s *Service) generate(groupID int64, windowID string, manual bool) (*Digest
 		result.Message = "Дайджест отправлен."
 	}
 	return result, nil
+}
+
+func (s *Service) tryStartGroup(groupID int64) bool {
+	s.runMu.Lock()
+	defer s.runMu.Unlock()
+	if s.runningGroups == nil {
+		s.runningGroups = make(map[int64]struct{})
+	}
+	if _, exists := s.runningGroups[groupID]; exists {
+		return false
+	}
+	s.runningGroups[groupID] = struct{}{}
+	return true
+}
+
+func (s *Service) finishGroup(groupID int64) {
+	s.runMu.Lock()
+	delete(s.runningGroups, groupID)
+	s.runMu.Unlock()
+}
+
+func (s *Service) emptyDigestBehavior(groupID int64) string {
+	if s == nil || s.database == nil || s.database.Groups == nil {
+		return model.EmptyDigestSendMessage
+	}
+	settings, err := s.database.Groups.GetGroupSettings(groupID)
+	if err != nil {
+		return model.EmptyDigestSendMessage
+	}
+	if settings.EmptyDigestBehavior == model.EmptyDigestSilent {
+		return model.EmptyDigestSilent
+	}
+	return model.EmptyDigestSendMessage
+}
+
+// ResumePending retries durable digest sends after a process restart. The
+// summaries and exact rendered message are already persisted, so no parser or
+// AI work is repeated.
+func (s *Service) ResumePending(groupID int64) error {
+	if s == nil || s.database == nil || s.database.Digests == nil || s.delivery == nil {
+		return errors.New("resume pending: digest delivery is not configured")
+	}
+	if !s.tryStartGroup(groupID) {
+		return ErrDigestInProgress
+	}
+	defer s.finishGroup(groupID)
+	return s.resumePendingLocked(groupID)
+}
+
+func (s *Service) resumePendingLocked(groupID int64) error {
+	pending, err := s.database.Digests.ListPendingByGroup(groupID)
+	if err != nil {
+		return fmt.Errorf("resume pending: list group %d: %w", groupID, err)
+	}
+	for _, item := range pending {
+		result := &Digest{
+			GroupID: groupID, PostCount: item.PostCount, Text: item.MessageText,
+			Outcome: OutcomeDeliveryFailed, Message: "Повторная отправка дайджеста.",
+		}
+		receipt, deliverErr := s.delivery.Deliver(context.Background(), groupID, result)
+		if deliverErr != nil {
+			return fmt.Errorf("resume pending digest %d: %w", item.ID, deliverErr)
+		}
+		if err := s.database.Digests.MarkSent(item.ID, receipt.MessageID); err != nil {
+			return fmt.Errorf("resume pending digest %d checkpoint: %w", item.ID, err)
+		}
+	}
+	return nil
 }
 
 func (s *Service) notifyDigestOutcome(result *Digest) {
@@ -464,6 +648,23 @@ func (s *Service) summarizeWithWindow(groupID int64, posts []model.Post, windowI
 	}
 	summaryContext, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+	if checker, ok := provider.(summarizer.CreditChecker); ok {
+		credits, creditErr := checker.CheckCredits(summaryContext)
+		if creditErr != nil {
+			// The balance endpoint is auxiliary. If it is unavailable, let
+			// the completion request decide whether the provider is usable.
+			log.Printf("OpenRouter credit check failed for group %d: %v", groupID, creditErr)
+		} else if credits.Credits < s.creditMinimumOrDefault() {
+			err := fmt.Errorf("OpenRouter credits exhausted: %.2f", credits.Credits)
+			s.notifyAIFailureForWindow(windowID, groupID, err)
+			return fmt.Errorf("summarize group %d: %w", groupID, err)
+		} else if credits.Credits < s.creditWarningOrDefault() {
+			_ = s.notifyAI(groupID, fmt.Sprintf(
+				"⚠️ Баланс OpenRouter низкий: $%.2f. Пополните баланс для продолжения работы.",
+				credits.Credits,
+			))
+		}
+	}
 	summaries, err := provider.Summarize(summaryContext, input)
 	if err != nil {
 		s.notifyAIFailureForWindow(windowID, groupID, err)
@@ -663,6 +864,10 @@ func classifyAIFailure(err error) aiFailureClass {
 		return aiFailureProvider
 	}
 	lower := strings.ToLower(err.Error())
+	if strings.Contains(lower, "credits exhausted") ||
+		strings.Contains(lower, "баланс openrouter исчерпан") {
+		return aiFailureCreditExhausted
+	}
 	if strings.Contains(lower, "parse summaries") ||
 		strings.Contains(lower, "expected json") ||
 		strings.Contains(lower, "summary response") ||
@@ -716,9 +921,25 @@ func formatAIFailure(class aiFailureClass, group string, err error) string {
 		return fmt.Sprintf("Временная ошибка AI для группы «%s» (%s) не устранена после повторных попыток; дайджест пропущен, повторите запуск позже.", group, providerStatusDetail(err))
 	case aiFailurePermanent:
 		return fmt.Sprintf("Ошибка AI провайдера для группы «%s» (%s). Дайджест пропущен; проверьте API ключ, доступ и баланс.", group, safeProviderStatus(err))
+	case aiFailureCreditExhausted:
+		return fmt.Sprintf("Баланс OpenRouter исчерпан для группы «%s» (%s). Дайджест пропущен; пополните баланс и повторите запуск.", group, providerStatusDetail(err))
 	default:
 		return fmt.Sprintf("Ошибка AI провайдера для группы «%s»; дайджест пропущен. Проверьте настройки провайдера и повторите запуск.", group)
 	}
+}
+
+func (s *Service) creditWarningOrDefault() float64 {
+	if s == nil || s.creditWarning <= 0 {
+		return defaultCreditWarningThreshold
+	}
+	return s.creditWarning
+}
+
+func (s *Service) creditMinimumOrDefault() float64 {
+	if s == nil || s.creditMinimum < 0 {
+		return defaultCreditMinimumThreshold
+	}
+	return s.creditMinimum
 }
 
 func safeProviderStatus(err error) string {

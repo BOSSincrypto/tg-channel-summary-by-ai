@@ -19,8 +19,8 @@ func (r *DigestRepository) Insert(d *model.Digest) (int64, error) {
 		msgID = *d.MessageID
 	}
 	result, err := r.db.Conn().Exec(
-		`INSERT INTO digests (group_id, message_id, post_count) VALUES (?, ?, ?)`,
-		d.GroupID, msgID, d.PostCount,
+		`INSERT INTO digests (group_id, message_id, post_count, status, message_text) VALUES (?, ?, ?, ?, ?)`,
+		d.GroupID, msgID, d.PostCount, normalizedDigestStatus(d.Status), d.MessageText,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("insert digest: %w", err)
@@ -32,14 +32,97 @@ func (r *DigestRepository) Insert(d *model.Digest) (int64, error) {
 	return id, nil
 }
 
+// CreatePending stores a durable digest checkpoint before the irreversible
+// Telegram send. Its post links and exact rendered text allow startup
+// recovery to resume delivery without re-running parsing or AI.
+func (r *DigestRepository) CreatePending(groupID int64, text string, posts []model.Post) (int64, error) {
+	if groupID <= 0 {
+		return 0, fmt.Errorf("create pending digest: group ID must be positive")
+	}
+	tx, err := r.db.Conn().Begin()
+	if err != nil {
+		return 0, fmt.Errorf("begin pending digest: %w", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(
+		`INSERT INTO digests (group_id, post_count, status, message_text) VALUES (?, ?, 'pending', ?)`,
+		groupID, len(posts), text,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("insert pending digest: %w", err)
+	}
+	digestID, err := result.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("pending digest last insert id: %w", err)
+	}
+	for _, post := range posts {
+		if _, err := tx.Exec(
+			`INSERT INTO digest_posts (digest_id, post_id) VALUES (?, ?)`,
+			digestID, post.ID,
+		); err != nil {
+			return 0, fmt.Errorf("link pending digest post %d: %w", post.ID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit pending digest: %w", err)
+	}
+	return digestID, nil
+}
+
+// MarkSent finalizes a pending digest after Telegram confirms delivery.
+func (r *DigestRepository) MarkSent(id, messageID int64) error {
+	result, err := r.db.Conn().Exec(
+		`UPDATE digests SET message_id = ?, status = 'sent' WHERE id = ? AND status = 'pending'`,
+		messageID, id,
+	)
+	if err != nil {
+		return fmt.Errorf("mark digest sent: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("mark digest sent rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ListPendingByGroup returns durable digest sends that must be retried after
+// a process crash.
+func (r *DigestRepository) ListPendingByGroup(groupID int64) ([]model.Digest, error) {
+	rows, err := r.db.Conn().Query(
+		`SELECT id, group_id, sent_at, message_id, post_count, status, message_text
+		 FROM digests WHERE group_id = ? AND status = 'pending'
+		 ORDER BY id ASC`, groupID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list pending digests: %w", err)
+	}
+	defer rows.Close()
+	var digests []model.Digest
+	for rows.Next() {
+		var d model.Digest
+		var msgID sql.NullInt64
+		if err := rows.Scan(&d.ID, &d.GroupID, &d.SentAt, &msgID, &d.PostCount, &d.Status, &d.MessageText); err != nil {
+			return nil, fmt.Errorf("scan pending digest: %w", err)
+		}
+		if msgID.Valid {
+			d.MessageID = &msgID.Int64
+		}
+		digests = append(digests, d)
+	}
+	return digests, rows.Err()
+}
+
 // GetByID returns a digest by its ID.
 func (r *DigestRepository) GetByID(id int64) (*model.Digest, error) {
 	d := &model.Digest{}
 	var msgID sql.NullInt64
 	err := r.db.Conn().QueryRow(
-		`SELECT id, group_id, sent_at, message_id, post_count
+		`SELECT id, group_id, sent_at, message_id, post_count, status, message_text
 		 FROM digests WHERE id = ?`, id,
-	).Scan(&d.ID, &d.GroupID, &d.SentAt, &msgID, &d.PostCount)
+	).Scan(&d.ID, &d.GroupID, &d.SentAt, &msgID, &d.PostCount, &d.Status, &d.MessageText)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -56,7 +139,7 @@ func (r *DigestRepository) GetByID(id int64) (*model.Digest, error) {
 // limited to the given count.
 func (r *DigestRepository) ListByGroup(groupID int64, limit int) ([]model.Digest, error) {
 	rows, err := r.db.Conn().Query(
-		`SELECT id, group_id, sent_at, message_id, post_count
+		`SELECT id, group_id, sent_at, message_id, post_count, status, message_text
 		 FROM digests WHERE group_id = ?
 		 ORDER BY sent_at DESC LIMIT ?`,
 		groupID, limit,
@@ -70,7 +153,7 @@ func (r *DigestRepository) ListByGroup(groupID int64, limit int) ([]model.Digest
 	for rows.Next() {
 		var d model.Digest
 		var msgID sql.NullInt64
-		if err := rows.Scan(&d.ID, &d.GroupID, &d.SentAt, &msgID, &d.PostCount); err != nil {
+		if err := rows.Scan(&d.ID, &d.GroupID, &d.SentAt, &msgID, &d.PostCount, &d.Status, &d.MessageText); err != nil {
 			return nil, fmt.Errorf("scan digest: %w", err)
 		}
 		if msgID.Valid {
@@ -152,4 +235,11 @@ func (r *DigestRepository) DeleteOlderThan(days int) (int64, error) {
 	}
 	n, _ := result.RowsAffected()
 	return n, nil
+}
+
+func normalizedDigestStatus(status string) string {
+	if status == "pending" || status == "failed" {
+		return status
+	}
+	return "sent"
 }

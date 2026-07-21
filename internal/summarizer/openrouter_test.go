@@ -64,6 +64,45 @@ func TestOpenRouterProviderChatCompletion(t *testing.T) {
 	}
 }
 
+func TestOpenRouterProviderCheckCreditsReadsNumericAndStringBalances(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want float64
+	}{
+		{name: "numeric", body: `{"data":{"credits":0.42}}`, want: 0.42},
+		{name: "string", body: `{"data":{"credits":"0.07"}}`, want: 0.07},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet || r.URL.Path != "/api/v1/key" {
+					t.Fatalf("request = %s %s, want GET /api/v1/key", r.Method, r.URL.Path)
+				}
+				if got := r.Header.Get("Authorization"); got != "Bearer test-key" {
+					t.Fatalf("authorization = %q, want Bearer test-key", got)
+				}
+				_, _ = w.Write([]byte(test.body))
+			}))
+			defer server.Close()
+			provider, err := NewOpenRouterWithConfig(OpenRouterConfig{
+				BaseURL: server.URL + "/api/v1", APIKey: "test-key",
+				Model: "test-model", HTTPClient: server.Client(), AllowPrivateHosts: true,
+			})
+			if err != nil {
+				t.Fatalf("create provider: %v", err)
+			}
+			status, err := provider.CheckCredits(context.Background())
+			if err != nil {
+				t.Fatalf("check credits: %v", err)
+			}
+			if status.Credits != test.want {
+				t.Fatalf("credits = %v, want %v", status.Credits, test.want)
+			}
+		})
+	}
+}
+
 func TestOpenRouterProviderSummarizeParsesBatchResponse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

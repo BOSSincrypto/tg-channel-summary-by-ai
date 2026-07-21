@@ -843,15 +843,16 @@ func (r *GroupRepository) CountChannelsForGroup(groupID int64) (int, error) {
 func (r *GroupRepository) GetGroupSettings(groupID int64) (*model.GroupSettings, error) {
 	gs := &model.GroupSettings{GroupID: groupID}
 	var providerID sql.NullInt64
-	var model sql.NullString
+	var modelValue sql.NullString
 	err := r.db.Conn().QueryRow(
-		`SELECT group_id, provider_id, model, digest_time, timezone
+		`SELECT group_id, provider_id, model, digest_time, timezone, empty_digest_behavior
 		 FROM group_settings WHERE group_id = ?`, groupID,
-	).Scan(&gs.GroupID, &providerID, &model, &gs.DigestTime, &gs.Timezone)
+	).Scan(&gs.GroupID, &providerID, &modelValue, &gs.DigestTime, &gs.Timezone, &gs.EmptyDigestBehavior)
 	if err == sql.ErrNoRows {
 		// Return defaults if no settings row exists
 		gs.DigestTime = "21:00"
 		gs.Timezone = "Europe/Moscow"
+		gs.EmptyDigestBehavior = model.EmptyDigestSendMessage
 		return gs, nil
 	}
 	if err != nil {
@@ -860,9 +861,10 @@ func (r *GroupRepository) GetGroupSettings(groupID int64) (*model.GroupSettings,
 	if providerID.Valid {
 		gs.ProviderID = &providerID.Int64
 	}
-	if model.Valid {
-		gs.Model = &model.String
+	if modelValue.Valid {
+		gs.Model = &modelValue.String
 	}
+	gs.EmptyDigestBehavior = normalizeEmptyDigestBehavior(gs.EmptyDigestBehavior)
 	return gs, nil
 }
 
@@ -925,19 +927,28 @@ func (r *GroupRepository) UpdateGroupSettings(gs *model.GroupSettings) error {
 		modelVal = *gs.Model
 	}
 	_, err := r.db.Conn().Exec(
-		`INSERT INTO group_settings (group_id, provider_id, model, digest_time, timezone)
-		 VALUES (?, ?, ?, ?, ?)
+		`INSERT INTO group_settings (group_id, provider_id, model, digest_time, timezone, empty_digest_behavior)
+		 VALUES (?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(group_id) DO UPDATE SET
 		   provider_id = excluded.provider_id,
 		   model = excluded.model,
 		   digest_time = excluded.digest_time,
-		   timezone = excluded.timezone`,
+		   timezone = excluded.timezone,
+		   empty_digest_behavior = excluded.empty_digest_behavior`,
 		gs.GroupID, providerID, modelVal, gs.DigestTime, gs.Timezone,
+		normalizeEmptyDigestBehavior(gs.EmptyDigestBehavior),
 	)
 	if err != nil {
 		return fmt.Errorf("update group settings: %w", err)
 	}
 	return nil
+}
+
+func normalizeEmptyDigestBehavior(behavior string) string {
+	if behavior == model.EmptyDigestSilent {
+		return model.EmptyDigestSilent
+	}
+	return model.EmptyDigestSendMessage
 }
 
 func normalizedGroupStatus(status string) string {

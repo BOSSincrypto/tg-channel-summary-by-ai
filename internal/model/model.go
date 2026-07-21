@@ -83,12 +83,18 @@ const (
 
 // GroupSettings holds per-group AI and scheduling configuration.
 type GroupSettings struct {
-	GroupID    int64
-	ProviderID *int64  // nil if using default provider
-	Model      *string // nil if using provider's default model
-	DigestTime string  // HH:MM format
-	Timezone   string  // e.g. Europe/Moscow
+	GroupID             int64
+	ProviderID          *int64  // nil if using default provider
+	Model               *string // nil if using provider's default model
+	DigestTime          string  // HH:MM format
+	Timezone            string  // e.g. Europe/Moscow
+	EmptyDigestBehavior string  // send_message or silent
 }
+
+const (
+	EmptyDigestSendMessage = "send_message"
+	EmptyDigestSilent      = "silent"
+)
 
 // Post represents a parsed post from a Telegram channel.
 type Post struct {
@@ -106,11 +112,13 @@ type Post struct {
 
 // Digest represents a sent digest in a group.
 type Digest struct {
-	ID        int64
-	GroupID   int64
-	SentAt    string
-	MessageID *int64 // nil if not yet sent
-	PostCount int
+	ID          int64
+	GroupID     int64
+	SentAt      string
+	MessageID   *int64 // nil if not yet sent
+	PostCount   int
+	Status      string
+	MessageText string
 }
 
 // DigestPost links posts to a digest (many-to-many).

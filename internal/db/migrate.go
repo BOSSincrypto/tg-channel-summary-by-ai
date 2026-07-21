@@ -19,6 +19,15 @@ func runMigrations(conn *sql.DB) error {
 	if err := ensureGroupStatusColumn(conn); err != nil {
 		return fmt.Errorf("migrate group status: %w", err)
 	}
+	if err := ensureGroupSettingsEmptyDigestColumn(conn); err != nil {
+		return fmt.Errorf("migrate empty digest behavior: %w", err)
+	}
+	if err := ensureDigestStatusColumn(conn); err != nil {
+		return fmt.Errorf("migrate digest status: %w", err)
+	}
+	if err := ensureDigestMessageTextColumn(conn); err != nil {
+		return fmt.Errorf("migrate digest message text: %w", err)
+	}
 	if err := ensureVersionColumns(conn); err != nil {
 		return fmt.Errorf("migrate optimistic locking versions: %w", err)
 	}
@@ -33,6 +42,96 @@ func runMigrations(conn *sql.DB) error {
 	}
 	if err := ensureForumTopicRecoveryIdentity(conn); err != nil {
 		return fmt.Errorf("migrate forum topic recovery identity: %w", err)
+	}
+	return nil
+}
+
+func ensureGroupSettingsEmptyDigestColumn(conn *sql.DB) error {
+	rows, err := conn.Query("PRAGMA table_info(group_settings)")
+	if err != nil {
+		return fmt.Errorf("inspect group_settings table: %w", err)
+	}
+	defer rows.Close()
+
+	hasColumn := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return fmt.Errorf("scan group_settings column: %w", err)
+		}
+		if name == "empty_digest_behavior" {
+			hasColumn = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate group_settings columns: %w", err)
+	}
+	if !hasColumn {
+		if _, err := conn.Exec(`ALTER TABLE group_settings ADD COLUMN empty_digest_behavior TEXT NOT NULL DEFAULT 'send_message'`); err != nil {
+			return fmt.Errorf("add empty_digest_behavior: %w", err)
+		}
+	}
+	return nil
+}
+
+func ensureDigestStatusColumn(conn *sql.DB) error {
+	rows, err := conn.Query("PRAGMA table_info(digests)")
+	if err != nil {
+		return fmt.Errorf("inspect digests table: %w", err)
+	}
+	defer rows.Close()
+
+	hasColumn := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return fmt.Errorf("scan digests column: %w", err)
+		}
+		if name == "status" {
+			hasColumn = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate digests columns: %w", err)
+	}
+	if !hasColumn {
+		if _, err := conn.Exec(`ALTER TABLE digests ADD COLUMN status TEXT NOT NULL DEFAULT 'sent'`); err != nil {
+			return fmt.Errorf("add digests status: %w", err)
+		}
+	}
+	return nil
+}
+
+func ensureDigestMessageTextColumn(conn *sql.DB) error {
+	rows, err := conn.Query("PRAGMA table_info(digests)")
+	if err != nil {
+		return fmt.Errorf("inspect digests table: %w", err)
+	}
+	defer rows.Close()
+
+	hasColumn := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return fmt.Errorf("scan digests column: %w", err)
+		}
+		if name == "message_text" {
+			hasColumn = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate digests columns: %w", err)
+	}
+	if !hasColumn {
+		if _, err := conn.Exec(`ALTER TABLE digests ADD COLUMN message_text TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("add digests message text: %w", err)
+		}
 	}
 	return nil
 }
@@ -365,7 +464,8 @@ var migrations = []string{
 		provider_id INTEGER REFERENCES ai_providers(id) ON DELETE SET NULL,
 		model TEXT,
 		digest_time TEXT DEFAULT '21:00',
-		timezone TEXT DEFAULT 'Europe/Moscow'
+		timezone TEXT DEFAULT 'Europe/Moscow',
+		empty_digest_behavior TEXT NOT NULL DEFAULT 'send_message'
 	)`,
 
 	// --------------------------------------------------
@@ -393,7 +493,9 @@ var migrations = []string{
 		group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
 		sent_at TEXT DEFAULT (datetime('now')),
 		message_id INTEGER,
-		post_count INTEGER DEFAULT 0
+		post_count INTEGER DEFAULT 0,
+		status TEXT NOT NULL DEFAULT 'sent',
+		message_text TEXT NOT NULL DEFAULT ''
 	)`,
 
 	// --------------------------------------------------

@@ -306,6 +306,79 @@ func TestGenerateUsesEffectiveGroupAIProviderAndModel(t *testing.T) {
 	}
 }
 
+func TestGenerateSkipsOpenRouterWhenCreditsAreExhausted(t *testing.T) {
+	parserServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`<div class="tgme_widget_message" data-post="credit_channel/1"><div class="tgme_widget_message_text">пост для проверки баланса</div><time datetime="2099-07-15T18:30:00Z"></time></div>`))
+	}))
+	defer parserServer.Close()
+
+	var completionCalls int32
+	providerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/key" {
+			atomic.AddInt32(&completionCalls, 1)
+			http.Error(w, "unexpected completion request", http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":{"credits":0.05}}`))
+	}))
+	defer providerServer.Close()
+
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer database.Close()
+	providerID, err := database.Providers.Insert(&model.AIProvider{
+		Name: "OpenRouter", BaseURL: providerServer.URL, APIKey: "credit-key",
+		DefaultModel: "credit-model", IsDefault: true,
+	})
+	if err != nil {
+		t.Fatalf("insert provider: %v", err)
+	}
+	channelID, err := database.Channels.Insert(&model.Channel{Username: "credit_channel", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	groupID, err := database.Groups.Insert(&model.Group{TelegramChatID: -1006, Title: "Credit group"})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	if err := database.Groups.AssignChannel(groupID, channelID, nil); err != nil {
+		t.Fatalf("assign channel: %v", err)
+	}
+	if err := database.Groups.UpdateGroupSettings(&model.GroupSettings{
+		GroupID: groupID, ProviderID: &providerID, DigestTime: "21:00", Timezone: "UTC",
+	}); err != nil {
+		t.Fatalf("update group settings: %v", err)
+	}
+
+	fetcher := parser.NewWithOptions(parser.Options{Client: parserServer.Client(), BaseURL: parserServer.URL})
+	processor := parser.NewChannelProcessor(fetcher, parser.NewPostStorage(database.Channels, database.Posts))
+	notifier := &recordingDigestNotifier{}
+	service := NewWithProcessorAndAIForTesting(database, processor, database.Groups, providerServer.Client(), notifier)
+
+	result, err := service.GenerateManualResult(groupID)
+	if err != nil {
+		t.Fatalf("manual exhausted-credit result: %v", err)
+	}
+	if result == nil || result.Outcome != OutcomeAIFailed {
+		t.Fatalf("result = %+v, want ai_failed outcome", result)
+	}
+	if atomic.LoadInt32(&completionCalls) != 0 {
+		t.Fatalf("completion calls = %d, want zero after credit guard", completionCalls)
+	}
+	if len(notifier.messages) != 1 || !strings.Contains(notifier.messages[0], "Баланс OpenRouter исчерпан") {
+		t.Fatalf("notifications = %v, want one exhausted-credit alert", notifier.messages)
+	}
+	post, err := database.Posts.GetByChannelAndMessageID(channelID, 1)
+	if err != nil {
+		t.Fatalf("get unsummarized post: %v", err)
+	}
+	if post.Summary != nil {
+		t.Fatalf("post summary = %v, want unsummarized for later retry", post.Summary)
+	}
+}
+
 func TestGenerateAIParseFailureNotifiesOnceAndPreservesPosts(t *testing.T) {
 	database, groupID, postID := newDigestFailureFixture(t)
 	notifier := &recordingDigestNotifier{}
@@ -1251,6 +1324,7 @@ func TestGenerateManualResultExposesAllTerminalOutcomes(t *testing.T) {
 		errs            map[string]error
 		provider        summarizer.Provider
 		delivery        Delivery
+		emptyBehavior   string
 		wantOutcome     string
 		wantPostCount   int
 		wantFailedCount int
@@ -1267,7 +1341,7 @@ func TestGenerateManualResultExposesAllTerminalOutcomes(t *testing.T) {
 			name: "no posts", channels: []string{"empty"},
 			posts:    map[string][]parser.ParsedPost{"empty": {}},
 			provider: successfulDigestProvider{}, delivery: outcomeDelivery{},
-			wantOutcome: OutcomeNoPosts,
+			emptyBehavior: "silent", wantOutcome: OutcomeNoPosts,
 		},
 		{
 			name: "partial", channels: []string{"ok", "broken"},
@@ -1314,6 +1388,14 @@ func TestGenerateManualResultExposesAllTerminalOutcomes(t *testing.T) {
 				}
 				if assignErr := database.Groups.AssignChannel(groupID, channelID, nil); assignErr != nil {
 					t.Fatalf("assign channel: %v", assignErr)
+				}
+			}
+			if test.emptyBehavior != "" {
+				if err := database.Groups.UpdateGroupSettings(&model.GroupSettings{
+					GroupID: groupID, DigestTime: "21:00", Timezone: "UTC",
+					EmptyDigestBehavior: test.emptyBehavior,
+				}); err != nil {
+					t.Fatalf("configure empty digest behavior: %v", err)
 				}
 			}
 			processor := parser.NewChannelProcessor(

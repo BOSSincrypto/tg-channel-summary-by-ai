@@ -25,6 +25,10 @@ type windowedDigestRunner interface {
 	GenerateWithWindow(groupID int64, windowID string) (*digest.Digest, error)
 }
 
+type pendingDigestRunner interface {
+	ResumePending(groupID int64) error
+}
+
 // ErrStaleSettingsRefresh reports that a prepared scheduler plan was created
 // against a live registration set that changed before it was applied.
 var ErrStaleSettingsRefresh = errors.New("settings refresh plan is stale")
@@ -150,7 +154,9 @@ type Scheduler struct {
 	engine cronEngine
 
 	mu                 sync.Mutex
-	lifecycleMu        sync.Mutex
+	lifecycleMu        sync.RWMutex
+	groupLocksMu       sync.Mutex
+	groupLocks         map[int64]*sync.Mutex
 	started            bool
 	generation         uint64
 	jobIDs             map[int64]cron.EntryID
@@ -196,13 +202,14 @@ type SettingsRefreshPlan struct {
 // New creates a scheduler that can register production digest jobs.
 func New(runner DigestRunner, options ...Option) *Scheduler {
 	s := &Scheduler{
-		runner:   runner,
-		engine:   newRealCronEngine(),
-		jobIDs:   make(map[int64]cron.EntryID),
-		jobSpecs: make(map[int64]string),
-		windows:  make(map[string]*scheduledWindow),
-		nowFunc:  time.Now,
-		lastFire: make(map[int64]fireRecord),
+		runner:     runner,
+		engine:     newRealCronEngine(),
+		jobIDs:     make(map[int64]cron.EntryID),
+		jobSpecs:   make(map[int64]string),
+		windows:    make(map[string]*scheduledWindow),
+		nowFunc:    time.Now,
+		lastFire:   make(map[int64]fireRecord),
+		groupLocks: make(map[int64]*sync.Mutex),
 	}
 	for _, option := range options {
 		option(s)
@@ -287,6 +294,45 @@ func (s *Scheduler) WithLifecycle(fn func() error) error {
 			s.lifecycleAfter()
 		}
 		s.lifecycleMu.Unlock()
+	}()
+	return fn()
+}
+
+// WithGroupLifecycle serializes one group's digest execution with mutations
+// that affect that same group, while allowing different groups to run
+// concurrently. The read lock keeps full scheduler refreshes and shutdown
+// operations from racing an in-flight digest.
+func (s *Scheduler) WithGroupLifecycle(groupID int64, fn func() error) error {
+	if s == nil {
+		return errors.New("group lifecycle: scheduler is not configured")
+	}
+	if groupID <= 0 {
+		return errors.New("group lifecycle: group ID must be positive")
+	}
+	if fn == nil {
+		return errors.New("group lifecycle: callback is required")
+	}
+	s.lifecycleMu.RLock()
+	s.groupLocksMu.Lock()
+	if s.groupLocks == nil {
+		s.groupLocks = make(map[int64]*sync.Mutex)
+	}
+	lock := s.groupLocks[groupID]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		s.groupLocks[groupID] = lock
+	}
+	s.groupLocksMu.Unlock()
+	lock.Lock()
+	if s.lifecycleBefore != nil {
+		s.lifecycleBefore()
+	}
+	defer func() {
+		if s.lifecycleAfter != nil {
+			s.lifecycleAfter()
+		}
+		lock.Unlock()
+		s.lifecycleMu.RUnlock()
 	}()
 	return fn()
 }
@@ -703,7 +749,7 @@ func (s *Scheduler) RunGroupWithWindow(groupID int64, windowID string) (*digest.
 		result *digest.Digest
 		err    error
 	)
-	if lifecycleErr := s.WithLifecycle(func() error {
+	if lifecycleErr := s.WithGroupLifecycle(groupID, func() error {
 		result, err = s.runGroupWithWindow(groupID, windowID)
 		return err
 	}); lifecycleErr != nil {
@@ -802,6 +848,11 @@ func (s *Scheduler) CatchUp() error {
 // time, checks the digest history for a corresponding digest, and fires a
 // catch-up run if the schedule was missed.
 func (s *Scheduler) catchUpGroup(group model.Group, settings *model.GroupSettings, now time.Time, history DigestHistory) error {
+	if runner, ok := s.runner.(pendingDigestRunner); ok {
+		if err := runner.ResumePending(group.ID); err != nil {
+			return fmt.Errorf("resume pending digest for group %d: %w", group.ID, err)
+		}
+	}
 	loc, err := time.LoadLocation(strings.TrimSpace(settings.Timezone))
 	if err != nil {
 		return fmt.Errorf("load timezone %q: %w", settings.Timezone, err)

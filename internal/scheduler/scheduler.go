@@ -232,6 +232,11 @@ func (s *Scheduler) now() time.Time {
 // occurrence so exactly one digest is delivered per ambiguous hour.
 func (s *Scheduler) groupJobFunc(groupID int64, spec string, groupCount int) func() {
 	return func() {
+		defer func() {
+			if r := recover(); r != nil {
+				applog.Printf("ERROR: recovered panic in scheduler group %d: %v", groupID, r)
+			}
+		}()
 		if s.shouldSkipDSTDuplicate(groupID) {
 			return
 		}

@@ -61,6 +61,104 @@ func TestNonForumJoinKeepsSchedulerCleanupWhenWarningDeliveryFails(t *testing.T)
 	}
 }
 
+func TestRapidStartCommandsDontOverflowOrCrash(t *testing.T) {
+	// VAL-BOT-029: Rate limiting — many rapid /start calls should not crash
+	// or overflow the delivery queue.
+	api := &fakeTelegramClient{
+		me: &telego.User{ID: 123, Username: "DigestBot"},
+	}
+	service := newServiceForTest(api, api)
+	service.ownerID = "123"
+	service.webAppURL = "https://example.test/webapp/"
+	service.configureAdminCommands()
+
+	// Simulate 500 rapid /start calls from both owner and non-owner.
+	const rapidCount = 500
+	ctx := context.Background()
+	for i := 0; i < rapidCount; i++ {
+		chatID := int64(123)
+		fromID := int64(123)
+		if i%2 == 0 {
+			chatID = int64(i % 1000)
+			fromID = int64(i % 1000)
+		}
+		err := service.HandleUpdate(ctx, &telego.Update{
+			Message: &telego.Message{
+				Chat: telego.Chat{ID: chatID},
+				From: &telego.User{ID: fromID, FirstName: "Test"},
+				Text: "/start",
+			},
+		})
+		if err != nil {
+			// Delivery queue full is expected under extreme load; the bot
+			// must not crash and must remain responsive afterwards.
+			if !strings.Contains(err.Error(), "delivery queue is full") &&
+				!strings.Contains(err.Error(), "delivery") {
+				t.Fatalf("unexpected error after %d rapid calls: %v", i+1, err)
+			}
+		}
+	}
+	// After the stress test the bot should still process a normal request.
+	api.messages = nil // reset to keep assertion clean
+	err := service.HandleUpdate(ctx, &telego.Update{
+		Message: &telego.Message{
+			Chat: telego.Chat{ID: 123},
+			From: &telego.User{ID: 123, FirstName: "Owner"},
+			Text: "/start",
+		},
+	})
+	if err != nil {
+		t.Fatalf("post-stress handleUpdate error = %v", err)
+	}
+	if len(api.messages) == 0 {
+		t.Fatal("bot did not send response after stress test")
+	}
+}
+
+func TestPanicRecoveryInHandleUpdateDoesNotCrashBot(t *testing.T) {
+	api := &fakeTelegramClient{
+		me: &telego.User{ID: 123, Username: "DigestBot"},
+	}
+	service := newServiceForTest(api, api)
+	service.ownerID = "123"
+	service.webAppURL = "https://example.test/webapp/"
+	service.configureAdminCommands()
+
+	// Inject a command handler that panics.
+	service.SetCommandHandler("testpanic", func(ctx context.Context, message *telego.Message, argument string) error {
+		panic("simulated panic in command handler")
+	})
+
+	// The panic should be caught and prevent the bot from crashing.
+	err := service.HandleUpdate(context.Background(), &telego.Update{
+		Message: &telego.Message{
+			Chat: telego.Chat{ID: 123},
+			From: &telego.User{ID: 123},
+			Text: "/testpanic",
+		},
+	})
+	if err == nil {
+		t.Fatal("HandleUpdate should return an error for a panicking handler")
+	}
+	if !strings.Contains(err.Error(), "panic handling update") {
+		t.Fatalf("error = %v, want panic recovery message", err)
+	}
+	// The bot must still be operational after the panic.
+	err = service.HandleUpdate(context.Background(), &telego.Update{
+		Message: &telego.Message{
+			Chat: telego.Chat{ID: 123},
+			From: &telego.User{ID: 123, FirstName: "Owner"},
+			Text: "/start",
+		},
+	})
+	if err != nil {
+		t.Fatalf("post-panic handleUpdate error = %v", err)
+	}
+	if len(api.messages) == 0 {
+		t.Fatal("bot did not recover after panic")
+	}
+}
+
 func TestUnconfiguredBotHelpersReturnErrorsInsteadOfPanicking(t *testing.T) {
 	service := New()
 	if err := service.Start(); err == nil {

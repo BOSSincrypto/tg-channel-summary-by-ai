@@ -1029,3 +1029,104 @@ func TestSchedulerCatchUpWithRealDBFiresForMissedSchedule(t *testing.T) {
 		t.Fatalf("catch-up runner calls = %v, want [%d]", runner.groupIDs, groupID)
 	}
 }
+
+// --- VAL-CROSS-006: Config Persistence Across Restarts ---
+
+func TestConfigPersistenceAcrossSimulatedRestart(t *testing.T) {
+	// VAL-CROSS-006: Configuration changes survive a simulated process
+	// restart — the database file is closed and reopened, and both the
+	// settings repository and scheduler must use the persisted values.
+
+	// Use a temporary file-backed database to simulate persistent storage.
+	dbPath := t.TempDir() + "/persist_test.db"
+
+	database, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer database.Close()
+
+	groupID, err := database.Groups.Insert(&model.Group{
+		TelegramChatID: -1007,
+		Title:          "Persist Group",
+		Status:         model.GroupStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+
+	// Set a non-default digest time.
+	settings := &model.GroupSettings{
+		GroupID:    groupID,
+		DigestTime: "08:30",
+		Timezone:   "Asia/Tokyo",
+	}
+	if err := database.Groups.UpdateGroupSettings(settings); err != nil {
+		t.Fatalf("update settings: %v", err)
+	}
+
+	// Also persist global settings via the Config repository.
+	if err := database.Config.Set("webapp_settings", `{"digest_time":"08:30","timezone":"Asia/Tokyo","default_model":"test/model"}`); err != nil {
+		t.Fatalf("save global settings: %v", err)
+	}
+
+	// Verify the first scheduler instance picks up settings.
+	engine1 := newFakeCronEngine()
+	runner1 := &fakeRunner{}
+	sched1 := New(runner1, WithGroupSource(database.Groups), withCronEngine(engine1))
+	if err := sched1.Start(); err != nil {
+		t.Fatalf("start scheduler 1: %v", err)
+	}
+	if len(engine1.entries) != 1 {
+		t.Fatalf("scheduler 1 registered %d jobs, want 1", len(engine1.entries))
+	}
+	for _, entry := range engine1.entries {
+		if !strings.Contains(entry.spec, "30 8") || !strings.Contains(entry.spec, "Asia/Tokyo") {
+			t.Fatalf("scheduler 1 schedule = %q, want 08:30/Asia/Tokyo", entry.spec)
+		}
+	}
+	sched1.Stop()
+	database.Close()
+
+	// --- Simulate restart ---
+	database, err = db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen database after restart: %v", err)
+	}
+	defer database.Close()
+
+	// Verify global settings survived.
+	value, err := database.Config.Get("webapp_settings")
+	if err != nil {
+		t.Fatalf("load global settings after restart: %v", err)
+	}
+	if !strings.Contains(value, "08:30") || !strings.Contains(value, "Asia/Tokyo") {
+		t.Fatalf("global settings after restart = %q, want digest_time=08:30 and timezone=Asia/Tokyo", value)
+	}
+
+	// Verify group settings survived.
+	loaded, err := database.Groups.GetGroupSettings(groupID)
+	if err != nil {
+		t.Fatalf("load group settings after restart: %v", err)
+	}
+	if loaded.DigestTime != "08:30" || loaded.Timezone != "Asia/Tokyo" {
+		t.Fatalf("group settings after restart = %+v, want 08:30/Asia/Tokyo", loaded)
+	}
+
+	// Verify a new scheduler instance picks up the persisted settings.
+	engine2 := newFakeCronEngine()
+	runner2 := &fakeRunner{}
+	sched2 := New(runner2, WithGroupSource(database.Groups), withCronEngine(engine2))
+	if err := sched2.Start(); err != nil {
+		t.Fatalf("start scheduler 2 after restart: %v", err)
+	}
+	if len(engine2.entries) != 1 {
+		t.Fatalf("scheduler 2 registered %d jobs after restart, want 1", len(engine2.entries))
+	}
+	for _, entry := range engine2.entries {
+		if !strings.Contains(entry.spec, "30 8") || !strings.Contains(entry.spec, "Asia/Tokyo") {
+			t.Fatalf("scheduler 2 schedule = %q after restart, want 08:30/Asia/Tokyo", entry.spec)
+		}
+	}
+	sched2.Stop()
+}

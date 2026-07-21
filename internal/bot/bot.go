@@ -379,7 +379,13 @@ func (s *Service) registerCommands(ctx context.Context) error {
 
 // HandleUpdate dispatches one Telegram update. It is exported for deterministic
 // webhook-free tests and for alternate runners.
-func (s *Service) HandleUpdate(ctx context.Context, update *telego.Update) error {
+func (s *Service) HandleUpdate(ctx context.Context, update *telego.Update) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic handling update: %v", r)
+			s.logf("ERROR: recovered panic in update handler: %v", r)
+		}
+	}()
 	if s == nil || update == nil {
 		return nil
 	}

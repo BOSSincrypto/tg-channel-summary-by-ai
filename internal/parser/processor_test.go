@@ -885,6 +885,38 @@ func TestProcessChannelDoesNotPersistOrNotifyPostStorageFailure(t *testing.T) {
 	}
 }
 
+func TestProcessChannelsSeparatesPostValidationErrorsFromFetchFailures(t *testing.T) {
+	database, cleanup := newStorageTestDB(t)
+	defer cleanup()
+
+	channel := &model.Channel{Username: "invalid-batch-post", Enabled: true}
+	id, err := database.Channels.Insert(channel)
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	channel.ID = id
+
+	processor := NewChannelProcessor(
+		&fakeChannelFetcher{posts: map[string][]ParsedPost{
+			channel.Username: {{MessageID: 1, Text: "missing timestamp"}},
+		}},
+		NewPostStorage(database.Channels, database.Posts),
+	)
+	batch, err := processor.ProcessChannelsContext(context.Background(), []model.Channel{*channel})
+	if err != nil {
+		t.Fatalf("process channels: %v", err)
+	}
+	if len(batch.Failures) != 0 {
+		t.Fatalf("fetch failures = %+v, want none for post validation error", batch.Failures)
+	}
+	if len(batch.ProcessingErrors) != 1 || batch.ProcessingErrors[0].Channel.Username != channel.Username {
+		t.Fatalf("processing errors = %+v, want one validation error", batch.ProcessingErrors)
+	}
+	if !errors.Is(batch.ProcessingErrors[0].Err, errPostValidation) {
+		t.Fatalf("processing error = %v, want post validation error", batch.ProcessingErrors[0].Err)
+	}
+}
+
 func TestProcessChannelsRetriesEveryClassifiedFetchFailure(t *testing.T) {
 	tests := []struct {
 		name     string

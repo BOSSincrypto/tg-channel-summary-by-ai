@@ -302,6 +302,15 @@ func (s *Service) generate(groupID int64, windowID string, manual bool) (*Digest
 		FailureDetails:                 failedChannelDetails(batch),
 		ChannelFailureNotificationSent: batch.FailureNotificationSent,
 	}
+	if len(batch.Results) == 0 && len(batch.Failures) == 0 && len(batch.ProcessingErrors) > 0 {
+		// Configured channels that produced post-processing errors are not the
+		// same as a group with no configured channels. Keep the outcome
+		// informational and do not turn validation/storage diagnostics into a
+		// channel-fetch failure or recovery notification.
+		result.Outcome = OutcomeNoPosts
+		result.Message = "Нет новых постов для дайджеста."
+		return result, terminalDigestError(result, nil, manual)
+	}
 	if len(batch.Results) == 0 && len(batch.Failures) == 0 {
 		// A group with no configured (enabled) channels is a configuration
 		// error, not an empty-posts informational result. Keep the existing

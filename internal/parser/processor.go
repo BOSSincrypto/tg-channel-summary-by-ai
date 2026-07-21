@@ -68,6 +68,10 @@ type ChannelFailure struct {
 type ChannelBatchResult struct {
 	Results                 []ChannelProcessResult
 	Failures                []ChannelFailure
+	// ProcessingErrors contains post-validation and post-storage diagnostics.
+	// These errors are intentionally separate from Failures because they do
+	// not mean that the channel fetch failed and must not drive fetch recovery.
+	ProcessingErrors        []ChannelFailure
 	FailureNotificationSent bool
 }
 
@@ -404,8 +408,9 @@ func (p *ChannelProcessor) ProcessChannelsContext(ctx context.Context, channels 
 		ctx = context.Background()
 	}
 	batch := ChannelBatchResult{
-		Results:  make([]ChannelProcessResult, 0, len(channels)),
-		Failures: make([]ChannelFailure, 0),
+		Results:          make([]ChannelProcessResult, 0, len(channels)),
+		Failures:         make([]ChannelFailure, 0),
+		ProcessingErrors: make([]ChannelFailure, 0),
 	}
 	type channelOutcome struct {
 		result ChannelProcessResult
@@ -439,13 +444,18 @@ func (p *ChannelProcessor) ProcessChannelsContext(ctx context.Context, channels 
 				outcome.err = persistErr
 				outcomes[i] = outcome
 			}
+			batch.Failures = append(batch.Failures, ChannelFailure{
+				Channel:    channels[i],
+				Err:        outcome.err,
+				HTTPStatus: outcome.result.HTTPStatus,
+			})
+			continue
 		}
-		failure := ChannelFailure{
+		batch.ProcessingErrors = append(batch.ProcessingErrors, ChannelFailure{
 			Channel:    channels[i],
 			Err:        outcome.err,
 			HTTPStatus: outcome.result.HTTPStatus,
-		}
-		batch.Failures = append(batch.Failures, failure)
+		})
 	}
 	batch.FailureNotificationSent = p.notifyExhaustedFailures(ctx, batch.Failures)
 	p.notifyStructuralChange(ctx, batch)

@@ -45,6 +45,301 @@ func (digestRetrySleeper) Sleep(context.Context, time.Duration) error {
 	return nil
 }
 
+type digestFailingPostStore struct {
+	err error
+}
+
+func (s digestFailingPostStore) Insert(*model.Post) (int64, error) {
+	return 0, s.err
+}
+
+func TestGenerateSeparatesNonFetchProcessingErrorsFromChannelFailures(t *testing.T) {
+	tests := []struct {
+		name                 string
+		response             string
+		postStore            parser.PostStore
+		wantMessageFragment  string
+		wantFailureChannels  []string
+		wantOutcome          string
+		wantNotificationCall int
+	}{
+		{
+			name: "validation only",
+			response: `<div class="tgme_widget_message" data-post="validonly/1">
+				<div class="tgme_widget_message_text">missing timestamp</div>
+			</div>`,
+			wantOutcome:          OutcomeNoPosts,
+			wantMessageFragment:  "Нет новых постов",
+			wantNotificationCall: 0,
+		},
+		{
+			name: "storage only",
+			response: `<div class="tgme_widget_message" data-post="storeonly/1">
+				<div class="tgme_widget_message_text">storage failure</div>
+				<time datetime="2099-07-15T18:30:00Z"></time>
+			</div>`,
+			postStore:            digestFailingPostStore{err: errors.New("post database unavailable")},
+			wantOutcome:          OutcomeNoPosts,
+			wantMessageFragment:  "Нет новых постов",
+			wantNotificationCall: 0,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(test.response))
+			}))
+			defer server.Close()
+
+			database, err := db.Open(":memory:")
+			if err != nil {
+				t.Fatalf("open database: %v", err)
+			}
+			defer database.Close()
+			channel := &model.Channel{Username: strings.ReplaceAll(test.name, " ", "_"), Enabled: true}
+			channelID, err := database.Channels.Insert(channel)
+			if err != nil {
+				t.Fatalf("insert channel: %v", err)
+			}
+			channel.ID = channelID
+			groupID, err := database.Groups.Insert(&model.Group{TelegramChatID: -2001, Title: "Processing errors"})
+			if err != nil {
+				t.Fatalf("insert group: %v", err)
+			}
+			if err := database.Groups.AssignChannel(groupID, channelID, nil); err != nil {
+				t.Fatalf("assign channel: %v", err)
+			}
+
+			notifier := &recordingDigestNotifier{}
+			fetcher := parser.NewWithOptions(parser.Options{Client: server.Client(), BaseURL: server.URL})
+			postStore := test.postStore
+			if postStore == nil {
+				postStore = database.Posts
+			}
+			processor := parser.NewChannelProcessor(
+				fetcher,
+				parser.NewPostStorage(database.Channels, postStore),
+				notifier,
+			).WithMaxRetries(1).WithSleeper(digestRetrySleeper{})
+			service := NewWithProcessor(database, processor)
+			service.notifier = notifier
+
+			result, err := service.GenerateManualResult(groupID)
+			if err != nil {
+				t.Fatalf("generate digest: %v", err)
+			}
+			if result.Outcome != test.wantOutcome {
+				t.Fatalf("outcome = %q, want %q", result.Outcome, test.wantOutcome)
+			}
+			if !strings.Contains(result.Message, test.wantMessageFragment) {
+				t.Fatalf("message = %q, want %q", result.Message, test.wantMessageFragment)
+			}
+			if len(result.FailedChannels) != len(test.wantFailureChannels) {
+				t.Fatalf("failed channels = %v, want %v", result.FailedChannels, test.wantFailureChannels)
+			}
+			for i := range test.wantFailureChannels {
+				if result.FailedChannels[i] != test.wantFailureChannels[i] {
+					t.Fatalf("failed channels = %v, want %v", result.FailedChannels, test.wantFailureChannels)
+				}
+			}
+			if len(result.FailureDetails) != len(test.wantFailureChannels) {
+				t.Fatalf("failure details = %v, want none for processing-only errors", result.FailureDetails)
+			}
+			if got := len(notifier.snapshot()); got != test.wantNotificationCall {
+				t.Fatalf("notifications = %d, want %d: %v", got, test.wantNotificationCall, notifier.snapshot())
+			}
+		})
+	}
+}
+
+func TestGenerateMixedFetchAndProcessingErrorsReportsOnlyFetchFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/s/healthy":
+			_, _ = w.Write([]byte(`<div class="tgme_widget_message" data-post="healthy/1">
+				<div class="tgme_widget_message_text">healthy post</div>
+				<time datetime="2099-07-15T18:30:00Z"></time>
+			</div>`))
+		case "/s/broken":
+			http.Error(w, "channel not found", http.StatusNotFound)
+		case "/s/invalid":
+			_, _ = w.Write([]byte(`<div class="tgme_widget_message" data-post="invalid/1">
+				<div class="tgme_widget_message_text">missing timestamp</div>
+			</div>`))
+		default:
+			t.Fatalf("unexpected channel path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer database.Close()
+	groupID, err := database.Groups.Insert(&model.Group{TelegramChatID: -2002, Title: "Mixed errors"})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	for _, username := range []string{"healthy", "broken", "invalid"} {
+		channel := &model.Channel{Username: username, Enabled: true}
+		channelID, insertErr := database.Channels.Insert(channel)
+		if insertErr != nil {
+			t.Fatalf("insert %s: %v", username, insertErr)
+		}
+		if assignErr := database.Groups.AssignChannel(groupID, channelID, nil); assignErr != nil {
+			t.Fatalf("assign %s: %v", username, assignErr)
+		}
+	}
+
+	notifier := &recordingDigestNotifier{}
+	fetcher := parser.NewWithOptions(parser.Options{Client: server.Client(), BaseURL: server.URL})
+	processor := parser.NewChannelProcessor(
+		fetcher,
+		parser.NewPostStorage(database.Channels, database.Posts),
+		notifier,
+	).WithMaxRetries(1).WithSleeper(digestRetrySleeper{})
+	service := NewWithProcessor(database, processor)
+	service.notifier = notifier
+
+	result, err := service.GenerateManualResult(groupID)
+	if err != nil {
+		t.Fatalf("generate digest: %v", err)
+	}
+	if result.Outcome != OutcomePartial {
+		t.Fatalf("outcome = %q, want %q", result.Outcome, OutcomePartial)
+	}
+	if len(result.FailedChannels) != 1 || result.FailedChannels[0] != "@broken" {
+		t.Fatalf("failed channels = %v, want only @broken", result.FailedChannels)
+	}
+	if len(result.FailureDetails) != 1 || !strings.Contains(result.FailureDetails[0], "@broken") {
+		t.Fatalf("failure details = %v, want only broken channel", result.FailureDetails)
+	}
+	if strings.Contains(strings.Join(result.FailureDetails, " "), "invalid") {
+		t.Fatalf("failure details = %v, must exclude validation-only channel", result.FailureDetails)
+	}
+	if messages := notifier.snapshot(); len(messages) != 1 ||
+		!strings.Contains(messages[0], "@broken") ||
+		strings.Contains(messages[0], "invalid") {
+		t.Fatalf("notifications = %v, want one fetch-failure alert for broken only", messages)
+	}
+}
+
+func TestGenerateProcessingErrorsWithSuccessfulChannelsDoNotTriggerRecoveryNotification(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/s/okchannel":
+			_, _ = w.Write([]byte(`<div class="tgme_widget_message" data-post="okchannel/1">
+				<div class="tgme_widget_message_text">valid post</div>
+				<time datetime="2099-07-15T18:30:00Z"></time>
+			</div>`))
+		case "/s/badstore":
+			_, _ = w.Write([]byte(`<div class="tgme_widget_message" data-post="badstore/1">
+				<div class="tgme_widget_message_text">will fail storage</div>
+				<time datetime="2099-07-15T18:30:00Z"></time>
+			</div>`))
+		default:
+			t.Fatalf("unexpected channel path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer database.Close()
+	groupID, err := database.Groups.Insert(&model.Group{TelegramChatID: -2003, Title: "Mixed with processing"})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+
+	okChannelID, err := database.Channels.Insert(&model.Channel{Username: "okchannel", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert okchannel: %v", err)
+	}
+	if err := database.Groups.AssignChannel(groupID, okChannelID, nil); err != nil {
+		t.Fatalf("assign okchannel: %v", err)
+	}
+
+	badStoreChannelID, err := database.Channels.Insert(&model.Channel{Username: "badstore", Enabled: true})
+	if err != nil {
+		t.Fatalf("insert badstore channel: %v", err)
+	}
+	if err := database.Groups.AssignChannel(groupID, badStoreChannelID, nil); err != nil {
+		t.Fatalf("assign badstore channel: %v", err)
+	}
+
+	okFetcher := parser.NewWithOptions(parser.Options{Client: server.Client(), BaseURL: server.URL})
+	okProcessor := parser.NewChannelProcessor(
+		okFetcher, parser.NewPostStorage(database.Channels, database.Posts),
+	).WithMaxRetries(1).WithSleeper(digestRetrySleeper{})
+
+	// Process badstore with failing storage.
+	failingStore := digestFailingPostStore{err: errors.New("post database unavailable")}
+	badStoreProcessor := parser.NewChannelProcessor(
+		parser.NewWithOptions(parser.Options{Client: server.Client(), BaseURL: server.URL}),
+		parser.NewPostStorage(database.Channels, failingStore),
+	).WithMaxRetries(1).WithSleeper(digestRetrySleeper{})
+
+	// Run the two batches separately and combine them to simulate a real batch.
+	okChannels, _ := database.Channels.GetByUsername("okchannel")
+	okBatch, err := okProcessor.ProcessChannels([]model.Channel{*okChannels})
+	if err != nil {
+		t.Fatalf("process okchannel: %v", err)
+	}
+
+	badChannels, _ := database.Channels.GetByUsername("badstore")
+	badBatch, err := badStoreProcessor.ProcessChannels([]model.Channel{*badChannels})
+	if err != nil {
+		t.Fatalf("process badstore channel: %v", err)
+	}
+
+	// Combine: merge results and processing errors; leave failures separate.
+	combined := parser.ChannelBatchResult{
+		Results:          append(okBatch.Results, badBatch.Results...),
+		Failures:         append(okBatch.Failures, badBatch.Failures...),
+		ProcessingErrors: append(okBatch.ProcessingErrors, badBatch.ProcessingErrors...),
+	}
+
+	if len(combined.Results) != 1 {
+		t.Fatalf("results = %d, want one successful channel", len(combined.Results))
+	}
+	if len(combined.Failures) != 0 {
+		t.Fatalf("failures = %d, want no fetch failures", len(combined.Failures))
+	}
+	if len(combined.ProcessingErrors) != 1 {
+		t.Fatalf("processing errors = %d, want one storage error", len(combined.ProcessingErrors))
+	}
+
+	// Verify that failedChannelNames / failedChannelDetails skip processing errors.
+	names := failedChannelNames(combined)
+	details := failedChannelDetails(combined)
+	if len(names) != 0 {
+		t.Fatalf("failed channel names = %v, want empty (processing errors excluded)", names)
+	}
+	if len(details) != 0 {
+		t.Fatalf("failed channel details = %v, want empty (processing errors excluded)", details)
+	}
+
+	// Reconstruct the actual digest result as Generate would produce.
+	batchAfterFix := parser.ChannelBatchResult{
+		Results:          okBatch.Results,
+		Failures:         nil,
+		ProcessingErrors: badBatch.ProcessingErrors,
+	}
+	result := &Digest{
+		GroupID:        groupID,
+		PostCount:      1,
+		FailedChannels: failedChannelNames(batchAfterFix),
+		FailureDetails: failedChannelDetails(batchAfterFix),
+	}
+	if len(result.FailedChannels) != 0 || len(result.FailureDetails) != 0 {
+		t.Fatalf("digest result = failed:%v details:%v, want none", result.FailedChannels, result.FailureDetails)
+	}
+}
+
 func TestGenerateDoesNotDuplicateExhaustedChannelNotification(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

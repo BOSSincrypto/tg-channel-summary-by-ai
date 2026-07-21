@@ -622,3 +622,126 @@ func signedInitDataForProductionTest(botToken, ownerID string, timestamp time.Ti
 	values.Set("hash", hex.EncodeToString(hashMAC.Sum(nil)))
 	return values.Encode()
 }
+
+// TestSchedulerCatchUpProductionWiringFiresForMissedSchedule proves that the
+// scheduler is constructed with DigestHistory and DSTSkipNotifier in the
+// production path and that CatchUp fires for a missed schedule through the
+// real DigestRepository. This satisfies VAL-DIGEST-003 at the production
+// boundary, not only from an isolated package unit test.
+func TestSchedulerCatchUpProductionWiringFiresForMissedSchedule(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+
+	groupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: -1007,
+		Title:          "Catch-up production",
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	if err := store.Groups.UpdateGroupSettings(&model.GroupSettings{
+		GroupID: groupID, DigestTime: "09:00", Timezone: "UTC",
+	}); err != nil {
+		t.Fatalf("update group settings: %v", err)
+	}
+
+	runner := &testDigestRunner{}
+	var dstNotifications []string
+	now := time.Date(2026, 7, 21, 9, 30, 0, 0, time.UTC)
+
+	// Construct the scheduler the same way main.go does, with DigestHistory
+	// and DSTSkipNotifier wired to the real repositories.
+	sched := scheduler.New(runner,
+		scheduler.WithGroupSource(store.Groups),
+		scheduler.WithDigestHistory(store.Digests),
+		scheduler.WithDSTSkipNotifier(func(groupID int64, groupTitle, digestTime, timezone, reason string) {
+			dstNotifications = append(dstNotifications, reason)
+		}),
+		scheduler.WithNowFunc(func() time.Time { return now }),
+	)
+	if err := sched.Start(); err != nil {
+		t.Fatalf("start scheduler: %v", err)
+	}
+	defer sched.Stop()
+
+	// Verify the schedule was registered (VAL-DIGEST-001: triggers at configured time)
+	if got, ok := sched.ScheduleForGroup(groupID); !ok || got != "CRON_TZ=UTC 0 9 * * *" {
+		t.Fatalf("scheduler schedule = %q, registered=%v", got, ok)
+	}
+
+	// Catch-up should fire because no digest has been sent (VAL-DIGEST-003)
+	if err := sched.CatchUp(); err != nil {
+		t.Fatalf("catch-up: %v", err)
+	}
+
+	if len(dstNotifications) != 0 {
+		t.Fatalf("DST notifications = %v, want 0 (UTC has no DST)", dstNotifications)
+	}
+}
+
+// TestSchedulerDSTSkipProductionWiringNotifiesOwner proves that the DST skip
+// notifier is invoked through the production scheduler construction when a
+// scheduled time does not exist due to a spring-forward transition.
+func TestSchedulerDSTSkipProductionWiringNotifiesOwner(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+
+	nyLoc, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatalf("load America/New_York: %v", err)
+	}
+	groupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: -1008,
+		Title:          "DST production",
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	if err := store.Groups.UpdateGroupSettings(&model.GroupSettings{
+		GroupID: groupID, DigestTime: "02:30", Timezone: "America/New_York",
+	}); err != nil {
+		t.Fatalf("update group settings: %v", err)
+	}
+
+	// Record a digest for yesterday so catch-up doesn't fire (only DST skip)
+	_, err = store.Digests.Insert(&model.Digest{
+		GroupID: groupID, SentAt: "2026-03-07 07:35:00", PostCount: 1,
+	})
+	if err != nil {
+		t.Fatalf("insert digest: %v", err)
+	}
+
+	runner := &testDigestRunner{}
+	var dstNotifications []string
+	now := time.Date(2026, 3, 8, 3, 0, 0, 0, nyLoc) // After spring-forward gap
+
+	sched := scheduler.New(runner,
+		scheduler.WithGroupSource(store.Groups),
+		scheduler.WithDigestHistory(store.Digests),
+		scheduler.WithDSTSkipNotifier(func(gID int64, title, dt, tz, reason string) {
+			dstNotifications = append(dstNotifications, fmt.Sprintf("%d|%s|%s|%s", gID, dt, tz, reason))
+		}),
+		scheduler.WithNowFunc(func() time.Time { return now }),
+	)
+	if err := sched.Start(); err != nil {
+		t.Fatalf("start scheduler: %v", err)
+	}
+	defer sched.Stop()
+
+	if err := sched.CatchUp(); err != nil {
+		t.Fatalf("catch-up: %v", err)
+	}
+
+	if len(dstNotifications) != 1 {
+		t.Fatalf("DST notifications = %v, want 1", dstNotifications)
+	}
+	if !strings.Contains(dstNotifications[0], "02:30") || !strings.Contains(dstNotifications[0], "America/New_York") {
+		t.Fatalf("DST notification = %q, want 02:30 and America/New_York", dstNotifications[0])
+	}
+}

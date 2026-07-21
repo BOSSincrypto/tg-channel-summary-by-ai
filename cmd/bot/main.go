@@ -110,7 +110,21 @@ func main() {
 		WithMaxRetries(cfg.MaxRetries)
 	digestService := digest.NewWithProcessorAndAIWithMaxPostsPerChannel(store, channelProcessor, store.Groups, http.DefaultClient, cfg.MaxPostsPerChan, ownerNotifier)
 	srv.SetDigestRunner(digestService)
-	sched := scheduler.New(digestService, scheduler.WithGroupSource(store.Groups))
+	sched := scheduler.New(digestService,
+		scheduler.WithGroupSource(store.Groups),
+		scheduler.WithDigestHistory(store.Digests),
+		scheduler.WithDSTSkipNotifier(func(groupID int64, groupTitle, digestTime, timezone, reason string) {
+			title := groupTitle
+			if strings.TrimSpace(title) == "" {
+				title = fmt.Sprintf("группа %d", groupID)
+			}
+			message := fmt.Sprintf("⚠️ Пропущен дайджест для группы «%s» в %s (%s): %s",
+				title, digestTime, timezone, reason)
+			if err := ownerNotifier.NotifyOwner(context.Background(), message); err != nil {
+				log.Printf("failed to notify owner about DST skip for group %d: %v", groupID, err)
+			}
+		}),
+	)
 	srv.SetGroupScheduler(sched)
 
 	telegramBot, err := bot.NewWithConfig(
@@ -149,6 +163,14 @@ func main() {
 	if err := sched.Start(); err != nil {
 		log.Fatalf("failed to start scheduler: %v", err)
 	}
+	// Run missed-schedule catch-up asynchronously so startup is not blocked
+	// while past-due digests are generated. This implements the deterministic
+	// "always catch up on missed schedules" behavior required after restart.
+	go func() {
+		if err := sched.CatchUp(); err != nil {
+			log.Printf("scheduler catch-up incomplete: %v", err)
+		}
+	}()
 	if err := srv.ReconcileGroupScheduler(context.Background()); err != nil {
 		log.Printf("pending WebApp group scheduler reconciliation incomplete: %v", err)
 	}

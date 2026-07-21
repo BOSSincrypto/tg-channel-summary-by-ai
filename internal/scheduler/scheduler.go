@@ -35,6 +35,20 @@ type GroupSource interface {
 	GetGroupSettings(groupID int64) (*model.GroupSettings, error)
 }
 
+// DigestHistory provides access to past digest records for catch-up
+// detection. It is the narrow interface the scheduler needs from the digest
+// repository to determine whether a scheduled fire was missed while the bot
+// was down.
+type DigestHistory interface {
+	ListByGroup(groupID int64, limit int) ([]model.Digest, error)
+}
+
+// DSTSkipNotifier is called when a scheduled digest is skipped because the
+// configured wall-clock time does not exist due to a DST spring-forward
+// transition. Callers wire this to the owner notifier so the admin is
+// informed of any skipped digests.
+type DSTSkipNotifier func(groupID int64, groupTitle, digestTime, timezone, reason string)
+
 type cronEngine interface {
 	AddFunc(spec string, cmd func()) (cron.EntryID, error)
 	Start()
@@ -73,6 +87,35 @@ type Option func(*Scheduler)
 func WithGroupSource(source GroupSource) Option {
 	return func(s *Scheduler) {
 		s.groups = source
+	}
+}
+
+// WithDigestHistory configures the digest history source used for missed
+// schedule catch-up detection on restart.
+func WithDigestHistory(history DigestHistory) Option {
+	return func(s *Scheduler) {
+		s.history = history
+	}
+}
+
+// WithDSTSkipNotifier wires a callback that is invoked when a scheduled
+// digest is skipped because the configured time does not exist due to a DST
+// spring-forward transition. The admin should be notified so the skip is
+// visible.
+func WithDSTSkipNotifier(notifier DSTSkipNotifier) Option {
+	return func(s *Scheduler) {
+		s.dstNotifier = notifier
+	}
+}
+
+// WithNowFunc overrides the clock used for catch-up and DST dedup checks.
+// It is primarily intended for deterministic tests; production code uses the
+// default time.Now.
+func WithNowFunc(fn func() time.Time) Option {
+	return func(s *Scheduler) {
+		if fn != nil {
+			s.nowFunc = fn
+		}
 	}
 }
 
@@ -116,6 +159,21 @@ type Scheduler struct {
 	refreshFailureHook func() error
 	lifecycleBefore    func()
 	lifecycleAfter     func()
+
+	history     DigestHistory
+	dstNotifier DSTSkipNotifier
+	nowFunc     func() time.Time
+
+	fireMu   sync.Mutex
+	lastFire map[int64]fireRecord
+}
+
+// fireRecord tracks the last scheduled fire for DST fall-back deduplication.
+// During a fall-back transition the same wall-clock time occurs twice with
+// different UTC offsets; the second occurrence is skipped.
+type fireRecord struct {
+	wallClock string
+	offset    int
 }
 
 type scheduledWindow struct {
@@ -143,11 +201,70 @@ func New(runner DigestRunner, options ...Option) *Scheduler {
 		jobIDs:   make(map[int64]cron.EntryID),
 		jobSpecs: make(map[int64]string),
 		windows:  make(map[string]*scheduledWindow),
+		nowFunc:  time.Now,
+		lastFire: make(map[int64]fireRecord),
 	}
 	for _, option := range options {
 		option(s)
 	}
 	return s
+}
+
+// now returns the current time, honoring an injected clock for tests.
+func (s *Scheduler) now() time.Time {
+	if s.nowFunc != nil {
+		return s.nowFunc()
+	}
+	return time.Now()
+}
+
+// groupJobFunc wraps the cron callback for a group with DST fall-back
+// deduplication. During a DST fall-back transition the same wall-clock time
+// occurs twice; robfig/cron may invoke the callback for both occurrences.
+// The wrapper records the wall-clock string per group and skips the second
+// occurrence so exactly one digest is delivered per ambiguous hour.
+func (s *Scheduler) groupJobFunc(groupID int64, spec string, groupCount int) func() {
+	return func() {
+		if s.shouldSkipDSTDuplicate(groupID) {
+			return
+		}
+		windowID := s.nextScheduledWindow(spec, groupCount)
+		if _, runErr := s.RunGroupWithWindow(groupID, windowID); runErr != nil {
+			log.Printf("scheduler group %d failed: %v", groupID, runErr)
+		}
+	}
+}
+
+// shouldSkipDSTDuplicate returns true if the current wall-clock time in the
+// group's timezone was already fired with a different UTC offset, indicating
+// a DST fall-back duplicate. During a fall-back transition the same
+// wall-clock time occurs twice (first in the pre-transition offset, then in
+// the post-transition offset); the wrapper skips the second occurrence so
+// exactly one digest is delivered per ambiguous hour. Repeated fires with the
+// same offset (e.g., test double-triggers) are not treated as duplicates.
+func (s *Scheduler) shouldSkipDSTDuplicate(groupID int64) bool {
+	if s.groups == nil {
+		return false
+	}
+	settings, err := s.groups.GetGroupSettings(groupID)
+	if err != nil {
+		return false
+	}
+	loc, err := time.LoadLocation(strings.TrimSpace(settings.Timezone))
+	if err != nil {
+		return false
+	}
+	now := s.now().In(loc)
+	wallClock := now.Format("2006-01-02 15:04")
+	_, offset := now.Zone()
+	s.fireMu.Lock()
+	defer s.fireMu.Unlock()
+	if last, ok := s.lastFire[groupID]; ok && last.wallClock == wallClock && last.offset != offset {
+		log.Printf("DST fall-back: skipping duplicate digest for group %d at %s (wall-clock already fired)", groupID, wallClock)
+		return true
+	}
+	s.lastFire[groupID] = fireRecord{wallClock: wallClock, offset: offset}
+	return false
 }
 
 // WithLifecycle serializes scheduler registration changes and digest starts
@@ -219,12 +336,7 @@ func (s *Scheduler) Start() error {
 		}
 		spec := specByGroup[group.ID]
 		groupID := group.ID
-		entryID, err := s.engine.AddFunc(spec, func() {
-			windowID := s.nextScheduledWindow(spec, groupsBySpec[spec])
-			if _, runErr := s.RunGroupWithWindow(groupID, windowID); runErr != nil {
-				log.Printf("scheduler group %d failed: %v", groupID, runErr)
-			}
-		})
+		entryID, err := s.engine.AddFunc(spec, s.groupJobFunc(groupID, spec, groupsBySpec[spec]))
 		if err != nil {
 			for _, id := range registered {
 				s.engine.Remove(id)
@@ -294,12 +406,7 @@ func (s *Scheduler) RefreshGroup(groupID int64) error {
 		s.mu.Unlock()
 		return fmt.Errorf("refresh group: build schedule for group %d: %w", groupID, err)
 	}
-	entryID, err := engine.AddFunc(spec, func() {
-		windowID := s.nextScheduledWindow(spec, 1)
-		if _, runErr := s.RunGroupWithWindow(groupID, windowID); runErr != nil {
-			log.Printf("scheduler group %d failed: %v", groupID, runErr)
-		}
-	})
+	entryID, err := engine.AddFunc(spec, s.groupJobFunc(groupID, spec, 1))
 	if err != nil {
 		s.mu.Unlock()
 		return fmt.Errorf("refresh group: register group %d schedule %q: %w", groupID, spec, err)
@@ -441,12 +548,7 @@ func (s *Scheduler) addSchedulesLocked(specs map[int64]string) (map[int64]cron.E
 	registered := make(map[int64]cron.EntryID, len(specs))
 	for groupID, spec := range specs {
 		id := groupID
-		entryID, err := s.engine.AddFunc(spec, func() {
-			windowID := s.nextScheduledWindow(spec, bySpec[spec])
-			if _, runErr := s.RunGroupWithWindow(id, windowID); runErr != nil {
-				log.Printf("scheduler group %d failed: %v", id, runErr)
-			}
-		})
+		entryID, err := s.engine.AddFunc(spec, s.groupJobFunc(id, spec, bySpec[spec]))
 		if err != nil {
 			return registered, fmt.Errorf("register group %d schedule %q: %w", groupID, spec, err)
 		}
@@ -575,12 +677,7 @@ func (s *Scheduler) restoreGroupWithinLifecycle(groupID int64) error {
 	if err != nil {
 		return fmt.Errorf("restore group: build schedule for group %d: %w", groupID, err)
 	}
-	entryID, err := engine.AddFunc(spec, func() {
-		windowID := s.nextScheduledWindow(spec, 1)
-		if _, runErr := s.RunGroupWithWindow(groupID, windowID); runErr != nil {
-			log.Printf("scheduler group %d failed: %v", groupID, runErr)
-		}
-	})
+	entryID, err := engine.AddFunc(spec, s.groupJobFunc(groupID, spec, 1))
 	if err != nil {
 		return fmt.Errorf("restore group: register group %d schedule %q: %w", groupID, spec, err)
 	}
@@ -656,6 +753,118 @@ func (s *Scheduler) nextScheduledWindow(spec string, groupCount int) string {
 	windowID := window.id
 	window.remaining--
 	return windowID
+}
+
+// CatchUp checks each active group for a missed scheduled fire time and
+// runs a catch-up digest if the most recent scheduled time passed without a
+// corresponding digest. It also detects DST spring-forward transitions where
+// the configured wall-clock time does not exist on the current day and
+// notifies the admin so the skip is visible. This implements the deterministic
+// "always catch up on missed schedules" behavior required after a restart.
+func (s *Scheduler) CatchUp() error {
+	if s == nil {
+		return errors.New("catch-up: scheduler is not configured")
+	}
+	s.mu.Lock()
+	started := s.started
+	history := s.history
+	source := s.groups
+	s.mu.Unlock()
+
+	if !started || history == nil || source == nil {
+		return nil
+	}
+
+	groups, err := source.List()
+	if err != nil {
+		return fmt.Errorf("catch-up: list groups: %w", err)
+	}
+
+	now := s.now()
+	for _, group := range groups {
+		if group.Status != "" && group.Status != model.GroupStatusActive {
+			continue
+		}
+		settings, err := source.GetGroupSettings(group.ID)
+		if err != nil {
+			log.Printf("catch-up: load settings for group %d: %v", group.ID, err)
+			continue
+		}
+		if err := s.catchUpGroup(group, settings, now, history); err != nil {
+			log.Printf("catch-up: group %d: %v", group.ID, err)
+		}
+	}
+	return nil
+}
+
+// catchUpGroup evaluates a single group for missed-schedule catch-up and DST
+// spring-forward detection. It computes the most recent past scheduled fire
+// time, checks the digest history for a corresponding digest, and fires a
+// catch-up run if the schedule was missed.
+func (s *Scheduler) catchUpGroup(group model.Group, settings *model.GroupSettings, now time.Time, history DigestHistory) error {
+	loc, err := time.LoadLocation(strings.TrimSpace(settings.Timezone))
+	if err != nil {
+		return fmt.Errorf("load timezone %q: %w", settings.Timezone, err)
+	}
+	parsed, err := time.Parse("15:04", strings.TrimSpace(settings.DigestTime))
+	if err != nil {
+		return fmt.Errorf("parse digest time %q: %w", settings.DigestTime, err)
+	}
+
+	nowLocal := now.In(loc)
+	todayScheduled := time.Date(nowLocal.Year(), nowLocal.Month(), nowLocal.Day(),
+		parsed.Hour(), parsed.Minute(), 0, 0, loc)
+	todayExists := todayScheduled.Hour() == parsed.Hour() && todayScheduled.Minute() == parsed.Minute()
+
+	if !todayExists {
+		log.Printf("DST transition: skipping digest at %s — time does not exist due to DST", settings.DigestTime)
+		s.notifyDSTSkip(group.ID, group.Title, settings.DigestTime, settings.Timezone,
+			"spring-forward: scheduled time does not exist")
+	}
+
+	// Determine the most recent past scheduled fire time.
+	var lastScheduled time.Time
+	if todayExists && !todayScheduled.After(nowLocal) {
+		lastScheduled = todayScheduled
+	} else {
+		yesterday := nowLocal.AddDate(0, 0, -1)
+		lastScheduled = time.Date(yesterday.Year(), yesterday.Month(), yesterday.Day(),
+			parsed.Hour(), parsed.Minute(), 0, 0, loc)
+	}
+
+	// Skip catch-up if a digest was already sent after the last scheduled time.
+	digests, err := history.ListByGroup(group.ID, 1)
+	if err != nil {
+		return fmt.Errorf("list digests for group %d: %w", group.ID, err)
+	}
+	if len(digests) > 0 {
+		lastDigestTime, parseErr := parseDigestSentAt(digests[0].SentAt)
+		if parseErr == nil && lastDigestTime.After(lastScheduled) {
+			return nil
+		}
+	}
+
+	log.Printf("Missed schedule for group %d, running catch-up digest", group.ID)
+	if _, runErr := s.RunGroup(group.ID); runErr != nil {
+		return fmt.Errorf("catch-up run: %w", runErr)
+	}
+	return nil
+}
+
+// notifyDSTSkip invokes the configured DST skip notifier if one is wired.
+func (s *Scheduler) notifyDSTSkip(groupID int64, groupTitle, digestTime, timezone, reason string) {
+	if s.dstNotifier != nil {
+		s.dstNotifier(groupID, groupTitle, digestTime, timezone, reason)
+	}
+}
+
+// parseDigestSentAt parses a digest SentAt timestamp. SQLite datetime('now')
+// stores UTC in "2006-01-02 15:04:05" format; RFC3339 is tried as a fallback.
+func parseDigestSentAt(sentAt string) (time.Time, error) {
+	if t, err := time.Parse("2006-01-02 15:04:05", sentAt); err == nil {
+		return t, nil
+	}
+	return time.Parse(time.RFC3339, sentAt)
 }
 
 // Stop removes all registered jobs and waits for the scheduler to stop.

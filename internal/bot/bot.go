@@ -707,8 +707,8 @@ func (s *Service) Deliver(ctx context.Context, groupID int64, result *digest.Dig
 		return digest.DeliveryReceipt{}, fmt.Errorf("load digest group %d: %w", groupID, err)
 	}
 	params := &telego.SendMessageParams{
-		ChatID: groupTelegramChatID(group.TelegramChatID),
-		Text:   result.Text,
+		ChatID:    groupTelegramChatID(group.TelegramChatID),
+		ParseMode: "MarkdownV2",
 	}
 	assignments, err := s.groups.GetChannelAssignments(groupID)
 	if err != nil {
@@ -720,14 +720,26 @@ func (s *Service) Deliver(ctx context.Context, groupID int64, result *digest.Dig
 			break
 		}
 	}
-	message, err := s.api.SendMessage(ctx, params)
-	if err != nil {
-		return digest.DeliveryReceipt{}, fmt.Errorf("send digest to group %d: %w", groupID, s.classifyTelegramError(err))
+	parts := digest.SplitDigestMessage(result.Text)
+	if len(parts) == 0 {
+		return digest.DeliveryReceipt{}, errors.New("digest message is empty")
 	}
-	if message == nil || message.MessageID == 0 {
-		return digest.DeliveryReceipt{}, errors.New("Telegram delivery returned no message metadata")
+	var lastMessageID int64
+	for index, part := range parts {
+		params.Text = part
+		message, sendErr := s.api.SendMessage(ctx, params)
+		if sendErr != nil {
+			return digest.DeliveryReceipt{}, fmt.Errorf(
+				"send digest part %d/%d to group %d: %w",
+				index+1, len(parts), groupID, s.classifyTelegramError(sendErr),
+			)
+		}
+		if message == nil || message.MessageID == 0 {
+			return digest.DeliveryReceipt{}, errors.New("Telegram delivery returned no message metadata")
+		}
+		lastMessageID = int64(message.MessageID)
 	}
-	return digest.DeliveryReceipt{MessageID: int64(message.MessageID)}, nil
+	return digest.DeliveryReceipt{MessageID: lastMessageID}, nil
 }
 
 func (s *Service) handleMyChatMember(ctx context.Context, update *telego.ChatMemberUpdated) error {

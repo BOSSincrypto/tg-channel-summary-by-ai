@@ -297,7 +297,10 @@ func (s *Service) generate(groupID int64, windowID string, manual bool) (*Digest
 			"⚠️ Группа «%s»: не настроены каналы для дайджеста. Добавьте каналы в настройках.",
 			s.groupTitle(groupID),
 		)
-		result.Text = result.Message
+		result.Text = fmt.Sprintf(
+			"⚠️ Группа «%s»: не настроены каналы для дайджеста\\. Добавьте каналы в настройках\\.",
+			escapeMarkdownV2(s.groupTitle(groupID)),
+		)
 		if s.delivery != nil {
 			pendingID, checkpointErr := s.database.Digests.CreatePending(groupID, result.Text, nil)
 			if checkpointErr != nil {
@@ -547,32 +550,6 @@ func terminalDigestError(result *Digest, err error, manual bool) error {
 		return err
 	}
 	return errors.New(result.Message)
-}
-
-func (s *Service) formatDigestMessage(groupID int64, posts []model.Post) string {
-	var builder strings.Builder
-	builder.WriteString("📋 ")
-	builder.WriteString(s.groupTitle(groupID))
-	builder.WriteString("\n\n")
-	for _, post := range posts {
-		summary := post.Summary
-		if refreshed, err := s.database.Posts.GetByID(post.ID); err == nil {
-			summary = refreshed.Summary
-		}
-		text := post.Text
-		if summary != nil && strings.TrimSpace(*summary) != "" {
-			text = *summary
-		}
-		builder.WriteString("• ")
-		builder.WriteString(strings.TrimSpace(text))
-		if strings.TrimSpace(post.URL) != "" {
-			builder.WriteString(" (")
-			builder.WriteString(post.URL)
-			builder.WriteString(")")
-		}
-		builder.WriteString("\n")
-	}
-	return strings.TrimSpace(builder.String())
 }
 
 func capPostsPerChannel(posts []model.Post, limit int) []model.Post {

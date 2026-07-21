@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	applog "github.com/boss/tg-channel-summary-by-ai/internal/log"
 )
 
 // FallbackProvider retries a failed transient request with a secondary
@@ -45,7 +45,7 @@ func (p *FallbackProvider) Summarize(ctx context.Context, posts []Post) ([]Summa
 	if p.onFallback != nil {
 		p.onFallback(err)
 	} else {
-		log.Printf("primary AI provider failed, using fallback: %v", err)
+		applog.Printf("primary AI provider failed, using fallback: %v", err)
 	}
 	summaries, fallbackErr := p.fallback.Summarize(ctx, posts)
 	if fallbackErr != nil {

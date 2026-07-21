@@ -6,7 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	applog "github.com/boss/tg-channel-summary-by-ai/internal/log"
 	"strings"
 	"sync"
 	"time"
@@ -237,7 +237,7 @@ func (s *Scheduler) groupJobFunc(groupID int64, spec string, groupCount int) fun
 		}
 		windowID := s.nextScheduledWindow(spec, groupCount)
 		if _, runErr := s.RunGroupWithWindow(groupID, windowID); runErr != nil {
-			log.Printf("scheduler group %d failed: %v", groupID, runErr)
+			applog.Printf("scheduler group %d failed: %v", groupID, runErr)
 		}
 	}
 }
@@ -267,7 +267,7 @@ func (s *Scheduler) shouldSkipDSTDuplicate(groupID int64) bool {
 	s.fireMu.Lock()
 	defer s.fireMu.Unlock()
 	if last, ok := s.lastFire[groupID]; ok && last.wallClock == wallClock && last.offset != offset {
-		log.Printf("DST fall-back: skipping duplicate digest for group %d at %s (wall-clock already fired)", groupID, wallClock)
+		applog.Printf("DST fall-back: skipping duplicate digest for group %d at %s (wall-clock already fired)", groupID, wallClock)
 		return true
 	}
 	s.lastFire[groupID] = fireRecord{wallClock: wallClock, offset: offset}
@@ -833,11 +833,11 @@ func (s *Scheduler) CatchUp() error {
 		}
 		settings, err := source.GetGroupSettings(group.ID)
 		if err != nil {
-			log.Printf("catch-up: load settings for group %d: %v", group.ID, err)
+			applog.Printf("catch-up: load settings for group %d: %v", group.ID, err)
 			continue
 		}
 		if err := s.catchUpGroup(group, settings, now, history); err != nil {
-			log.Printf("catch-up: group %d: %v", group.ID, err)
+			applog.Printf("catch-up: group %d: %v", group.ID, err)
 		}
 	}
 	return nil
@@ -868,7 +868,7 @@ func (s *Scheduler) catchUpGroup(group model.Group, settings *model.GroupSetting
 	todayExists := todayScheduled.Hour() == parsed.Hour() && todayScheduled.Minute() == parsed.Minute()
 
 	if !todayExists {
-		log.Printf("DST transition: skipping digest at %s — time does not exist due to DST", settings.DigestTime)
+		applog.Printf("DST transition: skipping digest at %s — time does not exist due to DST", settings.DigestTime)
 		s.notifyDSTSkip(group.ID, group.Title, settings.DigestTime, settings.Timezone,
 			"spring-forward: scheduled time does not exist")
 	}
@@ -895,7 +895,7 @@ func (s *Scheduler) catchUpGroup(group model.Group, settings *model.GroupSetting
 		}
 	}
 
-	log.Printf("Missed schedule for group %d, running catch-up digest", group.ID)
+	applog.Printf("Missed schedule for group %d, running catch-up digest", group.ID)
 	if _, runErr := s.RunGroup(group.ID); runErr != nil {
 		return fmt.Errorf("catch-up run: %w", runErr)
 	}

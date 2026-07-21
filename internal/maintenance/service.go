@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	applog "github.com/boss/tg-channel-summary-by-ai/internal/log"
 	"sync"
 	"time"
 
@@ -106,7 +106,7 @@ func New(opts Options) *Service {
 
 	logger := opts.Logger
 	if logger == nil {
-		logger = log.Default()
+		logger = applog.GetDefault()
 	}
 
 	now := opts.Now

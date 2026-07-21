@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	applog "github.com/boss/tg-channel-summary-by-ai/internal/log"
 	"net/http"
 	"strings"
 	"time"
@@ -351,9 +351,9 @@ func (p *ChannelProcessor) notifyChannelFailure(ctx context.Context, channel mod
 	}
 
 	message := channelFailureNotification(channel.Username, kind)
-	log.Printf("WARNING: channel @%s fetch failed (%s): %v", channel.Username, kind, err)
+	applog.Printf("WARNING: channel @%s fetch failed (%s): %v", channel.Username, kind, err)
 	if notifyErr := p.notifier.NotifyOwner(ctx, message); notifyErr != nil {
-		log.Printf("WARNING: failed to notify owner about channel @%s: %v", channel.Username, notifyErr)
+		applog.Printf("WARNING: failed to notify owner about channel @%s: %v", channel.Username, notifyErr)
 	}
 }
 
@@ -495,9 +495,9 @@ func (p *ChannelProcessor) notifyExhaustedFailures(ctx context.Context, failures
 		"⚠️ частичный дайджест: канал(ы) %s не удалось обработать после исчерпания %d повторных попыток. Причины: %s. Посты из этих каналов не включены. Проверьте доступность каналов и обновите настройки.",
 		strings.Join(usernames, ", "), p.maxRetries, strings.Join(details, ", "),
 	)
-	log.Printf("WARNING: partial digest after exhausted channel failures: %s", strings.Join(usernames, ", "))
+	applog.Printf("WARNING: partial digest after exhausted channel failures: %s", strings.Join(usernames, ", "))
 	if err := p.notifier.NotifyOwner(ctx, message); err != nil {
-		log.Printf("WARNING: failed to notify owner about exhausted channel failures: %v", err)
+		applog.Printf("WARNING: failed to notify owner about exhausted channel failures: %v", err)
 		return false
 	}
 	return true
@@ -515,9 +515,9 @@ func (p *ChannelProcessor) notifyRateLimitPartial(ctx context.Context, failures 
 		"⚠️ частичный дайджест: канал(ы) %s ограничены Telegram (HTTP 429) после исчерпания %d повторных попыток. Посты из этих каналов не включены. Проверьте доступность каналов и повторите запуск позже.",
 		strings.Join(usernames, ", "), p.maxRetries,
 	)
-	log.Printf("WARNING: partial digest after rate-limited channels: %s", strings.Join(usernames, ", "))
+	applog.Printf("WARNING: partial digest after rate-limited channels: %s", strings.Join(usernames, ", "))
 	if err := p.notifier.NotifyOwner(ctx, message); err != nil {
-		log.Printf("WARNING: failed to notify owner about rate-limited channels: %v", err)
+		applog.Printf("WARNING: failed to notify owner about rate-limited channels: %v", err)
 		return false
 	}
 	return true
@@ -532,12 +532,12 @@ func (p *ChannelProcessor) notifyStructuralChange(ctx context.Context, batch Cha
 		"⚠️ Возможно, Telegram изменил структуру t.me/s. Посты не извлекаются из %d каналов, ранее содержавших публикации. Проверьте парсер.",
 		batch.PreviouslyPopulatedCount(),
 	)
-	log.Printf("WARNING: Possible t.me/s HTML structure change - 0 posts extracted from %d channels that previously had content.", batch.PreviouslyPopulatedCount())
+	applog.Printf("WARNING: Possible t.me/s HTML structure change - 0 posts extracted from %d channels that previously had content.", batch.PreviouslyPopulatedCount())
 	if p.notifier == nil {
 		return
 	}
 	if err := p.notifier.NotifyOwner(ctx, message); err != nil {
-		log.Printf("WARNING: failed to notify owner about parser structure change: %v", err)
+		applog.Printf("WARNING: failed to notify owner about parser structure change: %v", err)
 	}
 }
 

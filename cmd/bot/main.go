@@ -8,7 +8,22 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+
+	"github.com/boss/tg-channel-summary-by-ai/internal/bot"
+	"github.com/boss/tg-channel-summary-by-ai/internal/config"
+	"github.com/boss/tg-channel-summary-by-ai/internal/db"
+	"github.com/boss/tg-channel-summary-by-ai/internal/digest"
+	"github.com/boss/tg-channel-summary-by-ai/internal/forum"
+	"github.com/boss/tg-channel-summary-by-ai/internal/lifecycle"
+	applog "github.com/boss/tg-channel-summary-by-ai/internal/log"
+	"github.com/boss/tg-channel-summary-by-ai/internal/maintenance"
+	"github.com/boss/tg-channel-summary-by-ai/internal/model"
+	"github.com/boss/tg-channel-summary-by-ai/internal/parser"
+	"github.com/boss/tg-channel-summary-by-ai/internal/scheduler"
+	"github.com/boss/tg-channel-summary-by-ai/internal/security"
+	"github.com/boss/tg-channel-summary-by-ai/internal/summarizer"
+	"github.com/boss/tg-channel-summary-by-ai/internal/webapp"
+	"github.com/mymmrac/telego"
 	"net"
 	"net/http"
 	"os"
@@ -17,51 +32,36 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
-	"github.com/boss/tg-channel-summary-by-ai/internal/bot"
-	"github.com/boss/tg-channel-summary-by-ai/internal/config"
-	"github.com/boss/tg-channel-summary-by-ai/internal/db"
-	"github.com/boss/tg-channel-summary-by-ai/internal/digest"
-	"github.com/boss/tg-channel-summary-by-ai/internal/forum"
-	"github.com/boss/tg-channel-summary-by-ai/internal/lifecycle"
-	"github.com/boss/tg-channel-summary-by-ai/internal/maintenance"
-	"github.com/boss/tg-channel-summary-by-ai/internal/model"
-	"github.com/boss/tg-channel-summary-by-ai/internal/parser"
-	"github.com/boss/tg-channel-summary-by-ai/internal/scheduler"
-	"github.com/boss/tg-channel-summary-by-ai/internal/summarizer"
-	"github.com/boss/tg-channel-summary-by-ai/internal/webapp"
-	"github.com/mymmrac/telego"
 )
 
 var productionSettingsMu sync.Mutex
 
 func main() {
-	log.Println("tg-channel-summary-by-ai starting...")
-
+	applog.Info("tg-channel-summary-by-ai starting...")
 	if validatorHTTPOnlyEnabled() {
 		if err := runValidatorHTTPOnly(); err != nil {
-			log.Fatalf("validator HTTP mode stopped: %v", err)
+			applog.Fatalf("validator HTTP mode stopped: %v", err)
 		}
 		return
 	}
-
 	// Load configuration from .env or environment variables.
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("failed to load config: %v", err)
+		applog.Fatalf("failed to load config: %v", err)
 	}
-
+	// Initialize structured logger with secret redaction.
+	applog.SetDefault(applog.NewWithRedactor(os.Stderr, applog.ParseLevel(cfg.LogLevel),
+		security.NewRedactor(cfg.BotToken, cfg.OpenRouterKey)))
 	// Initialize SQLite so Fly boots against the mounted /data volume.
 	store, err := db.OpenWithEncryptionKey(cfg.DBPath, cfg.ProviderKey)
 	if err != nil {
-		log.Fatalf("failed to open database at %s: %v", cfg.DBPath, err)
+		applog.Fatalf("failed to open database at %s: %v", cfg.DBPath, err)
 	}
 	defer store.Close()
-	log.Printf("database opened at %s", cfg.DBPath)
+	applog.Info("database opened", "path", cfg.DBPath)
 	if err := ensureDefaultAIProvider(store, cfg.OpenRouterKey); err != nil {
-		log.Fatalf("failed to configure default AI provider: %v", err)
+		applog.Fatalf("failed to configure default AI provider: %v", err)
 	}
-
 	ownerNotifier := bot.NewOwnerNotifier(cfg.BotToken, cfg.OwnerTelegramID, cfg.OpenRouterKey)
 	appLifecycle := lifecycle.New(5 * time.Second)
 	ownerNotifier.SetProviderSecretSource(func() []string {
@@ -83,25 +83,23 @@ func main() {
 		ConfigStore:   store.Config,
 		Notifier:      ownerNotifier,
 	})
-
 	// Configure the HTTP server (health check + WebApp) before wiring the
 	// remaining production services.
 	webAppAuth, err := webapp.NewWebAppAuthWithOrigin(cfg.BotToken, cfg.OwnerTelegramID, cfg.WebAppURL)
 	if err != nil {
-		log.Fatalf("failed to configure WebApp authentication: %v", err)
+		applog.Fatalf("failed to configure WebApp authentication: %v", err)
 	}
 	srv := webapp.NewWithProvidersAuthenticated(store, 10*time.Second, http.DefaultClient, webAppAuth)
 	forumFence := &forum.MutationFence{}
 	srv.SetForumMutationFence(forumFence)
 	revocationHandler := func(err error) {
-		log.Printf("FATAL: Bot token revoked (401 Unauthorized): %v", err)
+		applog.Error("Bot token revoked (401 Unauthorized)", "err", err)
 		srv.EnterTerminal(err)
 		appLifecycle.TokenRevoked(err)
 	}
 	srv.SetTokenRevocationHandler(revocationHandler)
 	ownerNotifier.SetTokenRevocationHandler(revocationHandler)
 	srv.SetChannelVerificationRetry(cfg.MaxRetries, nil)
-
 	// Wire the production parser -> post storage -> digest path before the
 	// scheduler starts. Scheduled group runs use this same injected service.
 	channelParser := parser.New()
@@ -121,12 +119,11 @@ func main() {
 			message := fmt.Sprintf("⚠️ Пропущен дайджест для группы «%s» в %s (%s): %s",
 				title, digestTime, timezone, reason)
 			if err := ownerNotifier.NotifyOwner(context.Background(), message); err != nil {
-				log.Printf("failed to notify owner about DST skip for group %d: %v", groupID, err)
+				applog.Printf("failed to notify owner about DST skip for group %d: %v", groupID, err)
 			}
 		}),
 	)
 	srv.SetGroupScheduler(sched)
-
 	telegramBot, err := bot.NewWithConfig(
 		cfg.BotToken,
 		cfg.OwnerTelegramID,
@@ -137,7 +134,7 @@ func main() {
 		sched,
 	)
 	if err != nil {
-		log.Fatalf("failed to configure Telegram bot: %v", err)
+		applog.Fatalf("failed to configure Telegram bot: %v", err)
 	}
 	telegramBot.SetTokenRevocationHandler(revocationHandler)
 	srv.SetTopicLifecycle(telegramBot)
@@ -145,10 +142,10 @@ func main() {
 	telegramBot.SetForumMutationFence(forumFence)
 	telegramBot.SetForumTopicRegistry(store.ForumTopics)
 	if err := telegramBot.ReconcilePendingTopicClosures(context.Background()); err != nil {
-		log.Printf("pending forum topic reconciliation incomplete: %v", err)
+		applog.Printf("pending forum topic reconciliation incomplete: %v", err)
 	}
 	if err := telegramBot.ReconcilePendingTopicCreations(context.Background()); err != nil {
-		log.Printf("pending forum topic creation cleanup incomplete: %v", err)
+		applog.Printf("pending forum topic creation cleanup incomplete: %v", err)
 	}
 	appLifecycle.Add(srv)
 	appLifecycle.Add(maintenanceSvc)
@@ -164,24 +161,24 @@ func main() {
 		// Keep the durable checkpoint for the next retry while allowing the
 		// rest of the application to start. A transient Telegram outage must
 		// not prevent HTTP health checks or the scheduler from coming up.
-		log.Printf("pending digest delivery reconciliation incomplete: %v", err)
+		applog.Printf("pending digest delivery reconciliation incomplete: %v", err)
 	}
 	if err := sched.Start(); err != nil {
-		log.Fatalf("failed to start scheduler: %v", err)
+		applog.Fatalf("failed to start scheduler: %v", err)
 	}
 	// Run missed-schedule catch-up asynchronously so startup is not blocked
 	// while past-due digests are generated. This implements the deterministic
 	// "always catch up on missed schedules" behavior required after restart.
 	go func() {
 		if err := sched.CatchUp(); err != nil {
-			log.Printf("scheduler catch-up incomplete: %v", err)
+			applog.Printf("scheduler catch-up incomplete: %v", err)
 		}
 	}()
 	if err := srv.ReconcileGroupScheduler(context.Background()); err != nil {
-		log.Printf("pending WebApp group scheduler reconciliation incomplete: %v", err)
+		applog.Printf("pending WebApp group scheduler reconciliation incomplete: %v", err)
 	}
 	if err := reconcilePendingSettings(context.Background(), store, sched); err != nil {
-		log.Printf("pending WebApp settings reconciliation incomplete: %v", err)
+		applog.Printf("pending WebApp settings reconciliation incomplete: %v", err)
 	}
 	if terminal, _ := appLifecycle.Terminal(); terminal {
 		<-appLifecycle.Done()
@@ -194,36 +191,32 @@ func main() {
 		return applyProductionSettingsMutation(ctx, store, sched, mutation)
 	})
 	go func() {
-		log.Printf("HTTP server listening on :%s", cfg.Port)
+		applog.Info("HTTP server listening", "port", cfg.Port)
 		if err := srv.Start(cfg.Port); err != nil {
-			log.Printf("HTTP server error: %v", err)
+			applog.Printf("HTTP server error: %v", err)
 		}
 	}()
 	go func() {
 		if err := telegramBot.Start(); err != nil {
-			log.Printf("Telegram bot stopped: %v", err)
+			applog.Printf("Telegram bot stopped: %v", err)
 		}
 	}()
-
 	// Wait for a signal or a coordinated terminal transition.
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	select {
 	case sig := <-quit:
-		log.Printf("Received signal %v, shutting down...", sig)
+		applog.Info("received signal, shutting down", "signal", sig)
 	case <-appLifecycle.Done():
-		log.Printf("Application entered bounded terminal state")
+		applog.Printf("Application entered bounded terminal state")
 	}
-
 	// Graceful shutdown
 	srv.Stop()
 	maintenanceSvc.Stop()
 	sched.Stop()
 	telegramBot.Stop()
-
-	log.Println("Shutdown complete")
+	applog.Info("Shutdown complete")
 }
-
 func validatorHTTPOnlyEnabled() bool {
 	return os.Getenv("VALIDATOR_HTTP_ONLY") == "1"
 }
@@ -249,7 +242,6 @@ func newValidatorHTTPServer(cfg *config.Config, store *db.DB) (*webapp.Server, e
 	server.SetGroupVerifier(validatorDisabledGroupVerifier{})
 	return server, nil
 }
-
 func runValidatorHTTPOnly() error {
 	cfg, err := config.LoadValidator()
 	if err != nil {
@@ -262,11 +254,10 @@ func runValidatorHTTPOnly() error {
 	validatorOwnerKey := cfg.DBPath
 	defer func() {
 		if cleanupErr := runDB.cleanup(); cleanupErr != nil {
-			log.Printf("validator database cleanup failed: %v", cleanupErr)
+			applog.Printf("validator database cleanup failed: %v", cleanupErr)
 		}
 	}()
 	cfg.DBPath = runDB.path
-
 	listener, err := net.Listen("tcp", ":"+cfg.Port)
 	if err != nil {
 		return fmt.Errorf("bind validator HTTP listener on port %s: %w", cfg.Port, err)
@@ -274,15 +265,14 @@ func runValidatorHTTPOnly() error {
 	var owner *validatorListenerOwner
 	defer func() {
 		if closeErr := listener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
-			log.Printf("validator listener cleanup failed: %v", closeErr)
+			applog.Printf("validator listener cleanup failed: %v", closeErr)
 		}
 		if owner != nil {
 			if releaseErr := owner.Release(); releaseErr != nil {
-				log.Printf("validator listener ownership cleanup failed: %v", releaseErr)
+				applog.Printf("validator listener ownership cleanup failed: %v", releaseErr)
 			}
 		}
 	}()
-
 	owner, err = newValidatorListenerOwnerForRun(validatorOwnerKey, cfg.DBPath)
 	if err != nil {
 		return err
@@ -290,7 +280,6 @@ func runValidatorHTTPOnly() error {
 	if err := owner.Claim(); err != nil {
 		return err
 	}
-
 	store, err := db.OpenWithEncryptionKey(cfg.DBPath, cfg.ProviderKey)
 	if err != nil {
 		return fmt.Errorf("open validator database at %s: %w", cfg.DBPath, err)
@@ -304,7 +293,6 @@ func runValidatorHTTPOnly() error {
 			return fmt.Errorf("seed validator fixture %s: %w", validatorFixtureProfile, err)
 		}
 	}
-
 	srv, err := newValidatorHTTPServer(cfg, store)
 	if err != nil {
 		return err
@@ -321,13 +309,12 @@ func runValidatorHTTPOnly() error {
 	go func() {
 		serverErr <- srv.Serve(listener)
 	}()
-
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(quit)
 	select {
 	case sig := <-quit:
-		log.Printf("Validator HTTP mode received signal %v, shutting down...", sig)
+		applog.Printf("Validator HTTP mode received signal %v, shutting down...", sig)
 	case err := <-serverErr:
 		srv.Stop()
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -378,7 +365,6 @@ func reconcilePendingSettings(ctx context.Context, store *db.DB, sched *schedule
 		return reconcilePendingSettingsLocked(ctx, store, sched)
 	})
 }
-
 func reconcilePendingSettingsLocked(ctx context.Context, store *db.DB, sched *scheduler.Scheduler) error {
 	pending, err := store.Config.Get(pendingSettingsSyncKey)
 	if errors.Is(err, db.ErrNotFound) {
@@ -423,7 +409,6 @@ func reconcilePendingSettingsLocked(ctx context.Context, store *db.DB, sched *sc
 	}
 	return nil
 }
-
 func applyProductionSettingsMutation(ctx context.Context, store *db.DB, sched *scheduler.Scheduler, mutation webapp.SettingsMutation) (int64, error) {
 	if store == nil || sched == nil {
 		return 0, errors.New("production settings dependencies are not configured")
@@ -441,7 +426,6 @@ func applyProductionSettingsMutation(ctx context.Context, store *db.DB, sched *s
 	})
 	return version, err
 }
-
 func applyProductionSettingsMutationLocked(ctx context.Context, store *db.DB, sched *scheduler.Scheduler, mutation webapp.SettingsMutation) (int64, error) {
 	if mutation.Version <= 0 {
 		return 0, db.ErrConflict
@@ -483,7 +467,6 @@ func applyProductionSettingsMutationLocked(ctx context.Context, store *db.DB, sc
 	if err != nil {
 		return 0, fmt.Errorf("encode WebApp settings: %w", err)
 	}
-
 	groups, err := store.Groups.List()
 	if err != nil {
 		return 0, fmt.Errorf("list groups for WebApp settings: %w", err)
@@ -514,7 +497,6 @@ func applyProductionSettingsMutationLocked(ctx context.Context, store *db.DB, sc
 	if err != nil {
 		return 0, fmt.Errorf("prepare scheduler settings refresh: %w", err)
 	}
-
 	pendingValue, err := json.Marshal(struct {
 		Version      int64                          `json:"version"`
 		DigestTime   string                         `json:"digest_time"`
@@ -553,14 +535,12 @@ func applyProductionSettingsMutationLocked(ctx context.Context, store *db.DB, sc
 	}
 	return version, nil
 }
-
 func ensureDefaultAIProvider(store *db.DB, apiKey string) error {
 	if _, err := store.Providers.GetDefault(); err == nil {
 		return nil
 	} else if !errors.Is(err, db.ErrNotFound) {
 		return fmt.Errorf("check default AI provider: %w", err)
 	}
-
 	provider, err := store.Providers.GetByName("OpenRouter")
 	if errors.Is(err, db.ErrNotFound) {
 		_, err = store.Providers.Insert(&model.AIProvider{
@@ -578,7 +558,6 @@ func ensureDefaultAIProvider(store *db.DB, apiKey string) error {
 	if err != nil {
 		return fmt.Errorf("load OpenRouter provider: %w", err)
 	}
-
 	provider.APIKey = apiKey
 	provider.DefaultModel = summarizer.DefaultOpenRouterModel
 	provider.IsDefault = true

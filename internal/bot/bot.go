@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	applog "github.com/boss/tg-channel-summary-by-ai/internal/log"
 	"net/url"
 	"sort"
 	"strconv"
@@ -172,7 +172,7 @@ type Service struct {
 // New creates an unconfigured service. Use NewWithConfig for production.
 func New() *Service {
 	service := &Service{
-		logger:               log.Default(),
+		logger:               applog.GetDefault(),
 		commands:             make(map[string]CommandHandler),
 		deliveryChatThrottle: deliveryChatThrottle,
 	}

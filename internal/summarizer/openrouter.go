@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	applog "github.com/boss/tg-channel-summary-by-ai/internal/log"
 	"net"
 	"net/http"
 	"strconv"
@@ -369,7 +369,7 @@ func (p *OpenRouterProvider) summarizeBatch(ctx context.Context, posts []Post) (
 	}
 	parsed, err := parseBatchSummaries(content)
 	if err != nil {
-		log.Printf("AI response unparseable: %v", err)
+		applog.Printf("AI response unparseable: %v", err)
 		return nil, fmt.Errorf("parse summaries: %w", err)
 	}
 
@@ -381,11 +381,11 @@ func (p *OpenRouterProvider) summarizeBatch(ctx context.Context, posts []Post) (
 	for _, item := range parsed {
 		text := strings.TrimSpace(item.Summary)
 		if _, ok := expected[item.PostID]; !ok {
-			log.Printf("AI returned hallucinated summary for unknown post %d; discarding", item.PostID)
+			applog.Printf("AI returned hallucinated summary for unknown post %d; discarding", item.PostID)
 			continue
 		}
 		if _, duplicate := byID[item.PostID]; duplicate {
-			log.Printf("AI returned duplicate summary for post %d; discarding", item.PostID)
+			applog.Printf("AI returned duplicate summary for post %d; discarding", item.PostID)
 			continue
 		}
 		if err := validateSummaryText(text); err != nil {
@@ -394,9 +394,9 @@ func (p *OpenRouterProvider) summarizeBatch(ctx context.Context, posts []Post) (
 		byID[item.PostID] = text
 	}
 	if len(byID) != len(posts) {
-		log.Printf("AI returned %d summaries for %d posts: WARNING: %d posts not summarized", len(byID), len(posts), len(posts)-len(byID))
+		applog.Printf("AI returned %d summaries for %d posts: WARNING: %d posts not summarized", len(byID), len(posts), len(posts)-len(byID))
 	} else {
-		log.Printf("AI returned %d summaries for %d posts - OK", len(byID), len(posts))
+		applog.Printf("AI returned %d summaries for %d posts - OK", len(byID), len(posts))
 	}
 	summaries := make([]Summary, 0, len(posts))
 	for _, post := range posts {

@@ -8,7 +8,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
-	"log"
+	applog "github.com/boss/tg-channel-summary-by-ai/internal/log"
 	"net/http"
 	"strings"
 	"sync"
@@ -344,7 +344,7 @@ func (s *Service) generate(groupID int64, windowID string, manual bool) (*Digest
 			result.MessageURL = receipt.MessageURL
 			result.Delivered = true
 			if markErr := s.database.Digests.MarkSent(pendingID, receipt.MessageID); markErr != nil {
-				log.Printf("configuration warning %d delivered but checkpoint remains pending: %v", pendingID, markErr)
+				applog.Printf("configuration warning %d delivered but checkpoint remains pending: %v", pendingID, markErr)
 			}
 		}
 		return result, terminalDigestError(result, nil, manual)
@@ -382,7 +382,7 @@ func (s *Service) generate(groupID int64, windowID string, manual bool) (*Digest
 			result.MessageURL = receipt.MessageURL
 			result.Delivered = true
 			if markErr := s.database.Digests.MarkSent(pendingID, receipt.MessageID); markErr != nil {
-				log.Printf("empty digest %d delivered but checkpoint remains pending: %v", pendingID, markErr)
+				applog.Printf("empty digest %d delivered but checkpoint remains pending: %v", pendingID, markErr)
 			}
 		}
 		return result, terminalDigestError(result, nil, manual)
@@ -416,7 +416,7 @@ func (s *Service) generate(groupID int64, windowID string, manual bool) (*Digest
 		if err := s.database.Digests.MarkSent(pendingID, receipt.MessageID); err != nil {
 			// The send succeeded and the pending row remains durable, so a
 			// restart can reconcile it instead of losing the checkpoint.
-			log.Printf("digest %d delivered but checkpoint remains pending: %v", pendingID, err)
+			applog.Printf("digest %d delivered but checkpoint remains pending: %v", pendingID, err)
 		}
 	}
 	if len(batch.Failures) > 0 {
@@ -563,7 +563,7 @@ func (s *Service) notifyDigestOutcome(result *Digest) {
 		message += " Сводки сохранены, но не доставлены."
 	}
 	if err := s.notifier.NotifyOwner(context.Background(), message); err != nil {
-		log.Printf("failed to notify owner about digest outcome %s for group %d: %v", result.Outcome, result.GroupID, err)
+		applog.Printf("failed to notify owner about digest outcome %s for group %d: %v", result.Outcome, result.GroupID, err)
 	}
 }
 
@@ -705,7 +705,7 @@ func (s *Service) summarizeWithWindow(groupID int64, posts []model.Post, windowI
 		if creditErr != nil {
 			// The balance endpoint is auxiliary. If it is unavailable, let
 			// the completion request decide whether the provider is usable.
-			log.Printf("OpenRouter credit check failed for group %d: %v", groupID, creditErr)
+			applog.Printf("OpenRouter credit check failed for group %d: %v", groupID, creditErr)
 		} else if credits.Credits < s.creditMinimumOrDefault() {
 			err := fmt.Errorf("OpenRouter credits exhausted: %.2f", credits.Credits)
 			s.notifyAIFailureForWindow(windowID, groupID, err)
@@ -1044,7 +1044,7 @@ func (s *Service) notifyAI(groupID int64, message string) error {
 	if err := s.notifier.NotifyOwner(context.Background(), message); err != nil {
 		// The provider error remains the actionable digest failure; a transport
 		// failure must not replace it or cause a retry to invoke the provider.
-		log.Printf("failed to notify owner about AI digest group %d: %v", groupID, err)
+		applog.Printf("failed to notify owner about AI digest group %d: %v", groupID, err)
 		return err
 	}
 	return nil

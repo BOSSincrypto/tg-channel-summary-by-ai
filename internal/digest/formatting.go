@@ -22,8 +22,10 @@ func (s *Service) formatDigestMessage(groupID int64, posts []model.Post) string 
 
 	channelTitles := make(map[int64]string)
 	channelOrder := make([]int64, 0)
+	channelPostCounts := make(map[int64]int)
 	seenChannels := make(map[int64]struct{})
 	for _, post := range posts {
+		channelPostCounts[post.ChannelID]++
 		if _, seen := seenChannels[post.ChannelID]; seen {
 			continue
 		}
@@ -32,8 +34,22 @@ func (s *Service) formatDigestMessage(groupID int64, posts []model.Post) string 
 		channelTitles[post.ChannelID] = s.channelTitle(post.ChannelID)
 	}
 
+	fmt.Fprintf(
+		&builder,
+		"\n\n📊 Всего: %d %s из %d %s",
+		len(posts),
+		russianCountWord(len(posts), "пост", "поста", "постов"),
+		len(channelOrder),
+		russianCountWord(len(channelOrder), "канал", "канала", "каналов"),
+	)
 	for _, channelID := range channelOrder {
-		fmt.Fprintf(&builder, "\n\n*%s*", escapeMarkdownV2(channelTitles[channelID]))
+		fmt.Fprintf(
+			&builder,
+			"\n\n📢 *%s* — %d %s",
+			escapeMarkdownV2(channelTitles[channelID]),
+			channelPostCounts[channelID],
+			russianCountWord(channelPostCounts[channelID], "пост", "поста", "постов"),
+		)
 		for _, post := range posts {
 			if post.ChannelID != channelID {
 				continue
@@ -53,22 +69,32 @@ func (s *Service) formatDigestMessage(groupID int64, posts []model.Post) string 
 				text = "Без текста"
 			}
 			builder.WriteString("\n• ")
+			builder.WriteString(escapeMarkdownV2(text))
 			if url := strings.TrimSpace(post.URL); url != "" {
-				builder.WriteByte('[')
-				builder.WriteString(escapeMarkdownV2(text))
-				builder.WriteString("](")
+				builder.WriteString(" ")
+				builder.WriteString("[🔗 Открыть](")
 				builder.WriteString(escapeMarkdownV2URL(url))
 				builder.WriteByte(')')
-			} else {
-				builder.WriteString(escapeMarkdownV2(text))
 			}
 		}
 	}
 
-	builder.WriteString("\n\n_Обновлено: ")
-	builder.WriteString(timestamp)
-	builder.WriteByte('_')
 	return strings.TrimSpace(builder.String())
+}
+
+func russianCountWord(value int, one, few, many string) string {
+	mod100 := value % 100
+	if mod100 >= 11 && mod100 <= 14 {
+		return many
+	}
+	switch value % 10 {
+	case 1:
+		return one
+	case 2, 3, 4:
+		return few
+	default:
+		return many
+	}
 }
 
 func (s *Service) channelTitle(channelID int64) string {
@@ -213,6 +239,25 @@ func packDigestLines(body string, limit int) []string {
 }
 
 func splitOversizedDigestLine(line string, limit int) []string {
+	const compactLinkMarker = " [🔗 Открыть]("
+	if marker := strings.LastIndex(line, compactLinkMarker); marker >= 0 &&
+		strings.HasSuffix(line, ")") {
+		link := line[marker+1:]
+		if runeCount(link) <= limit {
+			summaryChunks := splitOversizedDigestLine(line[:marker], limit)
+			if len(summaryChunks) == 0 {
+				return []string{link}
+			}
+			last := len(summaryChunks) - 1
+			if runeCount(summaryChunks[last])+1+runeCount(link) <= limit {
+				summaryChunks[last] += " " + link
+			} else {
+				summaryChunks = append(summaryChunks, link)
+			}
+			return summaryChunks
+		}
+	}
+
 	const linkPrefix = "• ["
 	if strings.HasPrefix(line, linkPrefix) {
 		marker := strings.Index(line[len(linkPrefix):], "](")

@@ -1,6 +1,7 @@
 package digest
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -234,4 +235,97 @@ func TestSplitDigestMessageKeepsCompactPostLinksBalanced(t *testing.T) {
 	if !foundLink {
 		t.Fatalf("split output lost compact link:\n%s", strings.Join(parts, "\n"))
 	}
+}
+
+func TestFormatAndSplitDigestEscapesSensitiveURLAndPreservesTarget(t *testing.T) {
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+
+	groupID, err := store.Groups.Insert(&model.Group{
+		TelegramChatID: -100102,
+		Title:          "URL regression",
+	})
+	if err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	channelID, err := store.Channels.Insert(&model.Channel{
+		Username: "url_regression",
+		Title:    "URL regression channel",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+
+	const targetURL = `https://example.test/posts/(release)\candidate\final`
+	const wantEscapedURL = `https://example.test/posts/\(release\)\\candidate\\final`
+	summary := strings.Repeat("Длинное резюме проверяет перенос компактной ссылки. ", 20)
+	message := NewWithProcessor(store, nil).formatDigestMessage(groupID, []model.Post{{
+		ChannelID: channelID,
+		Summary:   &summary,
+		URL:       targetURL,
+	}})
+	wantLink := "[🔗 Открыть](" + wantEscapedURL + ")"
+	if !strings.Contains(message, wantLink) {
+		t.Fatalf("formatted message missing escaped URL link %q:\n%s", wantLink, message)
+	}
+
+	const limit = 160
+	parts := splitDigestMessage(message, limit)
+	if len(parts) < 2 {
+		t.Fatalf("split parts = %d, want multiple parts", len(parts))
+	}
+
+	var targets []string
+	for index, part := range parts {
+		if runeCount(part) > limit {
+			t.Fatalf("part %d has %d runes, limit %d:\n%s", index+1, runeCount(part), limit, part)
+		}
+		for _, line := range strings.Split(part, "\n") {
+			if !strings.Contains(line, "[🔗 Открыть](") {
+				continue
+			}
+			target, parseErr := parseCompactMarkdownV2Link(line)
+			if parseErr != nil {
+				t.Fatalf("part %d link is not balanced or parseable: %v\n%s", index+1, parseErr, part)
+			}
+			targets = append(targets, target)
+		}
+	}
+	if len(targets) != 1 || targets[0] != targetURL {
+		t.Fatalf("split link targets = %q, want one complete target %q:\n%s", targets, targetURL, strings.Join(parts, "\n"))
+	}
+}
+
+func parseCompactMarkdownV2Link(line string) (string, error) {
+	const marker = "[🔗 Открыть]("
+	start := strings.Index(line, marker)
+	if start < 0 {
+		return "", fmt.Errorf("compact link marker is missing")
+	}
+	encoded := line[start+len(marker):]
+	if !strings.HasSuffix(encoded, ")") {
+		return "", fmt.Errorf("compact link has no closing parenthesis")
+	}
+	encoded = encoded[:len(encoded)-1]
+
+	var target strings.Builder
+	for index := 0; index < len(encoded); index++ {
+		switch encoded[index] {
+		case '\\':
+			if index+1 >= len(encoded) {
+				return "", fmt.Errorf("compact link ends with an escape")
+			}
+			target.WriteByte(encoded[index+1])
+			index++
+		case '(', ')':
+			return "", fmt.Errorf("compact link contains an unescaped parenthesis")
+		default:
+			target.WriteByte(encoded[index])
+		}
+	}
+	return target.String(), nil
 }

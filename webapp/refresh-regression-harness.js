@@ -569,10 +569,14 @@ async function testAssignmentReusesNewestGroupVersion() {
   checkbox.checked = true;
   const form = checkbox.closest("form");
   assert(form, "Assignment channel choice is not inside a form");
-  form.requestSubmit();
+  const save = form.querySelectorAll("button").find((button) => button.textContent === "Назначить");
+  assert(save, "Assignment modal did not render the visible Назначить button");
+  assert(save.type === "submit", "Assignment button is not a submit control");
+  save.click();
   await settle();
   const mutation = app.findPending("/api/groups/7/channels", "POST");
   assert(mutation.body.version === 5, "Assignment mutation reused a stale optimistic group version");
+  assert(String(mutation.body.channel_id) === "11", "Assignment mutation did not post the selected channel ID");
   app.resolve(mutation, {});
   await settle();
   const confirmation = app.findPending("/api/groups/7");
@@ -586,6 +590,12 @@ async function testAssignmentReusesNewestGroupVersion() {
   });
   await settle();
   assert(app.hooks.findGroup("7").version === 6, "Assignment did not apply its authoritative follow-up group");
+  await settle();
+  assert(!app.document.querySelector('[role="dialog"]'), "Successful assignment left the modal open");
+  assert(
+    app.document.querySelectorAll(".toast").some((toast) => visibleText(toast).includes("Каналы назначены.")),
+    "Successful assignment did not show visible success feedback"
+  );
 }
 
 async function testTimezoneFocusShowsCatalogAndTypingFilters() {

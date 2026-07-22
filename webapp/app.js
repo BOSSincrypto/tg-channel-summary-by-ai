@@ -856,6 +856,7 @@
           form.appendChild(topic.wrap);
         }
         var save = button("Назначить", "primary");
+        save.type = "submit";
         var assignmentActions = el("div", "actions");
         assignmentActions.appendChild(save);
         form.appendChild(assignmentActions);

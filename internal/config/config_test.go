@@ -105,6 +105,7 @@ func TestLoad_MissingDotEnvUsesProvidedDBPath(t *testing.T) {
 
 func TestParse_AllRequiredFields(t *testing.T) {
 	t.Setenv("WEBAPP_URL", "")
+	t.Setenv("PROVIDER_ENCRYPTION_KEY", "")
 	input := strings.NewReader(`
 BOT_TOKEN=test_bot_token_123
 OWNER_TELEGRAM_ID=123456789
@@ -122,6 +123,9 @@ OPENROUTER_API_KEY=test-openrouter-placeholder
 	}
 	if cfg.OpenRouterKey != "test-openrouter-placeholder" {
 		t.Errorf("OpenRouterKey = %q, want %q", cfg.OpenRouterKey, "test-openrouter-placeholder")
+	}
+	if cfg.ProviderKeySource != "legacy-bot-token" {
+		t.Errorf("ProviderKeySource = %q, want legacy-bot-token", cfg.ProviderKeySource)
 	}
 	if cfg.WebAppURL != "https://tg-channel-summary.fly.dev/webapp/" {
 		t.Errorf("WebAppURL = %q, want default HTTPS URL", cfg.WebAppURL)
@@ -142,6 +146,26 @@ WEBAPP_URL=https://settings.example.test/
 	}
 	if cfg.WebAppURL != "https://settings.example.test/" {
 		t.Fatalf("WebAppURL = %q, want configured URL", cfg.WebAppURL)
+	}
+}
+
+func TestParse_ExplicitProviderEncryptionKeyIsMarkedStable(t *testing.T) {
+	t.Setenv("PROVIDER_ENCRYPTION_KEY", "")
+	input := strings.NewReader(`
+BOT_TOKEN=test-token
+OWNER_TELEGRAM_ID=123
+OPENROUTER_API_KEY=test
+PROVIDER_ENCRYPTION_KEY=stable-provider-key
+`)
+	cfg, err := Parse(input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.ProviderKey != "stable-provider-key" {
+		t.Fatalf("ProviderKey = %q, want explicit key", cfg.ProviderKey)
+	}
+	if cfg.ProviderKeySource != "explicit" {
+		t.Fatalf("ProviderKeySource = %q, want explicit", cfg.ProviderKeySource)
 	}
 }
 
@@ -468,6 +492,7 @@ func TestParse_CRLFLineEndings(t *testing.T) {
 func TestLoadValidator_RequiresExplicitFakeCredentialsAndTempDatabase(t *testing.T) {
 	chdirToTempDir(t)
 	t.Setenv("VALIDATOR_HTTP_ONLY", "1")
+	t.Setenv("VALIDATOR_RUN_TOKEN", "validator-run-token")
 	t.Setenv("BOT_TOKEN", "validator:fake")
 	t.Setenv("OWNER_TELEGRAM_ID", "715602446")
 	t.Setenv("OPENROUTER_API_KEY", "validator-openrouter-key")
@@ -505,6 +530,7 @@ func TestLoadValidator_RequiresExplicitFakeCredentialsAndTempDatabase(t *testing
 func TestLoadValidatorRejectsProductionCredentialShape(t *testing.T) {
 	chdirToTempDir(t)
 	t.Setenv("VALIDATOR_HTTP_ONLY", "1")
+	t.Setenv("VALIDATOR_RUN_TOKEN", "validator-run-token")
 	t.Setenv("BOT_TOKEN", "123456:production-token")
 	t.Setenv("OWNER_TELEGRAM_ID", "715602446")
 	t.Setenv("OPENROUTER_API_KEY", "sk-or-v1-production-key")
@@ -522,9 +548,23 @@ func TestLoadValidatorRequiresExplicitOptIn(t *testing.T) {
 	}
 }
 
+func TestLoadValidatorRequiresRunToken(t *testing.T) {
+	t.Setenv("VALIDATOR_HTTP_ONLY", "1")
+	t.Setenv("VALIDATOR_RUN_TOKEN", "")
+	t.Setenv("BOT_TOKEN", "validator:fake")
+	t.Setenv("OWNER_TELEGRAM_ID", "715602446")
+	t.Setenv("OPENROUTER_API_KEY", "validator-openrouter-key")
+	t.Setenv("DB_PATH", filepath.Join(os.TempDir(), "tg-channel-summary-validator-test.sqlite"))
+
+	if _, err := LoadValidator(); err == nil || !strings.Contains(err.Error(), "VALIDATOR_RUN_TOKEN") {
+		t.Fatalf("error = %v, want missing VALIDATOR_RUN_TOKEN error", err)
+	}
+}
+
 func TestLoadValidatorRejectsTemporaryDirectoryAsDatabasePath(t *testing.T) {
 	chdirToTempDir(t)
 	t.Setenv("VALIDATOR_HTTP_ONLY", "1")
+	t.Setenv("VALIDATOR_RUN_TOKEN", "validator-run-token")
 	t.Setenv("BOT_TOKEN", "validator:fake")
 	t.Setenv("OWNER_TELEGRAM_ID", "715602446")
 	t.Setenv("OPENROUTER_API_KEY", "validator-openrouter-key")

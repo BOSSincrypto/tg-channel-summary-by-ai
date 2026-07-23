@@ -100,20 +100,41 @@ All settings are loaded from environment variables (`.env` file or process envir
 | `BOT_TOKEN` | Yes | — | Telegram bot token from @BotFather |
 | `OWNER_TELEGRAM_ID` | Yes | — | Numeric Telegram user ID of the bot owner |
 | `OPENROUTER_API_KEY` | Yes | — | OpenRouter API key |
-| `PROVIDER_ENCRYPTION_KEY` | No | `BOT_TOKEN` | Key for encrypting provider API keys at rest |
-| `CUSTOM_PROVIDERS` | No | `[]` | JSON array of custom AI providers |
-| `DIGEST_TIME` | No | `21:00` | Daily digest time in `HH:MM` format |
-| `TIMEZONE` | No | `Europe/Moscow` | IANA timezone for digest scheduling |
+| `PROVIDER_ENCRYPTION_KEY` | Recommended | — | Stable key for encrypting provider API keys at rest; keep it unchanged across bot-token rotations |
+| `PROVIDER_ENCRYPTION_KEY_PREVIOUS` | Migration only | — | One-deployment previous key for legacy provider-key migration; remove after a successful restart |
+| `CUSTOM_PROVIDERS` | Legacy/ignored | — | Not an active runtime setting; configure providers in the authenticated WebApp |
+| `DIGEST_TIME` | Legacy/ignored | — | Per-group digest time is persisted in the database and configured in the authenticated WebApp |
+| `TIMEZONE` | Legacy/ignored | — | Per-group timezone is persisted in the database and configured in the authenticated WebApp |
 | `WEBAPP_URL` | No | `https://tg-channel-summary.fly.dev/webapp/` | HTTPS URL for the WebApp mini-app |
 | `PORT` | No | `8080` | HTTP server port (health check + WebApp) |
 | `DB_PATH` | No | `bot.db` | SQLite database file path |
 | `LOG_LEVEL` | No | `info` | Log level: `debug`, `info`, `warn`, `error` |
-| `FETCH_DELAY_MS` | No | `2500` | Delay between channel fetch requests (ms) |
+| `FETCH_DELAY_MS` | Legacy/ignored | — | Not used by the parser; request pacing is defined by the parser implementation |
 | `MAX_RETRIES` | No | `3` | Max retries for failed channel fetches |
 | `MAX_POSTS_PER_CHANNEL` | No | `50` | Max posts per channel per digest |
 | `POST_RETENTION_DAYS` | No | `90` | Days to retain scraped posts before cleanup |
 
 Secrets must never be committed. `.env` and `*.db` are in `.gitignore`.
+
+### Provider-key migration
+
+Older deployments may have provider API keys encrypted from `BOT_TOKEN`. To
+avoid losing access during a bot-token rotation:
+
+1. Set a stable random `PROVIDER_ENCRYPTION_KEY` and keep the current
+   `BOT_TOKEN` unchanged for the migration restart.
+2. If the current token has already been rotated, set
+   `PROVIDER_ENCRYPTION_KEY_PREVIOUS` to the prior token-derived key material
+   for one restart.
+3. Restart the application and confirm it opens the database successfully.
+   Existing provider rows are decrypted with the legacy key and re-encrypted
+   under the stable key in one transaction.
+4. Remove `PROVIDER_ENCRYPTION_KEY_PREVIOUS`. Never log either key.
+
+When `PROVIDER_ENCRYPTION_KEY` is absent, the application retains the
+backwards-compatible `BOT_TOKEN` fallback and marks that source as
+`legacy-bot-token` in parsed configuration. This fallback is rotation-sensitive;
+set the stable key before rotating `BOT_TOKEN`.
 
 ## Testing
 
@@ -203,4 +224,21 @@ If the bot token is revoked while running, the application detects the 401 respo
 
 ## Validator HTTP Mode
 
-For local browser-based validation without external traffic, the application supports `VALIDATOR_HTTP_ONLY=1` with optional `VALIDATOR_FIXTURE=bot-admin-r2`. This mode starts only the HTTP/WebApp server on port 8080 using fake credentials and a temporary SQLite database. It does not start Telegram polling or call any external service. Production `.env` is never loaded in this mode.
+For local browser-based validation without external traffic, configure all
+required validator values before launch:
+
+```bash
+$env:VALIDATOR_HTTP_ONLY="1"
+$env:VALIDATOR_RUN_TOKEN="local-validator-run"
+$env:VALIDATOR_FIXTURE="bot-admin-r2" # optional
+$env:BOT_TOKEN="validator:fake"
+$env:OWNER_TELEGRAM_ID="715602446"
+$env:OPENROUTER_API_KEY="validator-openrouter-key"
+$env:DB_PATH="$env:TEMP\tg-channel-summary-validator.sqlite"
+go run ./cmd/bot/
+```
+
+`VALIDATOR_RUN_TOKEN` is required for the authenticated browser boundary. This
+mode starts only the HTTP/WebApp server on port 8080 using fake credentials and
+a temporary SQLite database. It does not start Telegram polling or call any
+external service. Production `.env` is never loaded in this mode.

@@ -15,10 +15,14 @@ import (
 
 // Config holds all configuration values for the application.
 type Config struct {
-	BotToken          string
-	OwnerTelegramID   string
-	OpenRouterKey     string
-	ProviderKey       string
+	BotToken        string
+	OwnerTelegramID string
+	OpenRouterKey   string
+	ProviderKey     string
+	// ProviderKeySource is "explicit" when PROVIDER_ENCRYPTION_KEY is set,
+	// otherwise "legacy-bot-token". It makes the rotation-sensitive fallback
+	// visible to startup diagnostics without exposing secret material.
+	ProviderKeySource string
 	CustomProviders   string
 	DigestTime        string
 	Timezone          string
@@ -53,6 +57,9 @@ func Load() (*Config, error) {
 func LoadValidator() (*Config, error) {
 	if os.Getenv("VALIDATOR_HTTP_ONLY") != "1" {
 		return nil, fmt.Errorf("VALIDATOR_HTTP_ONLY=1 is required for validator HTTP mode")
+	}
+	if strings.TrimSpace(os.Getenv("VALIDATOR_RUN_TOKEN")) == "" {
+		return nil, fmt.Errorf("validator HTTP mode requires VALIDATOR_RUN_TOKEN")
 	}
 
 	cfg, err := Parse(strings.NewReader(""))
@@ -92,6 +99,7 @@ func LoadValidator() (*Config, error) {
 	cfg.DBPath = dbPath
 	cfg.Port = "8080"
 	cfg.ProviderKey = cfg.BotToken
+	cfg.ProviderKeySource = "validator-fake"
 	cfg.WebAppURL = "http://localhost:8080/webapp/"
 	return cfg, nil
 }
@@ -143,6 +151,10 @@ func Parse(r io.Reader) (*Config, error) {
 	cfg.LogLevel = stringDefault(values, "LOG_LEVEL", "info")
 	cfg.CustomProviders = values["CUSTOM_PROVIDERS"] // may be empty
 	cfg.ProviderKey = stringDefault(values, "PROVIDER_ENCRYPTION_KEY", cfg.BotToken)
+	cfg.ProviderKeySource = "legacy-bot-token"
+	if values["PROVIDER_ENCRYPTION_KEY"] != "" {
+		cfg.ProviderKeySource = "explicit"
+	}
 
 	cfg.FetchDelayMs = intDefault(values, "FETCH_DELAY_MS", 2500)
 	cfg.MaxRetries = intDefault(values, "MAX_RETRIES", 3)

@@ -51,9 +51,52 @@ func Open(path string) (*DB, error) {
 // OpenWithEncryptionKey opens SQLite and encrypts provider API keys with the
 // supplied application secret. The key is never persisted in the database.
 func OpenWithEncryptionKey(path, keyMaterial string) (*DB, error) {
+	return openWithEncryptionKeys(path, keyMaterial, providerKeyMigrationMaterials(keyMaterial))
+}
+
+// OpenWithLegacyEncryptionKey opens SQLite and migrates provider API keys
+// encrypted with legacyKey to keyMaterial. It is useful for controlled
+// migrations where the old BOT_TOKEN is supplied separately.
+func OpenWithLegacyEncryptionKey(path, keyMaterial, legacyKey string) (*DB, error) {
+	return openWithEncryptionKeys(path, keyMaterial, []string{legacyKey})
+}
+
+func providerKeyMigrationMaterials(current string) []string {
+	var materials []string
+	appendMaterial := func(material string) {
+		material = strings.TrimSpace(material)
+		if material == "" || material == strings.TrimSpace(current) {
+			return
+		}
+		for _, existing := range materials {
+			if existing == material {
+				return
+			}
+		}
+		materials = append(materials, material)
+	}
+
+	// PROVIDER_ENCRYPTION_KEY_PREVIOUS is intentionally a one-deployment
+	// migration aid. Remove it after a successful restart.
+	if strings.TrimSpace(os.Getenv("PROVIDER_ENCRYPTION_KEY")) != "" {
+		appendMaterial(os.Getenv("PROVIDER_ENCRYPTION_KEY_PREVIOUS"))
+		appendMaterial(os.Getenv("BOT_TOKEN"))
+	}
+	return materials
+}
+
+func openWithEncryptionKeys(path, keyMaterial string, legacyMaterials []string) (*DB, error) {
 	keyCipher, err := newSecretCipher(keyMaterial)
 	if err != nil {
 		return nil, fmt.Errorf("configure provider key encryption: %w", err)
+	}
+	legacyCiphers := make([]*secretCipher, 0, len(legacyMaterials))
+	for _, material := range legacyMaterials {
+		legacyCipher, err := newSecretCipher(material)
+		if err != nil {
+			return nil, fmt.Errorf("configure legacy provider key encryption: %w", err)
+		}
+		legacyCiphers = append(legacyCiphers, legacyCipher)
 	}
 	// Use WAL mode by default via pragma in the DSN.
 	dsn := path + "?_journal_mode=WAL&_foreign_keys=on&_busy_timeout=5000"
@@ -98,8 +141,8 @@ func OpenWithEncryptionKey(path, keyMaterial string) (*DB, error) {
 	if err := integrityCheck(conn); err != nil {
 		return closeOnError("post-migration integrity check", err)
 	}
-	if err := reencryptLegacyProviderKeys(conn, keyCipher); err != nil {
-		return closeOnError("encrypt legacy provider keys", err)
+	if err := migrateProviderKeys(conn, keyCipher, legacyCiphers); err != nil {
+		return closeOnError("migrate provider key encryption", err)
 	}
 
 	db := &DB{conn: conn, providerKeyCipher: keyCipher}
@@ -114,53 +157,88 @@ func OpenWithEncryptionKey(path, keyMaterial string) (*DB, error) {
 	return db, nil
 }
 
-func reencryptLegacyProviderKeys(conn *sql.DB, keyCipher *secretCipher) error {
-	rows, err := conn.Query(`SELECT id, api_key FROM ai_providers WHERE api_key NOT LIKE ?`, encryptedAPIKeyPrefix+"%")
+func migrateProviderKeys(conn *sql.DB, keyCipher *secretCipher, legacyCiphers []*secretCipher) error {
+	tx, err := conn.Begin()
 	if err != nil {
-		return fmt.Errorf("select legacy provider keys: %w", err)
+		return fmt.Errorf("begin provider key migration: %w", err)
 	}
-	defer rows.Close()
+	defer tx.Rollback()
 
-	type legacyKey struct {
+	rows, err := tx.Query(`SELECT id, api_key FROM ai_providers`)
+	if err != nil {
+		return fmt.Errorf("select provider keys: %w", err)
+	}
+
+	type providerKey struct {
 		id  int64
 		key string
 	}
-	var keys []legacyKey
+	var keys []providerKey
 	for rows.Next() {
-		var item legacyKey
+		var item providerKey
 		if err := rows.Scan(&item.id, &item.key); err != nil {
-			return fmt.Errorf("scan legacy provider key: %w", err)
+			rows.Close()
+			return fmt.Errorf("scan provider key: %w", err)
 		}
 		keys = append(keys, item)
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate legacy provider keys: %w", err)
+		rows.Close()
+		return fmt.Errorf("iterate provider keys: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close provider key migration rows: %w", err)
 	}
 	if len(keys) == 0 {
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit provider key migration: %w", err)
+		}
 		return nil
 	}
 
-	tx, err := conn.Begin()
-	if err != nil {
-		return fmt.Errorf("begin legacy provider key migration: %w", err)
-	}
-	defer tx.Rollback()
 	stmt, err := tx.Prepare(`UPDATE ai_providers SET api_key = ? WHERE id = ?`)
 	if err != nil {
-		return fmt.Errorf("prepare legacy provider key migration: %w", err)
+		return fmt.Errorf("prepare provider key migration: %w", err)
 	}
 	defer stmt.Close()
 	for _, item := range keys {
-		encrypted, err := keyCipher.encrypt(item.key)
+		if !strings.HasPrefix(item.key, encryptedAPIKeyPrefix) {
+			encrypted, err := keyCipher.encrypt(item.key)
+			if err != nil {
+				return fmt.Errorf("encrypt plaintext provider key %d: %w", item.id, err)
+			}
+			if _, err := stmt.Exec(encrypted, item.id); err != nil {
+				return fmt.Errorf("update plaintext provider key %d: %w", item.id, err)
+			}
+			continue
+		}
+
+		if _, err := keyCipher.decrypt(item.key); err == nil {
+			continue
+		}
+		var decrypted string
+		migrated := false
+		for _, legacyCipher := range legacyCiphers {
+			var err error
+			decrypted, err = legacyCipher.decrypt(item.key)
+			if err == nil {
+				migrated = true
+				break
+			}
+		}
+		if !migrated {
+			return fmt.Errorf("decrypt provider key %d with configured key; set PROVIDER_ENCRYPTION_KEY_PREVIOUS to the prior key for a one-time migration", item.id)
+		}
+		encrypted, err := keyCipher.encrypt(decrypted)
 		if err != nil {
-			return fmt.Errorf("encrypt legacy provider key %d: %w", item.id, err)
+			return fmt.Errorf("re-encrypt legacy provider key %d: %w", item.id, err)
 		}
 		if _, err := stmt.Exec(encrypted, item.id); err != nil {
 			return fmt.Errorf("update legacy provider key %d: %w", item.id, err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit legacy provider key migration: %w", err)
+		return fmt.Errorf("commit provider key migration: %w", err)
 	}
 	return nil
 }

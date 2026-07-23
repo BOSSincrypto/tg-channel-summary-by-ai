@@ -6,7 +6,7 @@ primary_region = "ams"
 
 [build]
   [build.args]
-    GO_VERSION = "1.26"
+    GO_VERSION = "1.26.5"
 
 [env]
   PORT = "8080"

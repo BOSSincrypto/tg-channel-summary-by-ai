@@ -1,5 +1,6 @@
 # Build stage
-FROM golang:1.26-bookworm AS builder
+ARG GO_VERSION=1.26.5
+FROM golang:${GO_VERSION}-bookworm AS builder
 
 WORKDIR /app
 
@@ -28,6 +29,7 @@ COPY --from=builder /app/bin/bot /app/bot
 
 USER botuser
 WORKDIR /app
+ENV DB_PATH=/data/bot.db
 
 # Expose health-check / WebApp port
 EXPOSE 8080

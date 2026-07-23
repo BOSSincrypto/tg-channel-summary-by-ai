@@ -3,5 +3,13 @@
 *.db
 *.db-wal
 *.db-shm
+*.db-journal
+*.exe
+*.out
+coverage.*
+bin/
+dist/
+tmp/
+app
 body.json
 research/

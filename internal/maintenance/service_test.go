@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,23 +13,35 @@ import (
 )
 
 type fakeCleaner struct {
+	mu            sync.Mutex
 	retentionDays []int
 	deleted       int64
 	err           error
 }
 
 func (f *fakeCleaner) CleanupPosts(retentionDays int) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.retentionDays = append(f.retentionDays, retentionDays)
 	return f.deleted, f.err
 }
 
+func (f *fakeCleaner) retentionDaysSnapshot() []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int(nil), f.retentionDays...)
+}
+
 type fakeConfigStore struct {
+	mu     sync.Mutex
 	values map[string]string
 	errGet error
 	errSet error
 }
 
 func (f *fakeConfigStore) Get(key string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.errGet != nil {
 		return "", f.errGet
 	}
@@ -40,6 +53,8 @@ func (f *fakeConfigStore) Get(key string) (string, error) {
 }
 
 func (f *fakeConfigStore) Set(key, value string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.errSet != nil {
 		return f.errSet
 	}
@@ -48,6 +63,12 @@ func (f *fakeConfigStore) Set(key, value string) error {
 	}
 	f.values[key] = value
 	return nil
+}
+
+func (f *fakeConfigStore) value(key string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.values[key]
 }
 
 type fakeUsageChecker struct {
@@ -67,6 +88,7 @@ func (f fakeUsageChecker) Check(dbPath string) (DiskUsage, error) {
 }
 
 type fakeNotifier struct {
+	mu       sync.Mutex
 	messages []string
 	ctxErr   error
 	err      error
@@ -82,20 +104,38 @@ func (f *fakeNotifier) NotifyOwner(ctx context.Context, text string) error {
 	if f.err != nil {
 		return f.err
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.messages = append(f.messages, text)
 	return nil
 }
 
+func (f *fakeNotifier) messagesSnapshot() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.messages...)
+}
+
 type fakeLogger struct {
+	mu    sync.Mutex
 	lines []string
 }
 
 func (l *fakeLogger) Printf(format string, v ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	l.lines = append(l.lines, fmt.Sprintf(format, v...))
+}
+
+func (l *fakeLogger) linesSnapshot() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.lines...)
 }
 
 type fakeTicker struct {
 	ch      chan time.Time
+	mu      sync.Mutex
 	stopped bool
 }
 
@@ -104,7 +144,15 @@ func (t *fakeTicker) Chan() <-chan time.Time {
 }
 
 func (t *fakeTicker) Stop() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.stopped = true
+}
+
+func (t *fakeTicker) isStopped() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.stopped
 }
 
 func TestServiceRunOnceUsesDefaultRetentionAndStoresLastRun(t *testing.T) {
@@ -131,17 +179,19 @@ func TestServiceRunOnceUsesDefaultRetentionAndStoresLastRun(t *testing.T) {
 		t.Fatalf("run once: %v", err)
 	}
 
-	if len(cleaner.retentionDays) != 1 || cleaner.retentionDays[0] != 90 {
-		t.Fatalf("cleanup retentionDays = %v, want [90]", cleaner.retentionDays)
+	retentionDays := cleaner.retentionDaysSnapshot()
+	if len(retentionDays) != 1 || retentionDays[0] != 90 {
+		t.Fatalf("cleanup retentionDays = %v, want [90]", retentionDays)
 	}
-	if got := configStore.values[lastRunAtKey]; got != now.Format(time.RFC3339) {
+	if got := configStore.value(lastRunAtKey); got != now.Format(time.RFC3339) {
 		t.Fatalf("lastRunAt = %q, want %q", got, now.Format(time.RFC3339))
 	}
-	if len(logger.lines) != 1 {
-		t.Fatalf("expected 1 log line, got %d", len(logger.lines))
+	lines := logger.linesSnapshot()
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 log line, got %d", len(lines))
 	}
-	if !strings.Contains(logger.lines[0], "deleted=3") {
-		t.Fatalf("log line %q does not mention deleted rows", logger.lines[0])
+	if !strings.Contains(lines[0], "deleted=3") {
+		t.Fatalf("log line %q does not mention deleted rows", lines[0])
 	}
 }
 
@@ -170,17 +220,19 @@ func TestServiceRunOnceNotifiesOwnerOnceAboveThreshold(t *testing.T) {
 		t.Fatalf("second run once: %v", err)
 	}
 
-	if len(notifier.messages) != 1 {
-		t.Fatalf("expected 1 notification, got %d", len(notifier.messages))
+	messages := notifier.messagesSnapshot()
+	if len(messages) != 1 {
+		t.Fatalf("expected 1 notification, got %d", len(messages))
 	}
-	if !strings.Contains(notifier.messages[0], "85.00%") {
-		t.Fatalf("notification %q does not mention usage percentage", notifier.messages[0])
+	if !strings.Contains(messages[0], "85.00%") {
+		t.Fatalf("notification %q does not mention usage percentage", messages[0])
 	}
-	if got := configStore.values[volumeAlertStateKey]; got != "1" {
+	if got := configStore.value(volumeAlertStateKey); got != "1" {
 		t.Fatalf("volume alert state = %q, want %q", got, "1")
 	}
-	if cleaner.retentionDays[0] != 45 {
-		t.Fatalf("cleanup retentionDays[0] = %d, want 45", cleaner.retentionDays[0])
+	retentionDays := cleaner.retentionDaysSnapshot()
+	if retentionDays[0] != 45 {
+		t.Fatalf("cleanup retentionDays[0] = %d, want 45", retentionDays[0])
 	}
 }
 
@@ -203,7 +255,7 @@ func TestServiceRunOnceClearsAlertStateWhenUsageRecovers(t *testing.T) {
 		t.Fatalf("run once: %v", err)
 	}
 
-	if got := configStore.values[volumeAlertStateKey]; got != "0" {
+	if got := configStore.value(volumeAlertStateKey); got != "0" {
 		t.Fatalf("volume alert state = %q, want %q", got, "0")
 	}
 }
@@ -270,7 +322,7 @@ func TestServiceStartAndStopRunImmediateMaintenanceAndStopTicker(t *testing.T) {
 
 	svc.Start()
 	deadline := time.After(2 * time.Second)
-	for len(cleaner.retentionDays) < 1 {
+	for len(cleaner.retentionDaysSnapshot()) < 1 {
 		select {
 		case <-deadline:
 			t.Fatal("timed out waiting for initial maintenance run")
@@ -281,7 +333,7 @@ func TestServiceStartAndStopRunImmediateMaintenanceAndStopTicker(t *testing.T) {
 
 	ft.ch <- time.Now()
 	deadline = time.After(2 * time.Second)
-	for len(cleaner.retentionDays) < 2 {
+	for len(cleaner.retentionDaysSnapshot()) < 2 {
 		select {
 		case <-deadline:
 			t.Fatal("timed out waiting for scheduled maintenance run")
@@ -292,13 +344,14 @@ func TestServiceStartAndStopRunImmediateMaintenanceAndStopTicker(t *testing.T) {
 
 	svc.Stop()
 
-	if !ft.stopped {
+	if !ft.isStopped() {
 		t.Fatal("expected ticker to be stopped")
 	}
-	if len(cleaner.retentionDays) != 2 {
-		t.Fatalf("expected 2 maintenance runs, got %d", len(cleaner.retentionDays))
+	retentionDays := cleaner.retentionDaysSnapshot()
+	if len(retentionDays) != 2 {
+		t.Fatalf("expected 2 maintenance runs, got %d", len(retentionDays))
 	}
-	if len(logger.lines) < 3 {
-		t.Fatalf("expected start, run, and stop logs, got %d lines", len(logger.lines))
+	if len(logger.linesSnapshot()) < 3 {
+		t.Fatalf("expected start, run, and stop logs, got %d lines", len(logger.linesSnapshot()))
 	}
 }

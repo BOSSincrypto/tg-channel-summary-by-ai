@@ -1,0 +1,125 @@
+name: Fly Machine Cost Control
+
+on:
+  schedule:
+    # 22:00 UTC is 01:00 Europe/Moscow. Russia does not observe DST.
+    - cron: "0 22 * * *"
+    # 03:00 UTC is 06:00 Europe/Moscow. Russia does not observe DST.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Lifecycle operation to run against the existing machine
+        required: true
+        type: choice
+        options:
+          - stop
+          - start
+
+concurrency:
+  group: fly-machine-cost-control
+  cancel-in-progress: false
+
+jobs:
+  lifecycle:
+    name: Run scheduled Fly Machine lifecycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      FLY_APP: tg-channel-summary
+      MACHINE_ID: e823074a696068
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+    steps:
+      - name: Set up flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # master
+
+      - name: Stop or start the existing machine
+        shell: bash
+        env:
+          SCHEDULED_OPERATION: ${{ github.event.schedule }}
+          MANUAL_OPERATION: ${{ inputs.operation }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$SCHEDULED_OPERATION" == "0 22 * * *" ]]; then
+            operation="stop"
+          elif [[ "$SCHEDULED_OPERATION" == "0 3 * * *" ]]; then
+            operation="start"
+          else
+            operation="$MANUAL_OPERATION"
+          fi
+
+          case "$operation" in
+            stop|start) ;;
+            *)
+              echo "Unsupported lifecycle operation: $operation" >&2
+              exit 1
+              ;;
+          esac
+
+          inventory="$(flyctl machine list --app "$FLY_APP" --json)"
+          if ! jq -e --arg id "$MACHINE_ID" '
+            length == 1
+            and .[0].id == $id
+            and .[0].region == "ams"
+            and .[0].config.guest.cpu_kind == "shared"
+            and .[0].config.guest.cpus == 1
+            and .[0].config.guest.memory_mb == 256
+            and ([.[0].config.mounts[] |
+              select(.path == "/data" and .encrypted == true and .size_gb == 1)] | length == 1)
+            and ([.[0].config.services[] |
+              select(.internal_port == 8080 and .autostop == false and .autostart == false)] | length == 1)
+          ' <<<"$inventory" >/dev/null; then
+            echo "Refusing to operate on an unexpected Fly topology" >&2
+            exit 1
+          fi
+
+          state="$(jq -r '.[0].state' <<<"$inventory")"
+          echo "Machine $MACHINE_ID is $state; requested operation: $operation"
+
+          if [[ "$operation" == "stop" ]]; then
+            if [[ "$state" == "stopped" || "$state" == "suspended" ]]; then
+              echo "Stop is already satisfied; leaving the existing machine unchanged."
+            elif [[ "$state" == "started" ]]; then
+              flyctl machine stop "$MACHINE_ID" --app "$FLY_APP" --wait-timeout 2m
+            else
+              echo "Machine is in unsupported state for stop: $state" >&2
+              exit 1
+            fi
+          elif [[ "$state" == "started" ]]; then
+            echo "Start is already satisfied; leaving the existing machine unchanged."
+          elif [[ "$state" == "stopped" || "$state" == "suspended" ]]; then
+            flyctl machine start "$MACHINE_ID" --app "$FLY_APP"
+          else
+            echo "Machine is in unsupported state for start: $state" >&2
+            exit 1
+          fi
+
+          for attempt in {1..36}; do
+            current="$(flyctl machine list --app "$FLY_APP" --json)"
+            current_state="$(jq -r '.[0].state' <<<"$current")"
+            if [[ "$operation" == "stop" && "$current_state" == "stopped" ]]; then
+              echo "Machine reached stopped state."
+              exit 0
+            fi
+            if [[ "$operation" == "start" && "$current_state" == "started" ]]; then
+              if jq -e 'all(.[0].checks[]; .status == "passing")' <<<"$current" >/dev/null; then
+                echo "Machine reached started state with passing Fly health checks."
+                exit 0
+              fi
+            fi
+            sleep 5
+          done
+
+          echo "Timed out waiting for $operation to complete on $MACHINE_ID" >&2
+          exit 1
+
+      - name: Verify HTTPS health after start
+        if: ${{ github.event.schedule == '0 3 * * *' || inputs.operation == 'start' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error \
+            --retry 24 --retry-delay 5 --retry-all-errors --max-time 10 \
+            https://tg-channel-summary.fly.dev/health

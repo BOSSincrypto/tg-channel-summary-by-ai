@@ -676,6 +676,19 @@ func TestValidatorListenerOwnershipReplacesDeadValidatorRecordOnly(t *testing.T)
 	}
 }
 
+func TestValidatorProcessAliveBoundaryRejectsOverflowSentinelPID(t *testing.T) {
+	sentinelPID := int(^uint32(0))
+	if validatorProcessAlive(sentinelPID) {
+		t.Fatalf("validatorProcessAlive(%d) = true, want false", sentinelPID)
+	}
+}
+
+func TestValidatorProcessAliveBoundaryRecognizesCurrentProcess(t *testing.T) {
+	if !validatorProcessAlive(os.Getpid()) {
+		t.Fatal("validatorProcessAlive should report the current process as alive")
+	}
+}
+
 func TestValidatorListenerOwnershipPreservesActiveNonValidatorRecord(t *testing.T) {
 	ownerPath := filepath.Join(t.TempDir(), "listener-owner.json")
 	t.Setenv(validatorOwnerEnv, ownerPath)

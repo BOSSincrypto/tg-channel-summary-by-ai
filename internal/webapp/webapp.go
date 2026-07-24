@@ -28,6 +28,11 @@ type Server struct {
 	router                   chi.Router
 	apiRouter                chi.Router
 	srv                      *http.Server
+	serverMu                 sync.RWMutex
+	serverStopping           bool
+	serverStopOnce           sync.Once
+	serverStopDone           chan struct{}
+	digestRunnerCloseOnce    sync.Once
 	providerService          *ProviderService
 	database                 *db.DB
 	channelService           *ChannelService
@@ -46,6 +51,15 @@ type Server struct {
 	validatorBrowserInitData string
 	authBotTokenValue        string
 }
+
+const (
+	httpReadHeaderTimeout = 5 * time.Second
+	httpReadTimeout       = 15 * time.Second
+	httpWriteTimeout      = 15 * time.Second
+	httpIdleTimeout       = 60 * time.Second
+	httpMaxHeaderBytes    = 1 << 20
+	httpShutdownTimeout   = 5 * time.Second
+)
 
 // SettingsMutation is the validated settings payload shared by authenticated
 // WebApp HTTP writes and the Telegram web_app_data production adapter.
@@ -299,6 +313,9 @@ func validatorScriptLiteral(value string) string {
 // SetDigestRunner connects the manual WebApp action to the production digest
 // service without making the HTTP package depend on scheduler internals.
 func (s *Server) SetDigestRunner(runner DigestRunner) {
+	if s == nil {
+		return
+	}
 	s.digestRunner = runner
 }
 
@@ -508,12 +525,14 @@ func (s *Server) EnterTerminal(reason error) {
 }
 
 func (s *Server) closeDigestRunner() {
-	if s == nil || s.digestRunner == nil {
+	if s == nil {
 		return
 	}
-	if runner, ok := s.digestRunner.(closableDigestRunner); ok {
-		runner.Close()
-	}
+	s.digestRunnerCloseOnce.Do(func() {
+		if runner, ok := s.digestRunner.(closableDigestRunner); ok {
+			runner.Close()
+		}
+	})
 }
 
 func (s *Server) terminalState() (bool, error) {
@@ -557,6 +576,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // Start begins listening on the given port (e.g. ":8080").
 func (s *Server) Start(port string) error {
+	if s == nil {
+		return errors.New("HTTP server requires a server")
+	}
 	if terminal, _ := s.terminalState(); terminal {
 		return errors.New("HTTP server is in terminal state")
 	}
@@ -571,6 +593,12 @@ func (s *Server) Start(port string) error {
 // need to establish ownership of a socket before serving can bind the
 // listener first and then pass it here.
 func (s *Server) Serve(listener net.Listener) error {
+	if s == nil {
+		if listener != nil {
+			_ = listener.Close()
+		}
+		return errors.New("HTTP server requires a server")
+	}
 	if listener == nil {
 		return errors.New("HTTP server requires a listener")
 	}
@@ -578,19 +606,71 @@ func (s *Server) Serve(listener net.Listener) error {
 		_ = listener.Close()
 		return errors.New("HTTP server is in terminal state")
 	}
-	s.srv = &http.Server{
-		Addr:    listener.Addr().String(),
-		Handler: s.router,
+	server := &http.Server{
+		Addr:              listener.Addr().String(),
+		Handler:           s.router,
+		ReadHeaderTimeout: httpReadHeaderTimeout,
+		ReadTimeout:       httpReadTimeout,
+		WriteTimeout:      httpWriteTimeout,
+		IdleTimeout:       httpIdleTimeout,
+		MaxHeaderBytes:    httpMaxHeaderBytes,
 	}
-	return s.srv.Serve(listener)
+	s.serverMu.Lock()
+	if s.serverStopping {
+		s.serverMu.Unlock()
+		_ = listener.Close()
+		return http.ErrServerClosed
+	}
+	if s.srv != nil {
+		s.serverMu.Unlock()
+		_ = listener.Close()
+		return errors.New("HTTP server is already serving")
+	}
+	s.srv = server
+	s.serverMu.Unlock()
+	err := server.Serve(listener)
+	s.serverMu.Lock()
+	if s.srv == server {
+		s.srv = nil
+	}
+	s.serverMu.Unlock()
+	return err
 }
 
 // Stop gracefully shuts down the HTTP server.
 func (s *Server) Stop() {
-	s.closeDigestRunner()
-	if s.srv != nil {
-		s.srv.Close()
+	if s == nil {
+		return
 	}
+	s.closeDigestRunner()
+	s.serverMu.RLock()
+	stopDone := s.serverStopDone
+	s.serverMu.RUnlock()
+	if stopDone == nil {
+		s.serverMu.Lock()
+		if s.serverStopDone == nil {
+			s.serverStopDone = make(chan struct{})
+		}
+		stopDone = s.serverStopDone
+		s.serverMu.Unlock()
+	}
+	s.serverStopOnce.Do(func() {
+		s.serverMu.Lock()
+		s.serverStopping = true
+		server := s.srv
+		s.serverMu.Unlock()
+		if server != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), httpShutdownTimeout)
+			defer cancel()
+			if err := server.Shutdown(ctx); err != nil {
+				// Shutdown is bounded by context. Force-close any connections that
+				// did not drain so lifecycle transitions cannot hang indefinitely.
+				_ = server.Close()
+			}
+		}
+		close(stopDone)
+	})
+	<-stopDone
 }
 
 func decodeJSON(r *http.Request, w http.ResponseWriter, value any) error {

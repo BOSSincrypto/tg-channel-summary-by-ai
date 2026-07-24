@@ -193,12 +193,12 @@ func main() {
 	go func() {
 		applog.Info("HTTP server listening", "port", cfg.Port)
 		if err := srv.Start(cfg.Port); err != nil {
-			applog.Printf("HTTP server error: %v", err)
+			transitionOnUnexpectedComponentFailure("HTTP server", err, srv, appLifecycle)
 		}
 	}()
 	go func() {
 		if err := telegramBot.Start(); err != nil {
-			applog.Printf("Telegram bot stopped: %v", err)
+			transitionOnUnexpectedComponentFailure("Telegram bot", err, srv, appLifecycle)
 		}
 	}()
 	// Wait for a signal or a coordinated terminal transition.
@@ -217,6 +217,21 @@ func main() {
 	telegramBot.Stop()
 	applog.Info("Shutdown complete")
 }
+
+func transitionOnUnexpectedComponentFailure(component string, err error, srv *webapp.Server, appLifecycle *lifecycle.Supervisor) {
+	if err == nil || errors.Is(err, http.ErrServerClosed) || errors.Is(err, bot.ErrTokenRevoked) {
+		return
+	}
+	reason := fmt.Errorf("%s stopped unexpectedly: %w", component, err)
+	applog.Error("application component failed", "component", component, "err", err)
+	if srv != nil {
+		srv.EnterTerminal(reason)
+	}
+	if appLifecycle != nil {
+		appLifecycle.TokenRevoked(reason)
+	}
+}
+
 func validatorHTTPOnlyEnabled() bool {
 	return os.Getenv("VALIDATOR_HTTP_ONLY") == "1"
 }

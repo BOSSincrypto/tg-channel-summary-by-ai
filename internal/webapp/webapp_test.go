@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -75,9 +76,19 @@ func TestServeUsesExclusiveBoundListenerAndStopReleasesIt(t *testing.T) {
 	}
 	address := listener.Addr().String()
 	serverErr := make(chan error, 1)
+	serverDone := make(chan struct{})
 	go func() {
 		serverErr <- srv.Serve(listener)
+		close(serverDone)
 	}()
+	t.Cleanup(func() {
+		srv.Stop()
+		select {
+		case <-serverDone:
+		case <-time.After(2 * time.Second):
+			t.Error("Serve did not exit during cleanup")
+		}
+	})
 
 	var response *http.Response
 	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
@@ -104,6 +115,127 @@ func TestServeUsesExclusiveBoundListenerAndStopReleasesIt(t *testing.T) {
 		t.Fatalf("listener was not released after Stop(): %v", err)
 	}
 	released.Close()
+}
+
+func TestServeConfiguresConservativeHTTPBounds(t *testing.T) {
+	srv := New()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("bind listener: %v", err)
+	}
+	serverErr := make(chan error, 1)
+	serverDone := make(chan struct{})
+	go func() {
+		serverErr <- srv.Serve(listener)
+		close(serverDone)
+	}()
+	t.Cleanup(func() {
+		srv.Stop()
+		select {
+		case <-serverDone:
+		case <-time.After(2 * time.Second):
+			t.Error("Serve did not exit during cleanup")
+		}
+	})
+
+	var configured *http.Server
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		srv.serverMu.RLock()
+		configured = srv.srv
+		srv.serverMu.RUnlock()
+		if configured != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if configured == nil {
+		t.Fatal("Serve did not publish HTTP server configuration")
+	}
+	if configured.ReadHeaderTimeout != httpReadHeaderTimeout ||
+		configured.ReadTimeout != httpReadTimeout ||
+		configured.WriteTimeout != httpWriteTimeout ||
+		configured.IdleTimeout != httpIdleTimeout ||
+		configured.MaxHeaderBytes != httpMaxHeaderBytes {
+		t.Fatalf("HTTP server bounds = header:%s read:%s write:%s idle:%s max-header:%d",
+			configured.ReadHeaderTimeout, configured.ReadTimeout, configured.WriteTimeout,
+			configured.IdleTimeout, configured.MaxHeaderBytes)
+	}
+}
+
+func TestStopWaitsForActiveRequestAndIsIdempotent(t *testing.T) {
+	srv := New()
+	requestStarted := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	var releaseOnce sync.Once
+	srv.router.Get("/slow", func(w http.ResponseWriter, r *http.Request) {
+		close(requestStarted)
+		<-releaseRequest
+		w.WriteHeader(http.StatusNoContent)
+	})
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("bind listener: %v", err)
+	}
+	address := listener.Addr().String()
+	serverErr := make(chan error, 1)
+	serverDone := make(chan struct{})
+	go func() {
+		serverErr <- srv.Serve(listener)
+		close(serverDone)
+	}()
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(releaseRequest) })
+		srv.Stop()
+		select {
+		case <-serverDone:
+		case <-time.After(2 * time.Second):
+			t.Error("Serve did not exit during cleanup")
+		}
+	})
+
+	responseDone := make(chan *http.Response, 1)
+	go func() {
+		response, requestErr := http.Get("http://" + address + "/slow")
+		if requestErr != nil {
+			responseDone <- nil
+			return
+		}
+		responseDone <- response
+	}()
+	select {
+	case <-requestStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow request did not start")
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		srv.Stop()
+		close(stopDone)
+	}()
+	select {
+	case <-stopDone:
+		t.Fatal("Stop returned before active request completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+	releaseOnce.Do(func() { close(releaseRequest) })
+	response := <-responseDone
+	if response == nil {
+		t.Fatal("active request failed")
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("active request status = %d, want %d", response.StatusCode, http.StatusNoContent)
+	}
+	select {
+	case <-stopDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not complete after active request drained")
+	}
+	if err := <-serverErr; !errors.Is(err, http.ErrServerClosed) {
+		t.Fatalf("Serve() after graceful Stop() = %v, want ErrServerClosed", err)
+	}
+	srv.Stop()
 }
 
 func TestTerminalStateBoundsHealthAndStopsNormalHTTPWork(t *testing.T) {

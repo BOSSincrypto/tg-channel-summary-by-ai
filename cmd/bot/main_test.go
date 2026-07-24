@@ -21,6 +21,7 @@ import (
 	"github.com/boss/tg-channel-summary-by-ai/internal/config"
 	"github.com/boss/tg-channel-summary-by-ai/internal/db"
 	"github.com/boss/tg-channel-summary-by-ai/internal/digest"
+	"github.com/boss/tg-channel-summary-by-ai/internal/lifecycle"
 	"github.com/boss/tg-channel-summary-by-ai/internal/model"
 	"github.com/boss/tg-channel-summary-by-ai/internal/scheduler"
 	"github.com/boss/tg-channel-summary-by-ai/internal/summarizer"
@@ -39,6 +40,47 @@ func TestValidatorHTTPOnlyEnabledRequiresExactOptIn(t *testing.T) {
 	t.Setenv("VALIDATOR_HTTP_ONLY", "")
 	if validatorHTTPOnlyEnabled() {
 		t.Fatal("validator mode should remain disabled when unset")
+	}
+}
+
+func TestUnexpectedComponentFailureEntersTerminalLifecycle(t *testing.T) {
+	supervisor := lifecycle.New(time.Second)
+	server := webapp.New()
+	componentErr := errors.New("listener failed")
+
+	transitionOnUnexpectedComponentFailure("HTTP server", componentErr, server, supervisor)
+
+	select {
+	case <-supervisor.Done():
+	case <-time.After(time.Second):
+		t.Fatal("component failure did not complete lifecycle transition")
+	}
+	terminal, reason := supervisor.Terminal()
+	if !terminal || !errors.Is(reason, componentErr) {
+		t.Fatalf("lifecycle terminal=%v reason=%v, want component error", terminal, reason)
+	}
+	health := httptest.NewRecorder()
+	server.Handler().ServeHTTP(health, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if health.Code != http.StatusServiceUnavailable {
+		t.Fatalf("terminal health status = %d, want %d", health.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestExpectedComponentShutdownDoesNotEnterTerminalLifecycle(t *testing.T) {
+	supervisor := lifecycle.New(time.Second)
+	server := webapp.New()
+
+	transitionOnUnexpectedComponentFailure("HTTP server", http.ErrServerClosed, server, supervisor)
+	transitionOnUnexpectedComponentFailure("Telegram bot", bot.ErrTokenRevoked, server, supervisor)
+
+	select {
+	case <-time.After(25 * time.Millisecond):
+	case <-supervisor.Done():
+		t.Fatal("expected component shutdown entered terminal lifecycle")
+	}
+	terminal, reason := supervisor.Terminal()
+	if terminal || reason != nil {
+		t.Fatalf("lifecycle terminal=%v reason=%v, want non-terminal", terminal, reason)
 	}
 }
 
